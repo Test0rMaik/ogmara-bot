@@ -20,23 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The GitHub repository stays at `Test0rMaik/ogmara-newsbot`; GitHub redirects
     a renamed repo, so existing clone URLs keep working either way.
 
-### Notes on two things deliberately NOT renamed
+- **The GitHub repository is renamed too**, to
+  `github.com/Test0rMaik/ogmara-bot`. GitHub redirects the old URL, so existing
+  clones keep working; point them at the new one with
+  `git remote set-url origin git@github.com:Test0rMaik/ogmara-bot.git`.
+- **The CLI binary is `ogmara-bot`.** The transitional `ogmara-newsbot` alias
+  has been removed — the Docker image calls `node dist/index.js` directly and is
+  unaffected, but a global install under the old name needs reinstalling.
+- **The data-directory lock file is now `.ogmara-bot.lock`.**
 
-- **The data-directory lock file stays `.newsbot.lock`.** It is what stops two
-  instances sharing a data directory and overwriting each other's ledger.
-  Renaming it would make an OLD instance still holding `.newsbot.lock` invisible
-  to a NEW one looking for a different name — so an upgrade done without
-  stopping the old process would run both, which is exactly the failure the lock
-  exists to prevent. The name is internal; renaming it buys nothing and risks
-  that.
-- **The CLI keeps `ogmara-newsbot` as a bin alias** alongside the new
-  `ogmara-bot`, so an existing global install or a script invoking the old name
-  keeps working. (The Docker image calls `node dist/index.js` directly and is
-  unaffected either way.)
-- **The panel session cookie is now `ogmara_bot_session`, but the old
-  `ogmara_newsbot_session` is still accepted on read.** Upgrading therefore does
-  not log every operator out mid-session; pre-rename cookies age out on their
-  own. Pinned by a regression test.
+### Two migration shims, both time-limited
+
+These are not naming drift — they exist so an upgrade cannot lose anything, and
+each has a stated condition for removal:
+
+- **A live pre-0.16.0 instance still holding `.newsbot.lock` blocks startup.**
+  The lock is what stops two instances sharing a data directory and overwriting
+  each other's ledger. Renaming it outright would make an old instance invisible
+  to a new one looking only at the new name, so an upgrade done without stopping
+  the old process would run BOTH — precisely the failure the lock prevents. The
+  legacy path stays in the liveness check, and a *stale* legacy file is reclaimed
+  and deleted. Two regression tests pin both halves. Safe to drop once no
+  pre-0.16.0 instance can still be running anywhere.
+- **The panel session cookie is now `ogmara_bot_session`, and the old
+  `ogmara_newsbot_session` is still accepted on read**, so upgrading does not log
+  every operator out mid-session. Pre-rename cookies age out on their own.
+  Pinned by a regression test.
 
 ## [0.15.0] - 2026-08-29
 

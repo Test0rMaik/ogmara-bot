@@ -35,14 +35,19 @@ export interface DataLock {
 export function acquireDataLock(ledgerPath: string): DataLock {
   const dir = dirname(ledgerPath);
   mkdirSync(dir, { recursive: true });
-  // FILENAME DELIBERATELY FROZEN at `.newsbot.lock` across the ogmara-bot
-  // rename. This lock is what stops two instances sharing a data directory and
-  // overwriting each other's ledger. Renaming it would make an OLD instance
-  // (still holding `.newsbot.lock`) invisible to a NEW one looking for a
-  // different name — so an upgrade performed without stopping the old process
-  // would run both, which is precisely the failure the lock exists to prevent.
-  // The name is internal; renaming it buys nothing and risks exactly that.
-  const lockPath = join(dir, '.newsbot.lock');
+  const lockPath = join(dir, '.ogmara-bot.lock');
+  // The pre-0.16.0 name. Still CHECKED, never created.
+  //
+  // This lock is what stops two instances sharing a data directory and
+  // overwriting each other's ledger. Renaming it outright would make an OLD
+  // instance — still holding `.newsbot.lock` — invisible to a NEW one looking
+  // only at the new name, so an upgrade performed without stopping the old
+  // process would run both: exactly the failure this exists to prevent. Keeping
+  // the legacy path in the liveness check closes that window while still moving
+  // to the aligned name.
+  //
+  // Safe to drop once no pre-0.16.0 instance can still be running anywhere.
+  const legacyLockPath = join(dir, '.newsbot.lock');
 
   const tryCreate = (): number | null => {
     try {
@@ -52,6 +57,28 @@ export function acquireDataLock(ledgerPath: string): DataLock {
       throw err;
     }
   };
+
+  // A live pre-rename instance holds the legacy lock and knows nothing about the
+  // new one, so check it BEFORE trying to create ours — otherwise we would
+  // happily create `.ogmara-bot.lock` alongside it and run concurrently.
+  const legacyHolder = readHolderPid(legacyLockPath);
+  if (legacyHolder !== null && isAlive(legacyHolder)) {
+    throw new LockError(
+      `Another ogmara-bot instance (pid ${legacyHolder}) is using "${dir}" under the ` +
+        'pre-0.16.0 lock name.\n' +
+        'Two instances sharing a data directory overwrite each other\'s ledger and ' +
+        'republish items. Stop the other one, or give this instance its own ' +
+        'storage.ledgerPath and queue.path.',
+    );
+  }
+  // Not alive — clear the stale legacy file so it does not linger forever.
+  if (legacyHolder !== null) {
+    try {
+      unlinkSync(legacyLockPath);
+    } catch {
+      /* best effort; a stale file is harmless once its pid is gone */
+    }
+  }
 
   let fd = tryCreate();
 

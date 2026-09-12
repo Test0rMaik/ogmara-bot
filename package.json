@@ -4,8 +4,7 @@
   "description": "Self-hostable, modular Ogmara bot — publishes AI-composed news posts and answers slash commands in channels",
   "type": "module",
   "bin": {
-    "ogmara-bot": "dist/index.js",
-    "ogmara-newsbot": "dist/index.js"
+    "ogmara-bot": "dist/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -27,7 +26,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Test0rMaik/ogmara-newsbot"
+    "url": "https://github.com/Test0rMaik/ogmara-bot"
   },
   "engines": {
     "node": ">=22"

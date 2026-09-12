@@ -7,10 +7,16 @@ so an operator can pick which features to run — news posting, answering slash
 commands in channels — from one config file, and so contributors can add more
 without forking.
 
-> **Renamed from `ogmara-newsbot` in 0.16.0.** The clone URL below still works:
-> GitHub redirects the old repository name. The Docker image tag changed from
-> `ogmara-newsbot` to `ogmara-bot`; existing `newsbot-*` tags stay valid and are
-> not being deleted.
+> **Renamed from `ogmara-newsbot` in 0.16.0**, repository included. Old clone
+> URLs keep working — GitHub redirects a renamed repository — but if you have an
+> existing checkout, point it at the new one:
+>
+> ```bash
+> git remote set-url origin git@github.com:Test0rMaik/ogmara-bot.git
+> ```
+>
+> The Docker image tag changed from `ogmara-newsbot` to `ogmara-bot`; existing
+> `newsbot-*` tags stay valid and are not being deleted.
 
 Point it at news feeds, your own topics, or a folder of images. It composes
 posts with the AI provider of your choice, adds hashtags, and publishes them to
@@ -43,8 +49,8 @@ live posting.
 ## Quickstart
 
 ```bash
-git clone https://github.com/Test0rMaik/ogmara-newsbot
-cd ogmara-newsbot
+git clone https://github.com/Test0rMaik/ogmara-bot
+cd ogmara-bot
 npm install
 
 npm run dev -- --init
@@ -67,8 +73,8 @@ post. Nothing is published.
 ### Or with Docker
 
 ```bash
-git clone https://github.com/Test0rMaik/ogmara-newsbot
-cd ogmara-newsbot
+git clone https://github.com/Test0rMaik/ogmara-bot
+cd ogmara-bot
 npm install
 npm run dev -- --init          # generates config.yaml + .env on the host
 

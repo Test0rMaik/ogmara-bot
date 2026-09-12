@@ -203,6 +203,35 @@ describe('ensureWalletKey', () => {
       }
     });
 
+    it('refuses to start when a PRE-0.16.0 instance still holds the legacy lock', () => {
+      // The lock moved from `.newsbot.lock` to `.ogmara-bot.lock` in 0.16.0.
+      // Renaming it outright would make a live old instance invisible to a new
+      // one, so an upgrade done without stopping the old process would run BOTH
+      // on the same data directory — overwriting each other's ledger and
+      // republishing items, exactly what this lock prevents. The legacy name
+      // stays in the liveness check to close that window.
+      const path = join(dir, 'state.json');
+      const legacy = join(dir, '.newsbot.lock');
+      // A live holder: our own pid is, by definition, alive.
+      writeFileSync(legacy, String(process.pid));
+      expect(() => acquireDataLock(path)).toThrow(LockError);
+      expect(() => acquireDataLock(path)).toThrow(/pre-0\.16\.0 lock name/);
+    });
+
+    it('reclaims a STALE legacy lock and removes it', () => {
+      const path = join(dir, 'state.json');
+      const legacy = join(dir, '.newsbot.lock');
+      // A pid that cannot be alive — a dead pre-rename instance.
+      writeFileSync(legacy, '2147483647');
+      const lock = acquireDataLock(path);
+      try {
+        expect(existsSyncSafe(legacy)).toBe(false);
+        expect(existsSyncSafe(join(dir, '.ogmara-bot.lock'))).toBe(true);
+      } finally {
+        lock.release();
+      }
+    });
+
     it('releases the lock after a successful run, so a later call can proceed', async () => {
       const envPath = join(dir, '.env');
       const path = backupPath();
