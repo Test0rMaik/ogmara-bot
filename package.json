@@ -1,9 +1,10 @@
 {
-  "name": "ogmara-newsbot",
-  "version": "0.15.0",
-  "description": "Self-hostable bot that publishes AI-composed posts to the Ogmara News Feed",
+  "name": "ogmara-bot",
+  "version": "0.16.0",
+  "description": "Self-hostable, modular Ogmara bot — publishes AI-composed news posts and answers slash commands in channels",
   "type": "module",
   "bin": {
+    "ogmara-bot": "dist/index.js",
     "ogmara-newsbot": "dist/index.js"
   },
   "scripts": {

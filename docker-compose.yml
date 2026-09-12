@@ -1,7 +1,7 @@
 services:
-  newsbot:
+  ogmara-bot:
     build: .
-    image: ogmara-newsbot:latest
+    image: ogmara-bot:latest
     restart: unless-stopped
     env_file:
       # Copy .env.example -> .env and fill in OGMARA_WALLET_KEY + your AI

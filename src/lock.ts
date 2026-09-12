@@ -35,6 +35,13 @@ export interface DataLock {
 export function acquireDataLock(ledgerPath: string): DataLock {
   const dir = dirname(ledgerPath);
   mkdirSync(dir, { recursive: true });
+  // FILENAME DELIBERATELY FROZEN at `.newsbot.lock` across the ogmara-bot
+  // rename. This lock is what stops two instances sharing a data directory and
+  // overwriting each other's ledger. Renaming it would make an OLD instance
+  // (still holding `.newsbot.lock`) invisible to a NEW one looking for a
+  // different name — so an upgrade performed without stopping the old process
+  // would run both, which is precisely the failure the lock exists to prevent.
+  // The name is internal; renaming it buys nothing and risks exactly that.
   const lockPath = join(dir, '.newsbot.lock');
 
   const tryCreate = (): number | null => {
@@ -52,7 +59,7 @@ export function acquireDataLock(ledgerPath: string): DataLock {
     const holder = readHolderPid(lockPath);
     if (holder !== null && isAlive(holder)) {
       throw new LockError(
-        `Another ogmara-newsbot instance (pid ${holder}) is using "${dir}".\n` +
+        `Another ogmara-bot instance (pid ${holder}) is using "${dir}".\n` +
           'Two instances sharing a data directory overwrite each other\'s ledger and ' +
           'republish items. Stop the other one, or give this instance its own ' +
           'storage.ledgerPath and queue.path.',

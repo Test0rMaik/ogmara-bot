@@ -737,7 +737,11 @@ function verifySession(req: IncomingMessage, auth: PanelAuth): string | undefine
   for (const part of cookie.split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    if (part.slice(0, eq).trim() === 'ogmara_newsbot_session') {
+    // Accept the pre-rename cookie too, so upgrading to ogmara-bot does not
+    // log every operator out mid-session. New sessions are issued under the new
+    // name below; the old one ages out on its own.
+    const name = part.slice(0, eq).trim();
+    if (name === 'ogmara_bot_session' || name === 'ogmara_newsbot_session') {
       return auth.verifySession(part.slice(eq + 1).trim());
     }
   }
@@ -773,14 +777,14 @@ function setSessionCookie(
   const secure = isHttps(req, trusted) ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
-    `ogmara_newsbot_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${ttlHours * 3600}${secure}`,
+    `ogmara_bot_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${ttlHours * 3600}${secure}`,
   );
 }
 
 function clearSessionCookie(res: ServerResponse): void {
   res.setHeader(
     'Set-Cookie',
-    'ogmara_newsbot_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+    'ogmara_bot_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
   );
 }
 

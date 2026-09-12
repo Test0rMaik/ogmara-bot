@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * ogmara-newsbot CLI entry point.
+ * ogmara-bot CLI entry point.
  *
  * Two modes: `--once` executes a single pipeline run and exits (good for cron,
  * systemd timers and testing), while the default runs the configured schedules
@@ -98,9 +98,9 @@ function parseArgs(argv: readonly string[]): CliArgs {
   return args;
 }
 
-const HELP = `ogmara-newsbot — publish AI-composed posts to the Ogmara News Feed
+const HELP = `ogmara-bot — a modular Ogmara bot: AI-composed news posts and channel commands
 
-Usage: ogmara-newsbot [options]
+Usage: ogmara-bot [options]
 
 Options:
   --once            Run the pipeline once and exit (default: run on schedule)

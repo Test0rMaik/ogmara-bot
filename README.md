@@ -1,7 +1,16 @@
-# ogmara-newsbot
+# ogmara-bot
 
-A self-hostable bot that publishes AI-composed posts to the
-[Ogmara](https://ogmara.org) News Feed.
+A self-hostable, modular bot for [Ogmara](https://ogmara.org).
+
+Today it publishes AI-composed posts to the News Feed. It is being made modular
+so an operator can pick which features to run — news posting, answering slash
+commands in channels — from one config file, and so contributors can add more
+without forking.
+
+> **Renamed from `ogmara-newsbot` in 0.16.0.** The clone URL below still works:
+> GitHub redirects the old repository name. The Docker image tag changed from
+> `ogmara-newsbot` to `ogmara-bot`; existing `newsbot-*` tags stay valid and are
+> not being deleted.
 
 Point it at news feeds, your own topics, or a folder of images. It composes
 posts with the AI provider of your choice, adds hashtags, and publishes them to

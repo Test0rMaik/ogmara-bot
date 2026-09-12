@@ -34,7 +34,7 @@ export interface FetchOptions {
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
-const DEFAULT_USER_AGENT = 'ogmara-newsbot (+https://github.com/Test0rMaik/ogmara-newsbot)';
+const DEFAULT_USER_AGENT = 'ogmara-bot (+https://github.com/Test0rMaik/ogmara-newsbot)';
 
 /** Maximum redirect hops before giving up. */
 const MAX_REDIRECTS = 5;

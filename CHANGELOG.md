@@ -5,6 +5,39 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-09-12
+
+### Changed
+
+- **Renamed `ogmara-newsbot` → `ogmara-bot`.** It is no longer only a news bot:
+  the next releases make features modular so an operator chooses what to run —
+  news posting, answering slash commands in channels — from one config file.
+  - Package name, CLI name, help text, HTTP user-agent, Docker Compose service
+    and CI image tag all updated.
+  - **Docker image tag is now `ogmara-bot`.** Existing `ogmara-newsbot` /
+    `newsbot-*` tags remain valid and are not being deleted — running
+    deployments reference them.
+  - The GitHub repository stays at `Test0rMaik/ogmara-newsbot`; GitHub redirects
+    a renamed repo, so existing clone URLs keep working either way.
+
+### Notes on two things deliberately NOT renamed
+
+- **The data-directory lock file stays `.newsbot.lock`.** It is what stops two
+  instances sharing a data directory and overwriting each other's ledger.
+  Renaming it would make an OLD instance still holding `.newsbot.lock` invisible
+  to a NEW one looking for a different name — so an upgrade done without
+  stopping the old process would run both, which is exactly the failure the lock
+  exists to prevent. The name is internal; renaming it buys nothing and risks
+  that.
+- **The CLI keeps `ogmara-newsbot` as a bin alias** alongside the new
+  `ogmara-bot`, so an existing global install or a script invoking the old name
+  keeps working. (The Docker image calls `node dist/index.js` directly and is
+  unaffected either way.)
+- **The panel session cookie is now `ogmara_bot_session`, but the old
+  `ogmara_newsbot_session` is still accepted on read.** Upgrading therefore does
+  not log every operator out mid-session; pre-rename cookies age out on their
+  own. Pinned by a regression test.
+
 ## [0.15.0] - 2026-08-29
 
 ### Changed

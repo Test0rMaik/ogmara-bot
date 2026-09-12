@@ -1,4 +1,4 @@
-# ogmara-newsbot configuration
+# ogmara-bot configuration
 #
 # Copy this file to config.yaml and edit. Secrets do NOT belong here — the
 # wallet key and AI API keys come from the environment (see .env.example), so

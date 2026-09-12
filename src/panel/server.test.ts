@@ -286,10 +286,30 @@ describe('login flow', () => {
       'X-Forwarded-For': '203.0.113.9',
     });
     expect(loginRes.status).toBe(200);
-    expect(cookie).toContain('ogmara_newsbot_session=');
+    expect(cookie).toContain('ogmara_bot_session=');
 
     const statusRes = await fetch(`${baseUrl}/api/status`, {
       headers: { Cookie: cookie, 'X-Forwarded-For': '203.0.113.9' },
+    });
+    expect(statusRes.status).toBe(200);
+    const body = await json(statusRes);
+    expect(body.authenticatedAs).toBe(operator.address);
+  });
+
+  it('still accepts a session cookie issued before the ogmara-bot rename', async () => {
+    // Upgrading must not log every operator out mid-session. New sessions are
+    // issued as `ogmara_bot_session`; the pre-rename name is still READ until
+    // those cookies age out on their own.
+    const { baseUrl } = await start();
+    const { cookie } = await loginAs(baseUrl, operator, {
+      'X-Forwarded-For': '203.0.113.9',
+    });
+    // Re-label the freshly issued cookie with the OLD name — same token.
+    const legacyCookie = cookie.replace('ogmara_bot_session=', 'ogmara_newsbot_session=');
+    expect(legacyCookie).toContain('ogmara_newsbot_session=');
+
+    const statusRes = await fetch(`${baseUrl}/api/status`, {
+      headers: { Cookie: legacyCookie, 'X-Forwarded-For': '203.0.113.9' },
     });
     expect(statusRes.status).toBe(200);
     const body = await json(statusRes);
