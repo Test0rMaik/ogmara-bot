@@ -840,6 +840,16 @@ async function refresh() {
   setField(dl, 'Daily limit', String(status.dailyLimit));
   setField(dl, 'Burst limit (10 min)', String(status.burstLimit));
   setField(dl, 'Balance', status.balanceKlv.toFixed(4) + ' KLV');
+  if (!status.registered) {
+    // Broken out because the total is a contract fee PLUS a transaction cost,
+    // and the contract fee is governance-controlled — an operator seeing only
+    // one number cannot tell why it changed.
+    setField(
+      dl,
+      'Registration cost',
+      status.registrationCostKlv + ' KLV (' + status.registrationFeeKlv + ' fee + network)',
+    );
+  }
 
   renderBotIdentity(status.bot);
 
@@ -1061,21 +1071,36 @@ for (const btn of document.querySelectorAll('.range-btn')) {
   btn.addEventListener('click', () => selectChartRange(btn.dataset.range));
 }
 
-// If a session cookie is already valid (page reload, or localhost bypass),
-// the status call succeeds immediately and skips the login screen. A 401
-// just means "not logged in yet" and stays silent; anything else (the chain
-// being unreachable, a server error) is worth surfacing rather than leaving
-// the operator looking at an unexplained login screen.
+// Ask whether we have a session BEFORE loading anything that needs one.
 //
-// Run independently rather than chained: /api/posts has no dependency on
-// whatever /api/status might fail on, so a status failure (most likely the
-// chain being unreachable) must not silently prevent the post list from
-// ever loading.
-refresh().catch((err) => {
-  if (err && err.status !== 401) showError(err.message || String(err));
-});
-refreshPosts();
-refreshChart();
+// /api/auth/state always answers 200, so the common "not logged in yet" case
+// costs no console errors. Probing with /api/status instead meant three
+// guaranteed 401s on every page load — status, posts and chart — which is
+// indistinguishable from a real fault when an operator opens the console to
+// investigate something else.
+api('/api/auth/state', { method: 'GET' })
+  .then((state) => {
+    if (!state.authenticated) {
+      // Login screen stays up; nothing else is worth requesting yet.
+      loginCard.hidden = false;
+      panel.hidden = true;
+      return;
+    }
+    // Run independently rather than chained: /api/posts has no dependency on
+    // whatever /api/status might fail on, so a status failure (most likely the
+    // chain being unreachable) must not silently prevent the post list from
+    // ever loading.
+    refresh().catch((err) => {
+      if (err && err.status !== 401) showError(err.message || String(err));
+    });
+    refreshPosts();
+    refreshChart();
+  })
+  .catch((err) => {
+    // The probe itself failing is a real fault — the server is unreachable or
+    // broken — and unlike a 401 it is worth saying so.
+    showError(err.message || String(err));
+  });
 `;
 }
 

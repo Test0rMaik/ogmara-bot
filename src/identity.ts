@@ -7,7 +7,13 @@
  * same code instead of reimplementing it.
  */
 
-import { OgmaraClient, WalletSigner, getUserRegisteredAt, type ScNetwork } from '@ogmara/sdk';
+import {
+  OgmaraClient,
+  WalletSigner,
+  getRegistrationFee,
+  getUserRegisteredAt,
+  type ScNetwork,
+} from '@ogmara/sdk';
 import {
   KLV_PRECISION,
   REGISTRATION_COST_KLV,
@@ -107,6 +113,17 @@ export interface RegistrationStatus {
   balanceKlv: number;
   /** Whether the wallet holds enough KLV to register. */
   canAfford: boolean;
+  /**
+   * The contract's CURRENT registration fee, in whole KLV.
+   *
+   * Read from the chain on every check rather than held as a constant: the fee
+   * is node-governance controlled and changes with no client release, so a
+   * hardcoded figure goes stale silently and the only symptom is a rejected
+   * transaction. `0` is a legitimate reading — it means registration is free.
+   */
+  registrationFeeKlv: number;
+  /** Fee plus the transaction cost, i.e. what the wallet actually needs. */
+  totalCostKlv: number;
 }
 
 /**
@@ -119,16 +136,26 @@ export async function checkRegistration(
   network: ScNetwork,
   address: string,
 ): Promise<RegistrationStatus> {
-  const [registeredAt, account] = await Promise.all([
+  const [registeredAt, account, feeRaw] = await Promise.all([
     getUserRegisteredAt(network, address),
     getAccount(network, address),
+    // Queried, never assumed — see `registrationFeeKlv`.
+    getRegistrationFee(network),
   ]);
   const balanceKlv = account.balance / KLV_PRECISION;
+  const registrationFeeKlv = Number(feeRaw) / KLV_PRECISION;
+  // The contract fee is PAID TO the contract; REGISTRATION_COST_KLV is the
+  // separate Klever transaction cost. The wallet needs both, and checking only
+  // one is how the panel came to report "affordable" for a transaction the
+  // chain then refused.
+  const totalCostKlv = registrationFeeKlv + REGISTRATION_COST_KLV;
   return {
     registered: registeredAt > 0,
     registeredAt,
     balanceKlv,
-    canAfford: balanceKlv >= REGISTRATION_COST_KLV,
+    canAfford: balanceKlv >= totalCostKlv,
+    registrationFeeKlv,
+    totalCostKlv,
   };
 }
 
@@ -162,16 +189,22 @@ export async function registerWallet(
     return {
       status: 'insufficient-funds',
       balanceKlv: status.balanceKlv,
-      requiredKlv: REGISTRATION_COST_KLV,
+      requiredKlv: status.totalCostKlv,
     };
   }
 
   const data = buildCallData('register', [stringToHex(signer.publicKeyHex)]);
+  // The fee is re-read here rather than reused from `status`, so the value
+  // attached to the transaction is the one the contract wants NOW. It is
+  // governance-controlled and can change between the affordability check and
+  // the send; attaching a stale amount is rejected outright.
+  const feeRaw = await getRegistrationFee(network);
   const { txHash, explorerUrl } = await invokeContract(
     network,
     signer.address,
     privateKey,
     data,
+    feeRaw,
   );
   return { status: 'registered', txHash, explorerUrl };
 }

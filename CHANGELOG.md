@@ -5,6 +5,52 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-09-12
+
+### Fixed
+
+- **On-chain wallet registration always failed with `HTTP 400`.** The contract
+  gained a user-registration fee (100 KLV on testnet as of smart-contract
+  0.10.0), payable as the call's `callValue` — but `invokeContract` hardcoded
+  `callValue: {}`, so nothing was attached and the contract refused the call
+  before it was ever signed. Verified against the live chain: the old call is
+  rejected with `VMUserError - (Insufficient registration fee)`, the same call
+  with the fee attached builds cleanly.
+
+  The fee is now **queried from the contract** on every check and re-read
+  immediately before the transaction is built. It is node-governance controlled
+  and changes with no client release, so any hardcoded figure goes stale in
+  silence with a rejected transaction as the only symptom.
+
+  Not a regression — this code is byte-identical to the version that worked, and
+  it worked because the wallet was registered before the fee existed.
+
+- **The panel offered a registration the chain would refuse.** Affordability was
+  checked against `REGISTRATION_COST_KLV` (4.4), which is the Klever
+  *transaction* cost and not the contract's fee. A wallet holding 50 KLV was
+  reported as able to register when it needed 104.4. The check now uses fee +
+  transaction cost, and the Settings tab shows the breakdown so the number is
+  explainable when governance changes it.
+
+- **A failed Klever RPC call discarded the reason.** `postJson` threw
+  `returned HTTP 400` and dropped the response body — which is where Klever puts
+  the actual diagnosis. That is what made the registration failure opaque. The
+  `error` field is now included in the thrown message.
+
+- **Three guaranteed-to-fail requests on every page load.** The page probed for
+  a session by calling `/api/status` and treating a 401 as "not logged in", and
+  fired the posts and chart loads alongside it — so an operator opening the
+  console for any reason saw three 401s indistinguishable from a real fault.
+
+### Added
+
+- `GET /api/auth/state` — always answers 200 with `{ authenticated }`, so the
+  page can find out whether it has a session without generating a console error
+  in the ordinary not-logged-in case. Reveals nothing the caller does not
+  already hold: the answer is derived from their own cookie.
+- `/api/status` now reports `registrationFeeKlv` alongside the total, so the
+  cost is attributable rather than a single unexplained number.
+
 ## [0.19.0] - 2026-09-12
 
 ### Fixed

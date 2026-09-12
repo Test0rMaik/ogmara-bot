@@ -31,14 +31,18 @@ function getWithHost(baseUrl: string, path: string, host: string): Promise<numbe
 const REGISTERED: RegistrationStatus = {
   registered: true,
   registeredAt: 1_700_000_000,
-  balanceKlv: 50,
+  balanceKlv: 250,
   canAfford: true,
+  registrationFeeKlv: 100,
+  totalCostKlv: 104.4,
 };
 const UNREGISTERED: RegistrationStatus = {
   registered: false,
   registeredAt: 0,
   balanceKlv: 3,
   canAfford: false,
+  registrationFeeKlv: 100,
+  totalCostKlv: 104.4,
 };
 
 let operator: WalletSigner;
@@ -250,6 +254,30 @@ describe('localhost bypass', () => {
     const body = await json(res);
     expect(body.authenticatedAs).toBe('localhost');
     expect(body.registered).toBe(true);
+  });
+
+  it('answers /api/auth/state with 200 even when unauthenticated', async () => {
+    // Always 200 is the point: the page must learn whether it has a session
+    // without producing a console error in the common not-logged-in case.
+    // Probing via /api/status meant three guaranteed 401s on every page load,
+    // indistinguishable from a real fault.
+    const { baseUrl } = await start();
+    const res = await fetch(`${baseUrl}/api/auth/state`, {
+      headers: { 'x-forwarded-for': '203.0.113.7' }, // defeat the loopback bypass
+    });
+    expect(res.status).toBe(200);
+    expect((await json(res)).authenticated).toBe(false);
+  });
+
+  it('reports an authenticated session on /api/auth/state', async () => {
+    const { baseUrl, auth } = await start();
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/auth/state`, {
+      headers: { cookie: `ogmara_bot_session=${token}`, 'x-forwarded-for': '203.0.113.7' },
+    });
+    const body = await json(res);
+    expect(body.authenticated).toBe(true);
+    expect(body.authenticatedAs).toBe(operator.address);
   });
 
   it('adopts the wallet tier from every status poll', async () => {

@@ -107,12 +107,19 @@ export interface BroadcastResult {
  * @param address   The bot's `klv1…` address.
  * @param privateKey Raw 32-byte Ed25519 private key.
  * @param dataB64   Base64 call data from {@link buildCallData}.
+ * @param callValue KLV to send WITH the call, in raw units (1 KLV = 10^6).
+ *                  Omit or pass 0n for a non-payable endpoint.
+ *
+ * `callValue` is not optional decoration: a `#[payable]` endpoint that requires
+ * a fee rejects the whole build when nothing is attached, and Klever reports
+ * that as an HTTP 400 at BUILD time rather than a failure on chain.
  */
 export async function invokeContract(
   network: ScNetwork,
   address: string,
   privateKey: Uint8Array,
   dataB64: string,
+  callValue: bigint = 0n,
 ): Promise<BroadcastResult> {
   const net = kleverNetwork(network);
   const { nonce } = await getAccount(network, address);
@@ -120,7 +127,9 @@ export async function invokeContract(
   const contract = {
     scType: 0, // InvokeContract
     address: net.sc,
-    callValue: {},
+    // Keyed by KDA ticker, raw units. An empty object means "send nothing",
+    // which is correct for a non-payable endpoint and fatal for a payable one.
+    callValue: callValue > 0n ? { KLV: Number(callValue) } : {},
   };
 
   // Step 1 — BUILD. Despite the name, /transaction/send does not send: it
@@ -177,7 +186,22 @@ async function postJson(url: string, body: unknown): Promise<unknown> {
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
-    throw new KleverError(`Klever RPC ${url} returned HTTP ${resp.status}`);
+    // The BODY is the diagnosis, not the status code. Klever answers a rejected
+    // build with 400 and an `error` field naming the reason — e.g.
+    // "VMUserError - (Insufficient registration fee)" — and discarding it left
+    // the operator with "returned HTTP 400" and nothing to act on.
+    let detail = '';
+    try {
+      const text = await resp.text();
+      const parsed: unknown = JSON.parse(text);
+      const err = (parsed as { error?: unknown }).error;
+      detail = typeof err === 'string' && err.length > 0 ? err : text.slice(0, 400);
+    } catch {
+      // Body unreadable or not JSON; the status alone will have to do.
+    }
+    throw new KleverError(
+      `Klever RPC ${url} returned HTTP ${resp.status}${detail === '' ? '' : `: ${detail}`}`,
+    );
   }
   return resp.json();
 }

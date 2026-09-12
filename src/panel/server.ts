@@ -16,7 +16,6 @@ import type { AddressInfo } from 'node:net';
 import type { OgmaraClient, ScNetwork, WalletSigner } from '@ogmara/sdk';
 import type { ProfileResult, ProfileSpec, RegisterResult, RegistrationStatus } from '../identity.js';
 import { MAX_AVATAR_BYTES } from '../identity.js';
-import { REGISTRATION_COST_KLV } from '../klever.js';
 import { MediaError } from '../media.js';
 import type { StatsSnapshot } from '../statsHistory.js';
 import { PanelAuth } from './auth.js';
@@ -340,6 +339,20 @@ async function handle(
     res.writeHead(204).end();
     return;
   }
+  if (method === 'GET' && path === '/api/auth/state') {
+    // Always 200, even when unauthenticated — that is the whole point. The page
+    // has to find out whether it has a session before it can decide what to
+    // load, and discovering that via a 401 meant three guaranteed-to-fail
+    // requests in every operator's console on every page load, indistinguishable
+    // from a real fault. Reveals nothing the caller does not already hold: the
+    // answer is derived from their own cookie.
+    const who = local ? 'localhost' : verifySession(req, deps.auth);
+    sendJson(res, 200, {
+      authenticated: who !== undefined,
+      ...(who !== undefined ? { authenticatedAs: who } : {}),
+    });
+    return;
+  }
   if (method === 'GET' && path === '/api/auth/challenge') {
     // createChallenge() always succeeds (it evicts the oldest pending
     // challenge under pressure rather than refusing) specifically so this
@@ -425,7 +438,11 @@ async function handle(
       registeredAt: registration.registeredAt,
       balanceKlv: registration.balanceKlv,
       canAffordRegistration: registration.canAfford,
-      registrationCostKlv: REGISTRATION_COST_KLV,
+      // The chain's CURRENT total, not the transaction-fee constant. The fee is
+      // governance-controlled, so a hardcoded figure both understates the
+      // button and lets the panel offer a registration the chain will refuse.
+      registrationCostKlv: registration.totalCostKlv,
+      registrationFeeKlv: registration.registrationFeeKlv,
       authenticatedAs,
       walletBackupPending,
       bot: deps.botDescriptor(),
