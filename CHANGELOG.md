@@ -1,9 +1,212 @@
 # Changelog
 
-All notable changes to ogmara-newsbot will be documented in this file.
+All notable changes to ogmara-bot will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.18.0] - 2026-09-12
+
+The `commands` module: the bot now answers slash commands in channels, and
+declares itself a bot so every client renders those commands in its `/`
+autocomplete. This is Phase 6 of the bot-commands plan and the end-to-end proof
+of the feature — a real bot adopting it, built against the module contract from
+0.17.0 rather than wired in inline.
+
+### Added
+
+- **The `commands` module** (`src/modules/commands/`), owning the new `bot:`
+  config section. Enabled per-operator like any module; off by default.
+
+  A slash command is an **ordinary chat message** whose content starts with
+  `/name`, with the bot's wallet in `mentions[]`. There is no command message
+  type — deliberately, so the traffic is indistinguishable from chat and a
+  hostile relay cannot selectively drop it.
+- **Five commands to start**: `/about`, `/help`, `/sources`, `/latest [1-5]` and
+  `/topic <name>`. Chosen to exercise the parser rather than only the plumbing —
+  no-args, a numeric argument, and a case-preserving string argument. `/topic
+  Klever` must reach the handler as `Klever`: the SDK lowercases the command
+  token only, never the arguments, because lowercasing a ticker sends a bot
+  looking up a different asset.
+- **The bot descriptor is republished on every start**, unconditionally, with no
+  local "already published" bookkeeping. That state desyncs from what a node
+  actually holds — after a node wipe, on a fresh node, or on a dropped gossip
+  message — and the bot would then believe its commands were advertised while
+  every client saw nothing. The node compares content and suppresses its own
+  broadcast when nothing changed, so republishing costs nothing.
+- **Per-invoker rate limiting**, which is the bot's job rather than the node's:
+  because command traffic is indistinguishable from chat on the wire, a node
+  cannot identify it, let alone throttle it. Per-wallet and global per-minute
+  limits, with per-command cost weighting, plus a cap on how much of a single
+  budget window one wallet may take (`perWalletShareOfBudget`). That last one
+  matters: ten commands a minute is a polite rate, and sustained it is the whole
+  day's replies in under three hours — from one wallet that never exceeded a
+  stated limit, or the node's own limits either.
+- **A reply budget that reserves node quota for posting.** A reply is a chat
+  message, so it spends the same per-wallet quota the node meters for
+  everything this wallet sends — including news posts. A registered wallet gets
+  20 messages per 10-minute window and 300 per day, so an unbounded command
+  module could exhaust the daily quota before breakfast and the bot would post
+  no news for the rest of the day. Commands get a capped share
+  (`maxShareOfNodeBudget`, default 0.5) and posting keeps the rest. Expressed as
+  a share because the node ceiling moves 6x when a wallet registers on-chain.
+- **The Settings tab shows the advertised handle, channels and command list**,
+  read from local config — the first thing to check when a command is missing
+  from a client's picker, and it stays answerable while the node is unreachable.
+- `config.example.yaml` gains a fully documented `bot:` block.
+
+### Changed
+
+- **`@ogmara/sdk` 0.49.0 → 0.57.1**, for `parseCommand()`, `setBotCommands()`
+  and `getChannelBots()`. All 586 pre-existing tests pass unchanged across the
+  eight-minor jump.
+- Startup **refuses a private channel** in `bot.channels` rather than attempting
+  it. Private channels are force-encrypted and this build replies in plaintext
+  only, so it would answer nothing there — with no error anywhere for the
+  operator to find.
+- Startup **refuses a command the build has no handler for**. A bot advertising
+  a command it silently ignores reads to a user as a broken bot, and is worse
+  than not advertising it at all.
+- `bot.channels` is **required** when the module is enabled. There is no
+  "everywhere I have joined" default: answering spends the wallet's posting
+  quota, so where that happens should be written down rather than inferred.
+
+### Fixed
+
+- The CHANGELOG header still said `ogmara-newsbot`, missed in the 0.16.0 rename.
+- **Startup no longer dies when the descriptor publish fails.** That call is one
+  PUT to the profile endpoint; a 429 or a 5xx there would have thrown out of
+  `start()`, out of `startAll`, and taken down the news pipeline, which had
+  nothing to do with it. It now warns and keeps listening — commands still work
+  for anyone who types them, they just are not offered in the picker yet.
+- **A node hiccup at startup is no longer reported as a config error.** The
+  channel probe treated every failure as "this channel does not exist", so a
+  503 or a timeout told the operator to fix their channel ids and exited — under
+  systemd, a restart loop blaming the operator for a node problem. Only 404 and
+  403 mean "not there for us"; everything else propagates.
+- **Encrypted PUBLIC channels are now refused, not just private ones.** New
+  public channels are created with encryption forced on, so a private-only check
+  waved through most modern channels — where the bot would read ciphertext it
+  has no key for and answer nothing at all.
+- **A command could be permanently unanswerable on an unregistered wallet.**
+  There are three rate gates and the tightest is *derived* from the node tier
+  rather than configured: on the unverified tier (5 messages per 10 minutes) the
+  per-wallet window cap floors at 1. `/latest` carried a cost of 2 and ships in
+  `config.example.yaml`, so the default config on the default tier had a command
+  that could never be answered — and the bot replied telling the user they were
+  going too fast, when in fact they could never go slowly enough. Startup now
+  checks a command's cost against every gate, every built-in costs 1, and the
+  startup log prints the derived per-wallet ceiling (which was previously
+  invisible: an operator reading `perWalletPerMinute: 10` had no way to know the
+  real limit was 1).
+- **Registering the wallet now takes effect without a restart.** The node's
+  ceiling moves 6x on registration, but `setRegistered()` was only ever called
+  at startup — so registering from the control panel left the publisher's
+  posting budget *and* the new reply budget pinned at the unverified tier until
+  someone restarted the bot, while `/api/status` cheerfully reported
+  `registered: true` beside the stale `dailyLimit: 50`. The panel now propagates
+  the tier after a successful registration, and re-asserts it on every status
+  poll — which already reads the chain — so it is self-healing in both
+  directions rather than only on the happy path. Affects the news pipeline as
+  much as commands; it was simply never noticed.
+- A node being unreachable at startup is now reported as a node problem rather
+  than a bad channel id. Previously a 5xx or a timeout was indistinguishable
+  from "no such channel", so a restarting node told the operator to fix channel
+  ids that were perfectly correct — and under systemd did it in a restart loop.
+  It now takes preflight's clean exit path, so the operator gets a sentence
+  instead of a stack trace from the process-level catch-all.
+
+### Security
+
+- **Every outbound path is budgeted, including the throttle notice itself.**
+  Replying to each throttled request would turn the limiter into an amplifier
+  driven by the bot's own wallet: a 100-message flood would produce 100 "slow
+  down" replies. One notice per wallet per cooldown, then silence — and if the
+  node budget is gone the notice is dropped rather than spending the last of the
+  quota to announce that the quota is gone.
+- **The per-wallet map is bounded and evicts by least-recently-seen.** It is
+  keyed on an attacker-chosen value, so an unbounded map is a
+  memory-exhaustion vector that needs no valid wallet at all.
+- **Unknown commands are answered with silence.** A bare `/foo` with no handle
+  and no mentions is "addressed" for *every* bot in a channel — none can tell it
+  was meant for another — so an "unknown command" reply would make a three-bot
+  channel answer every typo three times.
+- **`posting.dryRun` covers command replies.** A reply is a real post under the
+  bot's real wallet; a module cannot opt out of the global safety catch.
+- Inbound messages are re-checked against the configured channel list even
+  though the subscription is already scoped, so a shared socket or a reconnect
+  from stale state cannot have the bot answering — and spending quota — in a
+  channel the operator never listed.
+- **The bot never echoes user text back raw.** `/topic` reflected its argument
+  into the reply, and the bot is the highest-trust poster in a channel:
+  Bot-badged, often verified, backed by a funded wallet. Clients auto-link URLs
+  and render `@klv1…` as a clickable mention pill, so echoing raw input let an
+  attacker publish a link *under the operator's identity* — with the abuse
+  reports, moderation actions and bans landing on the bot. Echoes now go through
+  a character whitelist: letters, digits, spaces and hyphens survive, and URLs,
+  mentions, hashtags, markdown, bidi overrides and zero-width characters do not.
+- **The bot answers only what it advertises.** Dispatch was driven by the handler
+  table rather than `bot.commands`, so an operator who deliberately omitted
+  `/topic` and `/sources` — to keep their feed and topic list private — still had
+  them answered. `/topic` against an undeclared handler is an exact-match oracle
+  over the operator's topic list, one guess at a time. `bot.commands` is now the
+  single source of truth for both the descriptor and the dispatch table.
+- **Message payloads are decoded behind capped decoder options.** The text
+  arrives as msgpack bytes from any wallet on the network, and
+  `@msgpack/msgpack` defaults every `max*` option to UINT32_MAX — decoding
+  without caps lets one payload force enormous allocation before any check of
+  ours runs. Malformed input yields empty fields and never throws.
+- **Edits no longer re-trigger commands.** The node broadcasts edits, reactions
+  and deletes under the same frame type, and an edit carries the full
+  replacement text — so a user could edit one message in a loop and draw a fresh
+  reply, and a fresh quota slot, each time. Only new chat messages are answered,
+  and answered message ids are remembered (bounded, oldest evicted) so a
+  reconnect replay is not answered twice.
+- **A global overload is answered with silence, never a notice.** Every
+  first-contact wallet was "due" a throttle notice, so a flood from 200 distinct
+  wallets would convert the entire reply budget into "I am busy" messages sent to
+  strangers. Only a wallet that exceeded *its own* limit is told, once.
+- **The per-wallet map cannot have its bound silently removed.** The cap default
+  was applied before the options spread, so an explicit `undefined` overwrote it
+  and `size >= undefined` was permanently false.
+- **Descriptor text is charset-validated at config load.** Control and bidi
+  codepoints previously passed the schema and threw at signing time — at startup,
+  against a live node — which is exactly the failure this schema exists to turn
+  into a YAML line number. U+200C/U+200D stay permitted: they are required for
+  emoji sequences and for correct Persian and Indic orthography.
+- **Dry run now also withholds the descriptor.** Publishing it is a real signed
+  `ProfileUpdate`, so an operator testing a config had already told the network
+  they were a bot, and published their whole command list, before deciding to go
+  live.
+- Replies are clipped by UTF-8 **bytes**, not UTF-16 units, on a code-point
+  boundary. The node's limit is bytes, so ~1360 CJK characters passed a
+  character-based cap and was rejected by the node — after the reply budget had
+  already been spent on it.
+- Attacker-influenced text reaching the operator's terminal in dry-run logs is
+  stripped of control characters, so ANSI escapes cannot rewrite what they see.
+- **The startup log no longer tells a correctly registered operator to
+  register.** The "quota is low" hint keyed off the derived per-wallet cap
+  alone, and on the default *registered* tier that cap is 2 — so the advice
+  fired for everyone.
+- **The echo whitelist excludes invisible characters, not only control ones.**
+  "Letters and digits" was not enough: the Hangul fillers are ordinary letters
+  that render as nothing, and `\p{N}` includes U+2488 (`⒈`, which renders as
+  "1.") — so a letters-and-digits whitelist still admitted invisible padding and
+  a period-shaped glyph, which is most of what is needed to make an echoed string
+  read as a domain.
+- **Decoded message content is capped at the node's own 4096-byte chat limit.**
+  The decoder allowed 1 MB, and the next thing to touch that string splits it on
+  whitespace — *before* the rate limiter — so an oversized payload bought a
+  ~500,000-element array per message for free.
+- **Wallet addresses and message ids from the node are length-checked before
+  being retained.** Both become keys in bounded collections, but those bounds
+  count entries rather than bytes, so a hostile or compromised node could park
+  gigabytes in maps that looked correctly bounded.
+- A mention list is no longer truncated to a fixed count. Keeping the first 64
+  silently broke a legitimate invocation: a message that mentions many people
+  before the bot lost the bot's own address, leaving a non-empty list that does
+  not name it — which reads as "addressed to someone else".
+- `npm audit`: **0 vulnerabilities**.
 
 ## [0.17.0] - 2026-09-12
 

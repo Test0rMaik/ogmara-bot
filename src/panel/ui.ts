@@ -177,6 +177,10 @@ export function renderPage(ctx: PageContext): string {
       <dl id="status"></dl>
 
       <hr>
+      <h2>Slash commands</h2>
+      <div id="bot-identity"></div>
+
+      <hr>
       <h2>Display name</h2>
       <label for="display-name">Display name</label>
       <input id="display-name" maxlength="64">
@@ -305,6 +309,60 @@ function setField(dl, label, value) {
   dd.textContent = value;
   dl.appendChild(dt);
   dl.appendChild(dd);
+}
+
+/**
+ * Render the slash-command identity this bot advertises.
+ *
+ * Read-only: this reflects the "bot:" block in config.yaml, which is the first
+ * thing to check when a command is missing from a client's "/" picker. Built as
+ * DOM nodes with textContent throughout, so a command description can
+ * never become markup in the operator's own dashboard. (The panel test asserts
+ * this script contains no markup-assignment API at all — keep it that way.)
+ */
+function renderBotIdentity(bot) {
+  const host = document.getElementById('bot-identity');
+  host.textContent = '';
+  if (!bot || !bot.enabled) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent =
+      'Not enabled. Set bot.enabled and list the channels to answer in — see config.example.yaml.';
+    host.appendChild(p);
+    return;
+  }
+
+  const dl = document.createElement('dl');
+  setField(dl, 'Handle', bot.handle ? '@' + bot.handle : 'none');
+  setField(dl, 'Channels', bot.channels.length ? bot.channels.join(', ') : 'none');
+  host.appendChild(dl);
+
+  if (!bot.commands.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    // A bot with no commands is valid — it still gets the Bot badge — so this
+    // is stated rather than treated as an error.
+    p.textContent = 'No commands advertised. The Bot badge still applies.';
+    host.appendChild(p);
+    return;
+  }
+
+  const ul = document.createElement('ul');
+  for (const cmd of bot.commands) {
+    const li = document.createElement('li');
+    const code = document.createElement('code');
+    code.textContent = '/' + cmd.name + (cmd.argsHint ? ' ' + cmd.argsHint : '');
+    li.appendChild(code);
+    li.appendChild(document.createTextNode(' — ' + cmd.description));
+    ul.appendChild(li);
+  }
+  host.appendChild(ul);
+
+  const note = document.createElement('p');
+  note.className = 'muted';
+  note.textContent =
+    'Republished to the node on every start. If a client still shows nothing, check that the node is on 0.127.0 or newer.';
+  host.appendChild(note);
 }
 
 function switchTab(name) {
@@ -768,6 +826,8 @@ async function refresh() {
   setField(dl, 'Daily limit', String(status.dailyLimit));
   setField(dl, 'Burst limit (10 min)', String(status.burstLimit));
   setField(dl, 'Balance', status.balanceKlv.toFixed(4) + ' KLV');
+
+  renderBotIdentity(status.bot);
 
   const registerBtn = document.getElementById('register-btn');
   if (status.registered) {

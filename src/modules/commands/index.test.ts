@@ -1,0 +1,629 @@
+import { describe, expect, it, vi } from 'vitest';
+import { encode } from '@msgpack/msgpack';
+import { MessageType, type Envelope } from '@ogmara/sdk';
+import type { Config } from '../../config.js';
+import type { BotContext } from '../types.js';
+import { botSchema, type BotConfig } from './schema.js';
+import { createCommandsModule, type ChannelFacts, type CommandsDeps } from './index.js';
+import { capFor } from './rateLimit.js';
+import type { CommandHandler } from './handlers.js';
+
+function botCfg(over: Record<string, unknown> = {}): BotConfig {
+  return botSchema.parse({ enabled: true, channels: [7], ...over });
+}
+
+function configWith(bot: BotConfig, dryRun = false): Config {
+  return {
+    posting: { dryRun },
+    sources: {
+      rss: { enabled: false, feeds: [] },
+      topics: { enabled: false, topics: [] },
+      imagedir: { enabled: false, directories: [] },
+    },
+    bot,
+  } as unknown as Config;
+}
+
+function ctxWith(config: Config): BotContext {
+  return {
+    config,
+    secrets: {},
+    publisher: { address: 'klv1bot', burstLimit: 20, dailyLimit: 300 },
+    log: () => {},
+    warn: () => {},
+  } as unknown as BotContext;
+}
+
+const publicChannel: ChannelFacts = { name: 'general', encrypted: false, canPost: true };
+
+function depsWith(over: Partial<CommandsDeps> = {}): CommandsDeps {
+  return {
+    reply: vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {}),
+    subscribeChannels: vi.fn(async () => () => {}),
+    describeChannel: vi.fn(async () => publicChannel),
+    publishDescriptor: vi.fn(async () => {}),
+    ...over,
+  };
+}
+
+let msgSeq = 0;
+
+/**
+ * Build an envelope the way the NODE actually delivers one.
+ *
+ * The text and mentions go in `payload` as msgpack bytes, because that is where
+ * they live on the wire: the node enriches the frame with `msg_id`, `author` and
+ * `channel_id` and nothing else. An earlier version of this helper invented
+ * top-level `content`/`mentions` fields — the whole suite passed while the
+ * module could not answer a single command against a real node. Build the real
+ * shape here, or these tests prove nothing.
+ *
+ * `payload` is a number[] because the frame arrives as JSON, which has no byte
+ * array.
+ */
+function msg(
+  content: string,
+  opts: {
+    from?: string;
+    channel?: number;
+    mentions?: string[];
+    msgType?: number | string;
+    msgId?: string;
+  } = {},
+): Envelope {
+  const payload = encode({ content, mentions: opts.mentions ?? [] });
+  msgSeq += 1;
+  return {
+    author: opts.from ?? 'klv1user',
+    channel_id: opts.channel ?? 7,
+    msg_id: opts.msgId ?? `msg-${msgSeq}`,
+    msg_type: opts.msgType ?? MessageType.ChatMessage,
+    payload: Array.from(payload),
+  } as unknown as Envelope;
+}
+
+/**
+ * Start the module and hand back the message callback the core registered, so a
+ * test can deliver traffic the way the node would.
+ */
+async function startAndCapture(
+  deps: CommandsDeps,
+  ctx: BotContext,
+): Promise<{ deliver: (e: Envelope) => void; stop: () => Promise<void> }> {
+  let deliver: ((e: Envelope) => void) | undefined;
+  const subscribeChannels = vi.fn(async (_ch: number[], onMessage: (e: Envelope) => void) => {
+    deliver = onMessage;
+    return () => {};
+  });
+  const mod = createCommandsModule({ ...deps, subscribeChannels });
+  await mod.preflight!(ctx);
+  const handle = await mod.start(ctx);
+  return {
+    deliver: (e) => deliver!(e),
+    stop: () => handle.stop(),
+  };
+}
+
+/** Let the fire-and-forget handler promise settle. */
+const settle = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+describe('commands module preflight', () => {
+  it('refuses a command the build has no handler for', async () => {
+    // Advertising a command the bot silently ignores reads to a user as the bot
+    // being broken, and is worse than not advertising it at all.
+    const cfg = botCfg({ commands: [{ name: 'nosuch', description: 'x' }] });
+    const failure = await createCommandsModule(depsWith()).preflight!(ctxWith(configWith(cfg)));
+    expect(failure).not.toBeNull();
+    expect(failure!.message).toContain('/nosuch');
+    expect(failure!.message).toContain('no handler');
+  });
+
+  it('refuses an empty channel list rather than guessing', async () => {
+    const failure = await createCommandsModule(depsWith()).preflight!(
+      ctxWith(configWith(botCfg({ channels: [] }))),
+    );
+    expect(failure!.message).toContain('bot.channels is empty');
+  });
+
+  it('refuses a channel the node does not serve, naming the id', async () => {
+    const deps = depsWith({ describeChannel: vi.fn(async () => null) });
+    const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
+    expect(failure!.message).toContain('channel 7');
+  });
+
+  it('refuses an ENCRYPTED channel instead of posting plaintext into it', async () => {
+    // In an encrypted channel the bot reads ciphertext it has no key for, so it
+    // answers nothing — and a plaintext reply would downgrade a channel whose
+    // policy is encrypt-on-send. Not only private channels: new PUBLIC channels
+    // are created with encryption forced on, which is what makes a
+    // private-only check wave through most modern channels.
+    const deps = depsWith({
+      describeChannel: vi.fn(async () => ({ name: 'secret', encrypted: true, canPost: true })),
+    });
+    const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
+    expect(failure!.message).toContain('encrypted');
+  });
+
+  it('refuses a command costing more than one wallet can ever spend', async () => {
+    // Every shipped handler costs 1 today, so this drives the gate from the
+    // other side: a global ceiling below the cheapest possible command.
+    const cfg = botSchema.parse({
+      enabled: true,
+      channels: [7],
+      commands: [{ name: 'about', description: 'who I am' }],
+      rateLimit: { perWalletPerMinute: 1, globalPerMinute: 1 },
+    });
+    const ctx = ctxWith(configWith(cfg));
+    (ctx.publisher as unknown as { burstLimit: number }).burstLimit = 20;
+    expect(await createCommandsModule(depsWith()).preflight!(ctx)).toBeNull();
+  });
+
+  it('starts on an UNREGISTERED wallet with the shipped example commands', async () => {
+    // REGRESSION GUARD. The derived per-wallet window cap floors at 1 on the
+    // unverified tier (5 messages/10min), so any shipped command costing more
+    // than 1 would make the default config refuse to start for exactly the
+    // operators least able to diagnose it. Every built-in handler costs 1.
+    const cfg = botSchema.parse({
+      enabled: true,
+      channels: [7],
+      commands: [
+        { name: 'about', description: 'a' },
+        { name: 'help', description: 'b' },
+        { name: 'sources', description: 'c' },
+        { name: 'latest', description: 'd', argsHint: '[1-5]' },
+        { name: 'topic', description: 'e', argsHint: '<name>' },
+      ],
+    });
+    const ctx = ctxWith(configWith(cfg));
+    (ctx.publisher as unknown as { burstLimit: number }).burstLimit = 5; // unregistered
+    expect(await createCommandsModule(depsWith()).preflight!(ctx)).toBeNull();
+  });
+
+  it('refuses a costly command at EACH of the three gates', async () => {
+    // These assertions fail if the gate loop is removed — the previous version
+    // restated the arithmetic locally and passed either way, which is the same
+    // vacuous-test shape that let the original bug through.
+    //
+    // Every built-in costs 1, so the gates are unreachable from config alone;
+    // the handler override exists precisely so this guard can be tested.
+    const costly = (): Map<string, CommandHandler> =>
+      new Map([['pricey', { run: async () => 'x', cost: 4 }]]);
+    const base = {
+      enabled: true,
+      channels: [7],
+      commands: [{ name: 'pricey', description: 'expensive' }],
+    };
+
+    // Gate 1: per-wallet per minute.
+    let failure = await createCommandsModule(depsWith({ handlersOverride: costly })).preflight!(
+      ctxWith(configWith(botSchema.parse({ ...base, rateLimit: { perWalletPerMinute: 3 } }))),
+    );
+    expect(failure!.message).toContain('perWalletPerMinute');
+
+    // Gate 2: the global ceiling — denied SILENTLY at runtime, so nothing at all
+    // would be logged, which makes catching it at startup more important.
+    failure = await createCommandsModule(depsWith({ handlersOverride: costly })).preflight!(
+      ctxWith(
+        configWith(
+          botSchema.parse({ ...base, rateLimit: { perWalletPerMinute: 10, globalPerMinute: 2 } }),
+        ),
+      ),
+    );
+    expect(failure!.message).toContain('globalPerMinute');
+
+    // Gate 3: the DERIVED per-wallet window cap. Registered tier gives
+    // capFor(20, 0.5) = 10, then capFor(10, 0.25) = 2 — under a cost of 4.
+    failure = await createCommandsModule(depsWith({ handlersOverride: costly })).preflight!(
+      ctxWith(configWith(botSchema.parse(base))),
+    );
+    expect(failure!.message).toContain('per-wallet window cap');
+    expect(failure!.message).toContain('/pricey');
+  });
+
+  it('names the MOST expensive blocked command, not the first', async () => {
+    const many = (): Map<string, CommandHandler> =>
+      new Map([
+        ['cheapish', { run: async () => 'x', cost: 4 }],
+        ['dear', { run: async () => 'x', cost: 9 }],
+      ]);
+    const failure = await createCommandsModule(depsWith({ handlersOverride: many })).preflight!(
+      ctxWith(
+        configWith(
+          botSchema.parse({
+            enabled: true,
+            channels: [7],
+            commands: [
+              { name: 'cheapish', description: 'a' },
+              { name: 'dear', description: 'b' },
+            ],
+            rateLimit: { perWalletPerMinute: 3 },
+          }),
+        ),
+      ),
+    );
+    // The expensive one sets the limit the operator actually has to clear.
+    expect(failure!.message).toContain('/dear');
+    expect(failure!.message).toContain('costs 9');
+  });
+
+  it('reports an unreachable node as a node problem, not a bad channel id', async () => {
+    // A 5xx or a timeout used to be indistinguishable from "no such channel",
+    // so a restarting node told the operator to fix channel ids that were
+    // perfectly correct — and, under systemd, did it in a restart loop.
+    const deps = depsWith({ describeChannel: vi.fn(async () => 'unreachable' as const) });
+    const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
+    expect(failure!.message).toContain('Could not reach the node');
+    expect(failure!.message).not.toContain('Check the id');
+  });
+
+  it('pins the derived per-wallet window cap, which is what shipped broken', () => {
+    // The gate has three limits and the tightest is DERIVED from the node tier,
+    // not configured. On an unregistered wallet it floors at 1:
+    //
+    //   burstCap        = max(1, floor(5 * 0.5))  = 2
+    //   perWalletWindow = max(1, floor(2 * 0.25)) = 1
+    //
+    // `/latest` shipped at cost 2, in config.example.yaml. The preflight
+    // validated only `perWalletPerMinute` (10, satisfied), so the default config
+    // on the default tier carried a command that could never be answered — and
+    // the bot told the user they were going too fast. Every built-in now costs
+    // 1, and the preflight checks all three gates, so a future costed handler
+    // cannot reintroduce this silently.
+    // The SHIPPED helper, not a local copy — a restated formula cannot notice
+    // `capFor` changing, which is the drift that caused the bug.
+    const cap = (burst: number, share: number, walletShare: number): number =>
+      capFor(capFor(burst, share), walletShare);
+
+    expect(cap(5, 0.5, 0.25)).toBe(1); // unregistered — the broken case
+    expect(cap(20, 0.5, 0.25)).toBe(2); // registered
+    expect(cap(20, 1, 1)).toBe(20); // operator hands it the whole quota
+  });
+
+
+  it('refuses a channel where the wallet cannot post', async () => {
+    const deps = depsWith({
+      describeChannel: vi.fn(async () => ({ name: 'announce', encrypted: false, canPost: false })),
+    });
+    const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
+    expect(failure!.message).toContain('not allowed to post');
+  });
+
+  it('passes for a public channel with known commands', async () => {
+    const cfg = botCfg({ commands: [{ name: 'about', description: 'who I am' }] });
+    expect(
+      await createCommandsModule(depsWith()).preflight!(ctxWith(configWith(cfg))),
+    ).toBeNull();
+  });
+});
+
+describe('commands module start', () => {
+  it('republishes the descriptor UNCONDITIONALLY, tracking no local state', async () => {
+    // Local "last published" state desyncs from what a node actually holds —
+    // after a node wipe, on a fresh node, or on a dropped gossip message — and
+    // the bot would then believe its commands were advertised while every
+    // client saw nothing. The node suppresses its own broadcast when content is
+    // unchanged, so republishing costs nothing.
+    const publishDescriptor = vi.fn(async (_d: Parameters<CommandsDeps['publishDescriptor']>[0]) => {});
+    const deps = depsWith({ publishDescriptor });
+    const cfg = botCfg({ commands: [{ name: 'about', description: 'who I am' }] });
+    const ctx = ctxWith(configWith(cfg));
+
+    for (let i = 0; i < 3; i += 1) {
+      const mod = createCommandsModule(deps);
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+    }
+    expect(publishDescriptor).toHaveBeenCalledTimes(3);
+  });
+
+  it('sends argsHint under its WIRE name, not the config name', async () => {
+    // Config says `argsHint`, the protocol says `args_hint`. Getting this wrong
+    // publishes a descriptor whose hints silently vanish in every client.
+    const publishDescriptor = vi.fn(async (_d: Parameters<CommandsDeps['publishDescriptor']>[0]) => {});
+    const cfg = botCfg({
+      commands: [{ name: 'latest', description: 'recent posts', argsHint: '[1-5]' }],
+    });
+    const ctx = ctxWith(configWith(cfg));
+    const mod = createCommandsModule(depsWith({ publishDescriptor }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(publishDescriptor.mock.calls[0]![0]).toEqual({
+      commands: [{ name: 'latest', description: 'recent posts', args_hint: '[1-5]' }],
+    });
+  });
+
+  it('stop() is safe to call twice', async () => {
+    const ctx = ctxWith(configWith(botCfg()));
+    const mod = createCommandsModule(depsWith());
+    await mod.preflight!(ctx);
+    const handle = await mod.start(ctx);
+    await handle.stop();
+    await expect(handle.stop()).resolves.toBeUndefined();
+  });
+});
+
+describe('commands module message handling', () => {
+  const cfg = botCfg({
+    commands: [
+      { name: 'about', description: 'who I am' },
+      { name: 'topic', description: 'do I cover this', argsHint: '<name>' },
+    ],
+  });
+
+  it('answers an addressed command', async () => {
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/about', { mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply.mock.calls[0]![1]).toContain('ogmara-bot');
+    await stop();
+  });
+
+  it('never answers its OWN messages', async () => {
+    // Without this a reply that itself begins with "/" loops forever, with the
+    // bot spending its own wallet quota on every iteration.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/about', { from: 'klv1bot', mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('stays SILENT on a command it does not implement', async () => {
+    // A bare `/foo` with no handle and no mentions is "addressed" for EVERY bot
+    // in the channel — none can tell it was meant for another — so replying
+    // "unknown command" makes a three-bot channel answer every typo three times.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/nosuchthing', { mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('ignores ordinary chat', async () => {
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('just talking about /about really'));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('ignores a channel it was never configured for', async () => {
+    // Second lock behind the scoped subscription: a shared socket or a
+    // reconnect re-subscribing from stale state would otherwise have the bot
+    // answering — and spending quota — somewhere the operator never listed.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/about', { channel: 999, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('preserves argument CASE', async () => {
+    // The SDK lowercases the command token only, never the arguments —
+    // lowercasing a ticker or a topic sends the bot looking up a different
+    // thing. `/topic Klever` must reach the handler as "Klever".
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const config = configWith(
+      botSchema.parse({
+        enabled: true,
+        channels: [7],
+        commands: [{ name: 'topic', description: 'do I cover this' }],
+      }),
+    );
+    (config as unknown as { sources: { topics: { enabled: boolean; topics: string[] } } }).sources.topics = {
+      enabled: true,
+      topics: ['Klever'],
+    };
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(config));
+    deliver(msg('/topic Klever', { mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply.mock.calls[0]![1]).toContain('"Klever"');
+    await stop();
+  });
+
+  it('does not reply after stop(), even for a message already dispatched', async () => {
+    // Closing the socket does not un-dispatch a message already handed to the
+    // callback, and handling is async. Without the guard a module that has been
+    // stopped still spends the wallet's quota after shutdown was reported.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/about', { mentions: ['klv1bot'] }));
+    await stop();
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('ignores an EDIT of a message, even one whose text is a command', async () => {
+    // The node broadcasts edits, reactions and deletes under the same frame
+    // type, and an edit payload carries the full replacement text. Without a
+    // type check, a user can edit one message in a loop and draw a fresh reply —
+    // and a fresh quota slot — every time.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/about', { mentions: ['klv1bot'], msgType: MessageType.ChatEdit }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('accepts the msg_type the WebSocket actually sends (the variant NAME)', async () => {
+    // The envelope type says `msg_type: number`, but the node serialises the
+    // Rust enum as its name. A numeric-only check passes every hand-built
+    // fixture and rejects every live frame.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/about', { mentions: ['klv1bot'], msgType: 'ChatMessage' }));
+    await settle();
+    expect(reply).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
+  it('answers a re-delivered message only once', async () => {
+    // A reconnect replays, and the same frame reaches every connection.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    for (let i = 0; i < 4; i += 1) {
+      deliver(msg('/about', { mentions: ['klv1bot'], msgId: 'same-id' }));
+      await settle();
+    }
+    expect(reply).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
+  it('ignores a command that is implemented but NOT declared in config', async () => {
+    // `bot.commands` is the single source of truth for both the descriptor and
+    // the dispatch table. Otherwise an operator who omits `/topic` to keep their
+    // topic list private still gets an exact-match oracle over it, one guess at
+    // a time — and `/help` would lie about what the bot answers.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const onlyAbout = botCfg({ commands: [{ name: 'about', description: 'who I am' }] });
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ reply }),
+      ctxWith(configWith(onlyAbout)),
+    );
+    deliver(msg('/topic Klever', { mentions: ['klv1bot'] }));
+    deliver(msg('/sources', { mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+
+    deliver(msg('/about', { mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
+  it('never echoes a link or a mention back into a message it signs', async () => {
+    // The bot is the highest-trust poster in a channel: Bot-badged, often
+    // verified, funded wallet. Clients auto-link URLs and render @klv1… as a
+    // clickable pill, so echoing raw input publishes an attacker's link under
+    // the operator's identity — and the abuse reports land on the bot.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(
+      msg('/topic @klv1victim verify at https://evil.example #urgent', { mentions: ['klv1bot'] }),
+    );
+    await settle();
+    const sent = reply.mock.calls[0]?.[1] ?? '';
+    expect(sent).not.toContain('@klv1victim');
+    expect(sent).not.toContain('https://');
+    expect(sent).not.toContain('#urgent');
+    await stop();
+  });
+
+  it('never echoes INVISIBLE characters back either', async () => {
+    // "Letters and digits only" is not enough. The Hangul fillers are ordinary
+    // `\p{L}` letters that render as nothing, and `\p{N}` includes U+2488 (`⒈`,
+    // which renders as "1.") — so a letters-and-digits whitelist still admits
+    // both invisible padding and a period-shaped glyph, which is most of what is
+    // needed to make an echo read as a domain.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
+    deliver(msg('/topic \u3164\u1160\u115F\uFFA0evil\u2488com', { mentions: ['klv1bot'] }));
+    await settle();
+    const sent = reply.mock.calls[0]?.[1] ?? '';
+    expect(sent).not.toContain('\u3164');
+    expect(sent).not.toContain('\u2488');
+    expect(sent).toContain('evilcom');
+    await stop();
+  });
+
+  it('does not publish the descriptor in dry run', async () => {
+    // setBotCommands is a real signed ProfileUpdate against the live network.
+    // An operator testing a config would otherwise have already told everyone
+    // they are a bot, and published their whole command list, before deciding
+    // to go live.
+    const publishDescriptor = vi.fn(async (_d: Parameters<CommandsDeps['publishDescriptor']>[0]) => {});
+    const ctx = ctxWith(configWith(cfg, true));
+    const mod = createCommandsModule(depsWith({ publishDescriptor }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+    expect(publishDescriptor).not.toHaveBeenCalled();
+  });
+
+  it('keeps running when the descriptor publish fails', async () => {
+    // One PUT to the profile endpoint. A 429 or 5xx there must not throw out of
+    // start(), out of startAll, and take down the news pipeline with it.
+    const publishDescriptor = vi.fn(async () => {
+      throw new Error('API error (429)');
+    });
+    const ctx = ctxWith(configWith(cfg));
+    const mod = createCommandsModule(depsWith({ publishDescriptor }));
+    await mod.preflight!(ctx);
+    const handle = await mod.start(ctx);
+    expect(handle).toBeDefined();
+    await handle.stop();
+  });
+
+  it('publishes NOTHING in dry run', async () => {
+    // dryRun is the safety catch that lets an operator test a config against a
+    // live network. A command reply is a real post under the bot's real wallet,
+    // so it is not exempt.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ reply }),
+      ctxWith(configWith(cfg, true)),
+    );
+    deliver(msg('/about', { mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('stops replying once the wallet-quota share is spent', async () => {
+    // Burst limit 20 x share 0.5 = 10 replies per 10-minute window; the rest of
+    // the wallet's quota stays reserved for the news pipeline.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const config = configWith(
+      botSchema.parse({
+        enabled: true,
+        channels: [7],
+        commands: [{ name: 'about', description: 'who I am' }],
+        rateLimit: { perWalletPerMinute: 600, globalPerMinute: 600 },
+      }),
+    );
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(config));
+    for (let i = 0; i < 30; i += 1) {
+      deliver(msg('/about', { from: `klv1u${i}`, mentions: ['klv1bot'] }));
+      await settle();
+    }
+    expect(reply).toHaveBeenCalledTimes(10);
+    await stop();
+  });
+
+  it('does not spend the last of the quota announcing that the quota is gone', async () => {
+    // The throttle notice is itself a chat message and costs node quota, so it
+    // goes through the same budget as a real reply — the amplifier trap in its
+    // purest form.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const config = configWith(
+      botSchema.parse({
+        enabled: true,
+        channels: [7],
+        commands: [{ name: 'about', description: 'who I am' }],
+        rateLimit: { perWalletPerMinute: 1, globalPerMinute: 600 },
+        // 20 * 0.05 -> floor 1: exactly one message of quota exists.
+        ...{},
+      }),
+    );
+    (config.bot.rateLimit as { maxShareOfNodeBudget: number }).maxShareOfNodeBudget = 0.05;
+    const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(config));
+
+    deliver(msg('/about', { from: 'klv1u', mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledTimes(1); // the answer consumed the only slot
+
+    for (let i = 0; i < 5; i += 1) {
+      deliver(msg('/about', { from: 'klv1u', mentions: ['klv1bot'] }));
+      await settle();
+    }
+    expect(reply).toHaveBeenCalledTimes(1); // no notices squeezed past the budget
+    await stop();
+  });
+});

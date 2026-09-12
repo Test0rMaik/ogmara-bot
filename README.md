@@ -395,6 +395,54 @@ the feed while the bot waits still gets published.
 Queued posts are published before anything new is composed. They expire after
 24 hours by default, because stale news is worse than no news.
 
+### Answering slash commands in channels
+
+Set `bot.enabled` and the bot declares itself a **bot** on the network and
+answers slash commands in the channels you list. Clients read the descriptor it
+publishes and render those commands in their `/` autocomplete, the way Telegram
+does.
+
+```yaml
+bot:
+  enabled: true
+  handle: ogmarabot          # for "/cmd@handle" when several bots share a channel
+  channels: [1, 7]           # REQUIRED — answering spends your posting quota
+  commands:
+    - name: about
+      description: What this bot is and who runs it
+    - name: topic
+      description: Do I cover this topic?
+      argsHint: "<name>"
+```
+
+A slash command is an **ordinary chat message** whose content starts with
+`/name`, with the bot's wallet in the message's mentions. There is no separate
+command message type — deliberately, so the traffic is indistinguishable from
+chat and a hostile relay cannot selectively drop it.
+
+The cost of that design is that the **node cannot rate-limit commands**, because
+it cannot tell them apart from chat. The bot does that job itself, under
+`bot.rateLimit`. The setting worth understanding is `maxShareOfNodeBudget`
+(default `0.5`): a reply is a chat message, so it spends the same per-wallet
+quota the node meters for your news posts. A registered wallet gets 300 messages
+a day — an unbounded command module could spend them all by breakfast and your
+bot would post no news for the rest of the day. Half the quota goes to commands,
+half stays reserved for posting.
+
+Three things startup refuses rather than limping on:
+
+- a command name with **no handler in this build** — advertising a command the
+  bot silently ignores reads to a user as a broken bot;
+- a **private channel** — those are force-encrypted and this build replies in
+  plaintext only, so it would answer nothing there;
+- an **empty `channels` list** — there is no "everywhere I've joined" default.
+
+`posting.dryRun` covers replies too, so you can point a configured bot at a live
+channel and watch what it *would* say. The Settings tab shows the handle,
+channels and command list it is advertising.
+
+Requires a node on **l2-node 0.127.0 or newer**.
+
 ## Commands
 
 ```bash
@@ -424,6 +472,8 @@ npm run build                     # compile to dist/
 | P4 | Rate-limit backoff, retries | **done** (in the 0.4.0 audit pass) |
 | P5 | Web control panel (display name, wallet registration, wallet-signature login) | **done** |
 | P6 | Docker (**done**), full docs, v1.0.0 | in progress |
+| P7 | Module contract; `news` extracted behind it | **done** (0.17.0) |
+| P8 | `commands` module — slash commands in channels | **done** (0.18.0) |
 
 ## Posting responsibly
 

@@ -128,6 +128,34 @@ export interface PanelDeps {
    * before anything reaches the node.
    */
   uploadAvatar: (bytes: Uint8Array, mimeType: string, filename: string) => Promise<{ avatarCid: string }>;
+  /**
+   * The slash-command identity this bot is advertising, for the Settings tab.
+   *
+   * Read from local config rather than from the node on purpose: this answers
+   * "what did I configure", which is what an operator debugging a missing
+   * command needs first, and it stays answerable while the node is unreachable.
+   */
+  botDescriptor: () => BotDescriptorView;
+  /**
+   * Tell the rest of the process the wallet's on-chain tier.
+   *
+   * The node applies a 6x higher ceiling to a registered wallet, and several
+   * components model that ceiling — the publisher's own budget and the commands
+   * module's reply budget among them. Startup was the only place that ever set
+   * it, so registering from this panel left every one of them throttled at the
+   * unverified tier until someone restarted the bot, while this same endpoint
+   * cheerfully reported `registered: true`. Called from `/api/status` too, so it
+   * is self-healing in both directions rather than only on the happy path.
+   */
+  setRegistered: (registered: boolean) => void;
+}
+
+/** The `bot:` config section, projected for the panel. */
+export interface BotDescriptorView {
+  readonly enabled: boolean;
+  readonly handle?: string;
+  readonly channels: readonly number[];
+  readonly commands: readonly { name: string; description: string; argsHint?: string | undefined }[];
 }
 
 /** Per-instance mutable state, kept out of PanelDeps because it isn't config. */
@@ -368,6 +396,11 @@ async function handle(
       });
       return;
     }
+    // Every poll already reads the chain, so this is a free correction — and it
+    // is what stops the response contradicting itself by reporting a fresh
+    // `registered: true` beside a stale unverified `dailyLimit`.
+    deps.setRegistered(registration.registered);
+
     sendJson(res, 200, {
       botAddress: deps.botAddress,
       network: deps.network,
@@ -381,6 +414,7 @@ async function handle(
       registrationCostKlv: REGISTRATION_COST_KLV,
       authenticatedAs,
       walletBackupPending,
+      bot: deps.botDescriptor(),
     });
     return;
   }
@@ -573,6 +607,11 @@ async function handle(
     try {
       const key = hexToKey(deps.walletKeyHex);
       const result = await deps.registerWallet(deps.network, deps.signer, key);
+      // The whole point of registering is the 6x ceiling; adopt it now rather
+      // than at the next restart.
+      if (result.status === 'registered' || result.status === 'already-registered') {
+        deps.setRegistered(true);
+      }
       sendJson(res, 200, result);
     } catch (err) {
       sendJson(res, 502, {

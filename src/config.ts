@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { describeAddressProblem, validateAddress } from './address.js';
 import { TrustedProxies } from './panel/clientip.js';
 import { isValidCron } from './scheduler.js';
+import { botSchema } from './modules/commands/schema.js';
 
 /**
  * The node's per-wallet news limits, as of l2-node 0.122.0.
@@ -469,6 +470,10 @@ const configSchema = z.object({
   storage: storageSchema.prefault({}),
   panel: panelSchema.prefault({}),
   stats: statsSchema.prefault({}),
+  // Owned by the `commands` module, per the module contract — the module is the
+  // source of truth for its own section, which is what lets the operator
+  // settings page render from the schema instead of being hand-written.
+  bot: botSchema.prefault({}),
 });
 
 /** Fully validated bot configuration (secrets excluded). */

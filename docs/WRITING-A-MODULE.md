@@ -55,7 +55,15 @@ export const widgetSchema = z.object({
 Then compose it in `config.ts`'s `configSchema` and expose it in your module's
 `schemas` map under the same key.
 
-**2. Implement the interface.** `src/modules/news.ts` is the worked example.
+**2. Implement the interface.** Two worked examples, and they differ in a way
+worth knowing before you pick one to copy:
+
+- `src/modules/news.ts` — **scheduled**. Registers cron jobs and does its work on
+  a timer. Copy this for anything that runs *on its own initiative*.
+- `src/modules/commands/` — **reactive**. Holds a subscription and does its work
+  when something arrives from the network. Copy this for anything driven by
+  *other people's traffic*, and read its rate limiter first: input you did not
+  schedule is input an attacker controls the volume of.
 
 **3. Register it** in `index.ts`'s `allModules` array.
 
@@ -68,6 +76,14 @@ starts it, and `stopAll` shuts it down.
 publishes is a new posting path and gets the same budget as everything else. The
 budget exists because the node enforces one; a module that bypasses it doesn't
 get to post more, it gets the bot rate-limited.
+
+The sharper version, if your module posts in *response* to something: the node
+meters one per-wallet quota for everything this bot sends, so your module is
+spending the same allowance the news pipeline needs. A registered wallet gets
+300 messages a day. Take a bounded share of that and leave the rest — see
+`maxShareOfNodeBudget` in the `commands` module — because the failure mode is
+not "my module gets throttled", it is "the bot stopped posting news at 09:00 and
+nobody knows why".
 
 **`posting.dryRun` is global and you cannot opt out of it.** It's the safety
 catch that lets an operator run your brand-new module against a live network

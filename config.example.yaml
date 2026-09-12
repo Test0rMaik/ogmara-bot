@@ -305,3 +305,104 @@ stats:
   # regardless of how many the node reports.
   pageSize: 100
   maxPostsScanned: 2000
+
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+# Declares this wallet a BOT and answers slash commands in the channels you
+# list. Clients read the descriptor published here and render these commands in
+# their "/" autocomplete, the way Telegram does.
+#
+# A slash command is an ORDINARY chat message whose content starts with /name,
+# with this bot's wallet in the message's mentions. There is no separate command
+# message type — deliberately, so the traffic is indistinguishable from chat and
+# a hostile relay cannot selectively drop it. The cost of that lands here: the
+# node cannot identify command traffic, so it cannot rate-limit it either, and
+# everything under rateLimit below is the bot doing that job itself.
+bot:
+  enabled: false
+
+  # Display convenience for disambiguating "/cmd@handle" when several bots share
+  # a channel. ASCII only, NOT unique and NOT enforced — the wallet address is
+  # the identity, this is only a label.
+  handle: ogmarabot
+
+  # Channels the bot answers in, by id. REQUIRED when enabled (max 64).
+  #
+  # No "everywhere I have joined" default on purpose: answering spends the
+  # wallet's posting quota, so where that happens should be something you wrote
+  # down rather than something the bot inferred.
+  #
+  # Encrypted channels are NOT supported — the bot would read ciphertext it has
+  # no key for and answer nothing, so startup refuses one rather than looking
+  # healthy while doing nothing. Note this is not only PRIVATE channels: new
+  # public channels are created with encryption forced on.
+  channels: []
+  # channels: [1, 7]
+
+  # Commands to advertise. Every name here must be one this build implements, or
+  # startup refuses: a bot that advertises a command it silently ignores reads to
+  # a user as a broken bot.
+  #
+  # Names are lowercase, with no leading "/" — consumers match case-insensitively
+  # so that a phone capitalising "/Help" still works.
+  #
+  # description and argsHint are measured in BYTES, not characters (128 and 64).
+  # Full Unicode is fine — CJK, Cyrillic, Persian and emoji all render — but a
+  # CJK character costs three bytes, so ~42 Chinese characters fill a
+  # description.
+  commands:
+    - name: about
+      description: What this bot is and who runs it
+    - name: help
+      description: List the commands I answer
+    - name: sources
+      description: What I post about
+    - name: latest
+      description: My most recent posts
+      argsHint: "[1-5]"
+    - name: topic
+      description: Do I cover this topic?
+      argsHint: "<name>"
+
+  rateLimit:
+    # Commands one wallet may invoke per minute.
+    perWalletPerMinute: 10
+
+    # Ceiling across ALL wallets. Per-wallet limits stop one abuser; this stops a
+    # hundred wallets each sitting politely under the per-wallet limit from
+    # exhausting an AI budget or an upstream API quota.
+    globalPerMinute: 20
+
+    # How long before a throttled wallet is told again that it is throttled.
+    # Replying to every throttled request would turn the limiter into an
+    # amplifier driven by this bot's own wallet: a 100-message flood would
+    # produce 100 replies. One notice per wallet per window, then silence.
+    noticeCooldownSeconds: 300
+
+    # Share of this wallet's NODE-side posting quota that commands may spend.
+    #
+    # The limits above bound abuse. This bounds something more dangerous: a reply
+    # is an ordinary chat message, so it spends the same per-wallet quota the
+    # node meters for everything this wallet sends — including news posts. A
+    # registered wallet gets 20 messages per 10-minute window and 300 per day, so
+    # an unbounded command module could exhaust the daily quota before breakfast
+    # and the bot would post no news for the rest of the day.
+    #
+    # A share rather than a count because the node ceiling moves 6x when a wallet
+    # registers on-chain; a fixed number would be wrong on one side of that.
+    maxShareOfNodeBudget: 0.5
+
+    # Most of one 10-minute budget window a SINGLE wallet may take.
+    #
+    # Watch the startup log for what this works out to — it is derived from the
+    # node quota, not from the number below, and on an UNREGISTERED wallet
+    # (5 messages/10min) it bottoms out at 1 reply per wallet per 10 minutes.
+    # Register the wallet for 6x the ceiling before tuning this.
+    #
+    # perWalletPerMinute alone does not stop one wallet owning the day: ten
+    # commands a minute is a polite rate, and sustained it is the whole daily
+    # reply budget in under three hours — from one wallet that never exceeded a
+    # stated limit, or the node's own limits either. This bounds a wallet
+    # against the quota that actually exists rather than against the clock.
+    perWalletShareOfBudget: 0.25

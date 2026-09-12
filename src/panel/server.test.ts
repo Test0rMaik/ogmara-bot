@@ -75,6 +75,8 @@ interface StartOptions {
   nodeUrl?: string;
   fetchProfile?: PanelDeps['fetchProfile'];
   uploadAvatar?: PanelDeps['uploadAvatar'];
+  botDescriptor?: PanelDeps['botDescriptor'];
+  setRegistered?: PanelDeps['setRegistered'];
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -91,6 +93,7 @@ async function start(options: StartOptions = {}): Promise<{
     refreshStatsHistory: ReturnType<typeof vi.fn>;
     fetchProfile: ReturnType<typeof vi.fn>;
     uploadAvatar: ReturnType<typeof vi.fn>;
+    setRegistered: ReturnType<typeof vi.fn>;
   };
 }> {
   const auth = new PanelAuth({
@@ -136,6 +139,7 @@ async function start(options: StartOptions = {}): Promise<{
   const refreshStatsHistoryFn = vi.fn(options.refreshStatsHistory ?? (async () => []));
   const fetchProfileFn = vi.fn(options.fetchProfile ?? (async () => ({})));
   const uploadAvatarFn = vi.fn(options.uploadAvatar ?? (async () => ({ avatarCid: 'bafy-avatar' })));
+  const setRegisteredFn = vi.fn(options.setRegistered ?? ((_registered: boolean) => {}));
 
   const deps: PanelDeps = {
     auth,
@@ -161,6 +165,9 @@ async function start(options: StartOptions = {}): Promise<{
     refreshStatsHistory: refreshStatsHistoryFn,
     nodeUrl: options.nodeUrl ?? 'https://node.example.test',
     fetchProfile: fetchProfileFn,
+    setRegistered: setRegisteredFn,
+    botDescriptor:
+      options.botDescriptor ?? ((): ReturnType<PanelDeps['botDescriptor']> => ({ enabled: false, channels: [], commands: [] })),
     uploadAvatar: uploadAvatarFn,
   };
 
@@ -180,6 +187,7 @@ async function start(options: StartOptions = {}): Promise<{
       refreshStatsHistory: refreshStatsHistoryFn,
       fetchProfile: fetchProfileFn,
       uploadAvatar: uploadAvatarFn,
+      setRegistered: setRegisteredFn,
     },
   };
 }
@@ -242,6 +250,50 @@ describe('localhost bypass', () => {
     const body = await json(res);
     expect(body.authenticatedAs).toBe('localhost');
     expect(body.registered).toBe(true);
+  });
+
+  it('adopts the wallet tier from every status poll', async () => {
+    // REGRESSION GUARD. `setRegistered` used to be called only at startup, so a
+    // wallet registered later stayed throttled at the unverified ceiling — a
+    // sixth of its real budget — until someone restarted the bot, while this
+    // very endpoint reported `registered: true` beside the stale limit. The poll
+    // already reads the chain, so correcting it here is free and self-healing in
+    // both directions.
+    const { baseUrl, fns } = await start();
+    await fetch(`${baseUrl}/api/status`);
+    expect(fns.setRegistered).toHaveBeenCalledWith(true);
+  });
+
+  it('adopts the new tier immediately after registering', async () => {
+    const { baseUrl, fns } = await start();
+    await fetch(`${baseUrl}/api/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    expect(fns.setRegistered).toHaveBeenCalledWith(true);
+  });
+
+  it('reports the advertised slash-command identity on /api/status', async () => {
+    // Read from local config, not from the node: this answers "what did I
+    // configure", which is the first thing an operator needs when a command is
+    // missing from a client's picker — and it stays answerable while the node
+    // is unreachable.
+    const { baseUrl } = await start({
+      botDescriptor: () => ({
+        enabled: true,
+        handle: 'ogmarabot',
+        channels: [7],
+        commands: [{ name: 'about', description: 'who I am' }],
+      }),
+    });
+    const body = await json(await fetch(`${baseUrl}/api/status`));
+    expect(body.bot).toEqual({
+      enabled: true,
+      handle: 'ogmarabot',
+      channels: [7],
+      commands: [{ name: 'about', description: 'who I am' }],
+    });
   });
 
   it('requires login once a trusted proxy reports a non-loopback client', async () => {

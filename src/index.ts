@@ -9,7 +9,13 @@
 
 import { statSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
-import { WalletSigner, type OgmaraClient } from '@ogmara/sdk';
+import {
+  CHANNEL_TYPE_PRIVATE,
+  WalletSigner,
+  canPost,
+  subscribe,
+  type OgmaraClient,
+} from '@ogmara/sdk';
 import { config as loadDotenv } from 'dotenv';
 import { AiConfigError, createProvider } from './ai/index.js';
 import { loadTemplate } from './ai/prompt.js';
@@ -28,6 +34,7 @@ import {
   InvalidPostError,
   NetworkMismatchError,
   OgmaraPublisher,
+  httpStatusFromError,
   type ComposedPost,
 } from './ogmara.js';
 import { PanelAuth } from './panel/auth.js';
@@ -37,6 +44,7 @@ import { startPanel, type Panel } from './panel/server.js';
 import { PostQueue } from './queue.js';
 import { type RunOutcome } from './pipeline.js';
 import { createNewsModule } from './modules/news.js';
+import { createCommandsModule } from './modules/commands/index.js';
 import { enabledModules, preflightAll, startAll, stopAll } from './modules/registry.js';
 import type { BotContext, BotModule } from './modules/types.js';
 import type { StartedModule } from './modules/registry.js';
@@ -519,6 +527,56 @@ async function run(args: CliArgs): Promise<number> {
       // round trip for information the core already has.
       health,
     }),
+    createCommandsModule({
+      reply: async (channelId, text, mentions) => {
+        await publisher.client.sendMessage(channelId, text, { mentions });
+      },
+      subscribeChannels: async (channels, onMessage) => {
+        const sub = subscribe({
+          nodeUrl: effective.node.url,
+          channels: channels.map((id) => String(id)),
+          signer: publisher.signer,
+          onEvent: (event) => {
+            if (event.type === 'message') onMessage(event.envelope);
+          },
+          onError: (err) => {
+            console.warn(`  warning: command listener could not connect (${err.message})`);
+          },
+        });
+        return () => sub.close();
+      },
+      describeChannel: async (channelId) => {
+        try {
+          const { channel } = await publisher.client.getChannel(channelId);
+          return {
+            name: channel.display_name ?? channel.slug,
+            // NOT just `channel_type === PRIVATE`. New Public and ReadPublic
+            // channels are created with encryption forced ON, so a private-only
+            // test would wave through most modern public channels — where the
+            // bot would read ciphertext it cannot decrypt and answer nothing,
+            // which is precisely what this check exists to prevent.
+            encrypted:
+              channel.channel_type === CHANNEL_TYPE_PRIVATE || channel.encryption_enabled === true,
+            // `isModerator: false` deliberately — the bot should be usable
+            // without moderator rights, so preflight must pass on the weaker
+            // assumption rather than one that could be revoked later.
+            canPost: canPost(channel, publisher.address, false),
+          };
+        } catch (err) {
+          // ONLY "this channel is not there for us" is a config error. A 5xx, a
+          // timeout or a restarting node becomes 'unreachable' instead, so the
+          // operator gets a sentence about their node rather than being told to
+          // fix channel ids that are perfectly correct — which, under systemd,
+          // would be a restart loop blaming them for a node hiccup.
+          const status = httpStatusFromError(err);
+          if (status === 404 || status === 403) return null;
+          return 'unreachable';
+        }
+      },
+      publishDescriptor: async (descriptor) => {
+        await publisher.client.setBotCommands(descriptor);
+      },
+    }),
   ];
   const modules = enabledModules(allModules, effective);
 
@@ -770,6 +828,13 @@ async function startControlPanel(
     },
     nodeUrl: config.node.url,
     fetchProfile: () => fetchProfile(publisher.client, publisher.address),
+    setRegistered: (registered) => publisher.setRegistered(registered),
+    botDescriptor: () => ({
+      enabled: config.bot.enabled,
+      ...(config.bot.handle !== undefined ? { handle: config.bot.handle } : {}),
+      channels: config.bot.channels,
+      commands: config.bot.commands,
+    }),
     uploadAvatar: (bytes, mimeType, filename) => uploadAvatar(publisher.client, bytes, mimeType, filename),
   });
 
