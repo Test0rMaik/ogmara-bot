@@ -34,7 +34,8 @@ export function renderPage(ctx: PageContext): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ogmara Newsbot Panel</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<title>ogmara-bot panel</title>
 <style>
   :root { color-scheme: dark; }
   body { font-family: system-ui, sans-serif; width: 80%; max-width: 1600px; min-width: 320px;
@@ -110,7 +111,7 @@ export function renderPage(ctx: PageContext): string {
 </style>
 </head>
 <body>
-  <h1>Ogmara Newsbot</h1>
+  <h1>ogmara-bot</h1>
   <p class="muted">Bot wallet: <code>${bot}</code> — ${network}</p>
 
   <p id="error"></p>
@@ -288,7 +289,20 @@ async function login() {
   // being unreachable), so one failing must not silently prevent the other
   // from ever being tried.
   await refresh().catch((err) => {
-    if (err && err.status !== 401) showError(err.message || String(err));
+    // A 401 HERE is not the harmless "not logged in yet" case the page-load
+    // path suppresses — the login just succeeded and set a cookie, so the
+    // session is not coming back and the user must be told. Staying silent is
+    // how a broken session looked like nothing happening at all: the button
+    // did nothing, the console showed 401s, and the UI showed no error.
+    if (err && err.status === 401) {
+      showError(
+        'Logged in, but the session was not accepted. If another Ogmara bot ' +
+          'is running on this same host, clear the cookies for this site and ' +
+          'try again — cookies are shared across ports.',
+      );
+      return;
+    }
+    showError(err.message || String(err));
   });
   await refreshPosts();
   await refreshChart();

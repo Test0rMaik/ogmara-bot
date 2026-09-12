@@ -274,6 +274,41 @@ describe('localhost bypass', () => {
     expect(fns.setRegistered).toHaveBeenCalledWith(true);
   });
 
+  it('ignores a stale legacy cookie sitting BEFORE a valid current one', async () => {
+    // THE REGRESSION. Cookies are scoped by host, not port, so running two
+    // instances on localhost (8787 old, 8788 new — the obvious way to compare
+    // builds) puts both cookie names on `localhost`, each signed with its own
+    // random per-process secret. Returning on the first matching NAME let a
+    // stale `ogmara_newsbot_session` short-circuit the valid current cookie:
+    // login returned 200 and set its cookie, then every request 401'd with
+    // nothing in the log to explain it.
+    const { baseUrl, auth } = await start();
+    const valid = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/status`, {
+      headers: {
+        // Legacy name first, carrying a token this process cannot verify.
+        cookie: `ogmara_newsbot_session=not-a-valid-token; ogmara_bot_session=${valid}`,
+        'x-forwarded-for': '203.0.113.7', // defeat the loopback bypass
+      },
+    });
+    expect(res.status).toBe(200);
+    expect((await json(res)).authenticatedAs).toBe(operator.address);
+  });
+
+  it('still accepts a legacy cookie when it is the only one', async () => {
+    // The pre-rename name must keep working, or upgrading logs every operator
+    // out mid-session.
+    const { baseUrl, auth } = await start();
+    const valid = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/status`, {
+      headers: {
+        cookie: `ogmara_newsbot_session=${valid}`,
+        'x-forwarded-for': '203.0.113.7',
+      },
+    });
+    expect(res.status).toBe(200);
+  });
+
   it('reports the advertised slash-command identity on /api/status', async () => {
     // Read from local config, not from the node: this answers "what did I
     // configure", which is the first thing an operator needs when a command is

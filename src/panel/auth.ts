@@ -277,7 +277,10 @@ export class PanelAuth {
    */
   #buildMessage(nonce: string, timestampMs: number): string {
     return (
-      'Ogmara Newsbot Login\n' +
+      // Safe to rename: a challenge is held in memory and verified by the same
+      // process that issued it, so this string never has to match one produced
+      // by an older build.
+      'Ogmara Bot Login\n' +
       `Bot: ${this.#botAddress}\n` +
       `Network: ${this.#network}\n` +
       `Nonce: ${nonce}\n` +

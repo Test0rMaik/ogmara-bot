@@ -5,6 +5,51 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-09-12
+
+### Fixed
+
+- **Panel login silently failed when two instances ran on the same host.**
+  Reported from a fresh install: the wallet signed the challenge, `/api/auth/login`
+  returned 200 and set its cookie, and then every request 401'd with nothing in
+  the log and no error in the UI.
+
+  Cookies are scoped by host, **not by port**. Running an old build on
+  `localhost:8787` and a new one on `localhost:8788` — the obvious way to compare
+  them — puts both a `ogmara_newsbot_session` and a `ogmara_bot_session` cookie on
+  `localhost`, and each process signs sessions with its own random per-process
+  secret. `verifySession` returned on the first cookie whose NAME matched either
+  the current or the pre-rename name, so a stale legacy cookie sitting earlier in
+  the header short-circuited the valid current one, failed to verify, and the
+  correct cookie further along was never looked at.
+
+  It now collects every candidate and returns the first that actually *verifies*,
+  current name before legacy. The pre-rename name keeps working on its own, so
+  upgrading still does not log anyone out.
+
+- **`/favicon.ico` returned 401.** The browser asks for it before anyone has
+  logged in, so gating it behind the session only produced a 401 in every
+  operator's console with nothing to fix. It now answers 204, and the page links
+  a real icon.
+
+- A 401 arriving *after* a successful login is no longer swallowed in silence by
+  the dashboard refresh — it was the one case where the user could see nothing at
+  all, which is exactly how the bug above stayed invisible.
+
+### Added
+
+- **A favicon** — the official Ogmara monogram, served from `/favicon.svg`
+  without authentication. Byte-identical in geometry to the project logo the web
+  client ships, not a lookalike redrawn for this repo.
+
+### Changed
+
+- Panel title, heading and the wallet-signing prompt now say **ogmara-bot**
+  rather than "Ogmara Newsbot" — the last of the pre-rename strings, and the one
+  an operator actually reads in their wallet extension. Safe to change: a login
+  challenge is held in memory and verified by the process that issued it, so it
+  never has to match a string from an older build.
+
 ## [0.18.0] - 2026-09-12
 
 The `commands` module: the bot now answers slash commands in channels, and

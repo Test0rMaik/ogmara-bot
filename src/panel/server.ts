@@ -23,6 +23,7 @@ import { PanelAuth } from './auth.js';
 import { TrustedProxies, isLoopback, resolveClientIp } from './clientip.js';
 import type { PostStats } from './posts.js';
 import { renderPage, renderScript } from './ui.js';
+import { FAVICON_SVG } from './favicon.js';
 
 /** Largest request body accepted, for ordinary panel actions (every one fits in a few hundred bytes). */
 const MAX_BODY_BYTES = 16 * 1024;
@@ -324,6 +325,19 @@ async function handle(
   }
   if (method === 'GET' && path === '/app.js') {
     sendScript(res, renderScript(), csp);
+    return;
+  }
+  // Unauthenticated, like the page and its script. A browser fetches the icon
+  // before anyone has logged in, so gating it behind the session only produced
+  // a 401 in every operator's console with nothing to fix.
+  if (method === 'GET' && path === '/favicon.svg') {
+    sendSvg(res, FAVICON_SVG, csp);
+    return;
+  }
+  if (method === 'GET' && path === '/favicon.ico') {
+    // The page links the SVG explicitly, so this is only hit by browsers that
+    // probe the legacy path anyway. 204 answers them without a 401 or a 404.
+    res.writeHead(204).end();
     return;
   }
   if (method === 'GET' && path === '/api/auth/challenge') {
@@ -773,16 +787,35 @@ function verifySession(req: IncomingMessage, auth: PanelAuth): string | undefine
   }
   const cookie = req.headers.cookie;
   if (cookie === undefined) return undefined;
+
+  // Collect EVERY candidate, then return the first that actually verifies —
+  // rather than returning on the first matching cookie NAME.
+  //
+  // This matters because cookies are scoped by host, not by port. Running two
+  // instances on the same host (`localhost:8787` and `localhost:8788`, the
+  // obvious way to compare an old build against a new one) puts both a
+  // `ogmara_newsbot_session` and a `ogmara_bot_session` on `localhost`, and each
+  // process signs with its own random per-process secret. Returning on the
+  // first name match meant a stale legacy cookie sitting earlier in the header
+  // short-circuited the valid current one: login returned 200, set its cookie,
+  // and every following request 401'd with nothing in the log to explain it.
+  //
+  // Current name first, so it wins whenever both are present and valid.
+  const current: string[] = [];
+  const legacy: string[] = [];
   for (const part of cookie.split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    // Accept the pre-rename cookie too, so upgrading to ogmara-bot does not
-    // log every operator out mid-session. New sessions are issued under the new
-    // name below; the old one ages out on its own.
     const name = part.slice(0, eq).trim();
-    if (name === 'ogmara_bot_session' || name === 'ogmara_newsbot_session') {
-      return auth.verifySession(part.slice(eq + 1).trim());
-    }
+    const value = part.slice(eq + 1).trim();
+    if (name === 'ogmara_bot_session') current.push(value);
+    // The pre-rename name is still accepted, so upgrading to ogmara-bot does
+    // not log every operator out mid-session. It ages out on its own.
+    else if (name === 'ogmara_newsbot_session') legacy.push(value);
+  }
+  for (const token of [...current, ...legacy]) {
+    const address = auth.verifySession(token);
+    if (address !== undefined) return address;
   }
   return undefined;
 }
@@ -882,6 +915,19 @@ function sendHtml(res: ServerResponse, status: number, html: string, csp: string
     'X-Frame-Options': 'DENY',
   });
   res.end(html);
+}
+
+function sendSvg(res: ServerResponse, svg: string, csp: string): void {
+  res.writeHead(200, {
+    'Content-Type': 'image/svg+xml; charset=utf-8',
+    'Content-Length': Buffer.byteLength(svg),
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': csp,
+    // Static for the life of a release, but the panel is a local admin tool —
+    // an hour keeps a rebuild from serving a stale icon.
+    'Cache-Control': 'public, max-age=3600',
+  });
+  res.end(svg);
 }
 
 function sendScript(res: ServerResponse, script: string, csp: string): void {
