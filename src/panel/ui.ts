@@ -857,6 +857,12 @@ async function refresh() {
   if (status.registered) {
     registerBtn.disabled = true;
     registerBtn.textContent = 'Already registered';
+  } else if (status.registrationPending) {
+    // Broadcast, but not in a committed block yet, so the chain still reads as
+    // unregistered. Re-enabling here is what let a second click spend a second
+    // bandwidth fee on a call the contract was going to reject.
+    registerBtn.disabled = true;
+    registerBtn.textContent = 'Confirming on chain…';
   } else {
     registerBtn.disabled = !status.canAffordRegistration;
     registerBtn.textContent = status.canAffordRegistration
@@ -1025,8 +1031,22 @@ async function register() {
   try {
     const result = await api('/api/register', { method: 'POST', body: JSON.stringify({ confirm: true }) });
     if (result.status === 'registered') {
-      showSuccess('Registered. Transaction: ' + result.txHash);
-    } else if (result.status === 'already-registered') {
+      showSuccess('Registered. Transaction: ' + result.txHash + ' — confirming on chain…');
+      await refresh();
+      // The transaction is broadcast but not yet in a committed block, so the
+      // chain still reports the wallet as unregistered for a few seconds. Poll
+      // until it agrees, so the button becomes "Already registered" on its own
+      // rather than only after a manual page reload.
+      await awaitRegistrationConfirmed();
+      return;
+    }
+    if (result.status === 'pending') {
+      showSuccess('A registration is already confirming on chain.');
+      await refresh();
+      await awaitRegistrationConfirmed();
+      return;
+    }
+    if (result.status === 'already-registered') {
       showSuccess('Already registered — nothing was spent.');
     } else if (result.status === 'insufficient-funds') {
       showError('Insufficient balance: need ' + result.requiredKlv + ' KLV, have ' + result.balanceKlv + '.');
@@ -1035,6 +1055,33 @@ async function register() {
   } catch (err) {
     showError(err.message || String(err));
     btn.disabled = false;
+  }
+}
+
+/**
+ * Poll /api/status until the chain confirms the registration.
+ *
+ * Bounded, and it never re-enables the button: if confirmation has not arrived
+ * by the time this gives up, the server's own pending latch still holds the
+ * button disabled, and the next refresh picks up the truth either way. A
+ * transaction that genuinely failed is recoverable once that latch expires.
+ */
+async function awaitRegistrationConfirmed() {
+  for (let i = 0; i < 20; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    try {
+      const status = await api('/api/status', { method: 'GET' });
+      if (status.registered) {
+        // refresh() re-renders everything from a fresh read, so the button, the
+        // limits and the cost row all move together.
+        await refresh();
+        showSuccess('Registered and confirmed on chain.');
+        return;
+      }
+    } catch {
+      // A transient failure mid-poll is not worth surfacing — the registration
+      // itself already succeeded, and the next refresh reconciles.
+    }
   }
 }
 

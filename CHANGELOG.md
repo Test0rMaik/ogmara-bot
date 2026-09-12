@@ -5,6 +5,35 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-09-12
+
+### Fixed
+
+- **The Register button came back enabled right after a successful
+  registration, and clicking it again cost real KLV.** A broadcast transaction
+  is not yet in a committed block, so the chain read immediately after it still
+  reports the wallet as unregistered — and the button's "not registered" branch
+  re-enabled itself on that reading. A second click built and broadcast a second
+  registration: rejected by the contract, but with the bandwidth fee (~8.6 KLV
+  on testnet) burned anyway.
+
+  A successful broadcast is now latched server-side and the wallet is reported
+  as `registrationPending` until the chain agrees, which keeps the button
+  disabled and makes `/api/register` answer without spending. The latch is a
+  timestamp, not a flag, so it expires: a transaction accepted for broadcast can
+  still fail on chain, and a permanent latch would leave registration
+  unretryable without a restart. An attempt that never broadcast — insufficient
+  funds, say — does not latch at all and stays retryable immediately.
+
+- **The button no longer needs a manual page reload to say "Already
+  registered".** After a successful registration the panel polls until the chain
+  confirms, then re-renders, so the button, the posting limits and the cost row
+  all update together.
+
+### Added
+
+- `/api/status` reports `registrationPending` — broadcast, not yet confirmed.
+
 ## [0.20.0] - 2026-09-12
 
 ### Fixed

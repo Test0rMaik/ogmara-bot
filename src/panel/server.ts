@@ -172,6 +172,23 @@ interface PanelState {
    */
   registering: boolean;
   /**
+   * When a registration transaction was successfully broadcast, in ms.
+   *
+   * `registering` only covers the request itself. The real hazard is AFTER it
+   * returns: a broadcast transaction is not yet in a committed block, so the
+   * chain read that follows still reports the wallet as unregistered. The panel
+   * would re-enable its Register button, and a second click would build and
+   * broadcast a SECOND registration — rejected by the contract, but with the
+   * bandwidth fee burned regardless.
+   *
+   * So a successful broadcast is latched here and the wallet is reported as
+   * pending until the chain agrees. Kept as a TIMESTAMP rather than a boolean
+   * so it expires: a transaction accepted for broadcast can still fail on
+   * chain, and a permanent latch would make a genuinely failed registration
+   * unretryable without a restart.
+   */
+  registrationBroadcastAt: number;
+  /**
    * True while an avatar upload is in flight.
    *
    * The avatar route accepts a body up to ~7 MB (vs. ~16 KB for every other
@@ -218,7 +235,11 @@ interface AvatarBody {
  * @param port Port to listen on.
  */
 export function startPanel(bind: string, port: number, deps: PanelDeps): Promise<Panel> {
-  const state: PanelState = { registering: false, uploadingAvatar: false };
+  const state: PanelState = {
+    registering: false,
+    registrationBroadcastAt: 0,
+    uploadingAvatar: false,
+  };
   const csp = buildCsp(deps.nodeUrl);
 
   const server = createServer((req, res) => {
@@ -443,6 +464,9 @@ async function handle(
       // button and lets the panel offer a registration the chain will refuse.
       registrationCostKlv: registration.totalCostKlv,
       registrationFeeKlv: registration.registrationFeeKlv,
+      // Broadcast but not yet visible on chain. The UI must keep its Register
+      // button disabled through this window, or a second click spends again.
+      registrationPending: isRegistrationPending(state, registration.registered),
       authenticatedAs,
       walletBackupPending,
       bot: deps.botDescriptor(),
@@ -634,6 +658,13 @@ async function handle(
       sendJson(res, 409, { error: 'a registration is already in progress' });
       return;
     }
+    // A transaction already went out and the chain has not caught up yet.
+    // Submitting another would burn a second bandwidth fee for a call the
+    // contract will reject, so answer without spending anything.
+    if (state.registrationBroadcastAt > 0 && !isRegistrationLatchExpired(state)) {
+      sendJson(res, 200, { status: 'pending' });
+      return;
+    }
     state.registering = true;
     try {
       const key = hexToKey(deps.walletKeyHex);
@@ -642,6 +673,9 @@ async function handle(
       // than at the next restart.
       if (result.status === 'registered' || result.status === 'already-registered') {
         deps.setRegistered(true);
+      }
+      if (result.status === 'registered') {
+        state.registrationBroadcastAt = Date.now();
       }
       sendJson(res, 200, result);
     } catch (err) {
@@ -932,6 +966,29 @@ function sendHtml(res: ServerResponse, status: number, html: string, csp: string
     'X-Frame-Options': 'DENY',
   });
   res.end(html);
+}
+
+/**
+ * How long a broadcast registration is trusted before the latch expires.
+ *
+ * Long enough to cover block commitment plus the chain scanner, short enough
+ * that a transaction accepted for broadcast but then failed does not leave
+ * registration permanently unretryable.
+ */
+const REGISTRATION_LATCH_MS = 5 * 60_000;
+
+function isRegistrationLatchExpired(state: PanelState): boolean {
+  return Date.now() - state.registrationBroadcastAt > REGISTRATION_LATCH_MS;
+}
+
+/** Broadcast, but the chain has not confirmed it yet. */
+function isRegistrationPending(state: PanelState, registeredOnChain: boolean): boolean {
+  if (registeredOnChain) {
+    // Confirmed — drop the latch so nothing depends on it any more.
+    state.registrationBroadcastAt = 0;
+    return false;
+  }
+  return state.registrationBroadcastAt > 0 && !isRegistrationLatchExpired(state);
 }
 
 function sendSvg(res: ServerResponse, svg: string, csp: string): void {

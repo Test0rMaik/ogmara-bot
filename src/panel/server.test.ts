@@ -912,21 +912,83 @@ describe('/api/register — spends real KLV, must never fire by accident', () =>
     expect(fns.registerWallet).toHaveBeenCalledTimes(1);
   });
 
-  it('allows a new registration attempt once the previous one has finished', async () => {
+  it('refuses a SECOND registration while the first is confirming on chain', async () => {
+    // A broadcast transaction is not in a committed block yet, so the chain read
+    // that follows still says "unregistered". The panel used to re-enable its
+    // Register button on that reading, and a second click built and broadcast a
+    // second registration — rejected by the contract, but with the bandwidth fee
+    // burned anyway. Real KLV, for nothing.
+    const post = (baseUrl: string): Promise<Response> =>
+      fetch(`${baseUrl}/api/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      });
+
     const { baseUrl, fns } = await start({ registration: UNREGISTERED });
-    const first = await fetch(`${baseUrl}/api/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirm: true }),
-    });
-    expect(first.status).toBe(200);
-    const second = await fetch(`${baseUrl}/api/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirm: true }),
-    });
+    expect((await post(baseUrl)).status).toBe(200);
+    const second = await post(baseUrl);
     expect(second.status).toBe(200);
+    expect((await json(second)).status).toBe('pending');
+    // The point: no second transaction was built.
+    expect(fns.registerWallet).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the wallet as pending on /api/status until the chain agrees', async () => {
+    const { baseUrl } = await start({ registration: UNREGISTERED });
+    expect((await json(await fetch(`${baseUrl}/api/status`))).registrationPending).toBe(false);
+
+    await fetch(`${baseUrl}/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    const status = await json(await fetch(`${baseUrl}/api/status`));
+    expect(status.registered).toBe(false);
+    expect(status.registrationPending).toBe(true);
+  });
+
+  it('still allows a retry when the first attempt did NOT broadcast', async () => {
+    // The latch must only cover a transaction that actually went out. An attempt
+    // that failed for want of funds spent nothing and has to stay retryable —
+    // otherwise topping up the wallet would require restarting the bot.
+    const { baseUrl, fns } = await start({
+      registration: UNREGISTERED,
+      registerWallet: async () => ({
+        status: 'insufficient-funds' as const,
+        balanceKlv: 3,
+        requiredKlv: 104.4,
+      }),
+    });
+    const post = (): Promise<Response> =>
+      fetch(`${baseUrl}/api/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      });
+    expect((await post()).status).toBe(200);
+    expect((await post()).status).toBe(200);
     expect(fns.registerWallet).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops the pending latch as soon as the chain confirms', async () => {
+    // The latch must not outlive its purpose: once the chain agrees, the button
+    // has to read "Already registered" rather than staying stuck on
+    // "Confirming on chain…" for the rest of the latch window.
+    let onChain: RegistrationStatus = UNREGISTERED;
+    const { baseUrl } = await start({ checkRegistration: async () => onChain });
+
+    await fetch(`${baseUrl}/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    expect((await json(await fetch(`${baseUrl}/api/status`))).registrationPending).toBe(true);
+
+    onChain = REGISTERED; // block commits
+    const status = await json(await fetch(`${baseUrl}/api/status`));
+    expect(status.registered).toBe(true);
+    expect(status.registrationPending).toBe(false);
   });
 });
 
