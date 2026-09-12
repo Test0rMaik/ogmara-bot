@@ -5,6 +5,73 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-09-12
+
+Phase B of the modularisation: the module contract, with `news` extracted behind
+it. A **behaviour-preserving refactor** — the existing 561 tests pass unchanged.
+
+### Added
+
+- **A module contract** (`src/modules/types.ts`). A module declares everything
+  about itself in one place: its config section *and* the Zod schema for it,
+  whether it is enabled, what must be true before the bot can start with it on,
+  and how to run once or on a schedule.
+
+  The schema living with the module is the load-bearing part: because a module
+  owns it, the operator settings page can later render itself *from* that schema
+  rather than being hand-written per feature. Adding a module then gets config
+  validation, settings UI and documented options in one step, and cannot forget
+  any of the three.
+- **A registry** (`src/modules/registry.ts`) — filter to enabled modules, run
+  preflights sequentially, start, and stop in reverse order. One module failing
+  to stop does not prevent the others stopping: a shutdown that gives up halfway
+  leaves a cron alive, and a "stopped" bot whose cron survived keeps posting.
+- **The `news` module** (`src/modules/news.ts`), owning the `sources:` section,
+  the per-source crons, the run pipeline and the two imagedir preconditions.
+- **`docs/WRITING-A-MODULE.md`** for contributors, including the two rules that
+  have actually bitten this codebase: put network-dependent checks in
+  `preflight`, never in a Zod `.refine()` (that is what produced the 0.12.0
+  cadence bug), and route posting through the shared rate budget rather than
+  around it.
+
+### Changed
+
+- **A bot with no modules enabled now starts, instead of refusing to.**
+  Previously "no sources are enabled" was a fatal startup error — which made a
+  panel-only bot impossible, even though the panel is how an operator configures
+  the thing in the first place. Startup now refuses only when there is genuinely
+  nothing to do: no modules AND no panel (or `--once` with no module to run).
+- Core crons (the stats snapshot) and module crons are tracked separately.
+  Shutdown stops core jobs directly and modules through the registry, so a job
+  cannot be stopped twice or — the one that matters — missed entirely. Module
+  shutdown is **awaited** before the process resolves: with one module whose
+  stop is synchronous nothing currently survives, but that is an accident of
+  there being one module, and a "stopped" bot whose cron outlived shutdown keeps
+  posting.
+- **"Every enabled source is unconfigured" stays a FATAL startup error**, as it
+  was before the refactor. Extracting news behind the contract briefly turned it
+  into a silent no-op — the module counted as enabled from the flag alone, so a
+  bot with `rss.enabled: true` and `feeds: []` started, scheduled a cron, and
+  called an empty pipeline forever. An operator who mistyped a config key would
+  have seen a running bot that never posted and never said why. It is now a
+  preflight failure naming what to fix, which is also the right home for it: the
+  schema cannot catch it, since `feeds` legitimately defaults to `[]`.
+- The module's media-uploads precondition reuses the node health the core
+  already fetched for its startup banner, rather than making a second round
+  trip — the pre-refactor code reused that same value.
+
+### Notes
+
+- `pipeline.ts` and `sources/` are deliberately **not relocated** into
+  `src/modules/news/`. What makes news a module is that enablement, preflight,
+  scheduling and its schema now sit behind the contract, not that the files live
+  in a particular directory; moving them would churn imports across the test
+  suite for no behavioural gain. Relocation stays available if it ever buys
+  something.
+- `sourcesSchema` is exported from `config.ts` and re-exported by the module's
+  `schemas` map. The module is the declared owner; the export keeps the
+  composition in `configSchema` readable.
+
 ## [0.16.0] - 2026-09-12
 
 ### Changed

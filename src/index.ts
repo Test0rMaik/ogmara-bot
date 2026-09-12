@@ -35,7 +35,11 @@ import { TrustedProxies } from './panel/clientip.js';
 import { DASHBOARD_POST_LIMIT, fetchPostStats } from './panel/posts.js';
 import { startPanel, type Panel } from './panel/server.js';
 import { PostQueue } from './queue.js';
-import { runOnce, type RunOutcome } from './pipeline.js';
+import { type RunOutcome } from './pipeline.js';
+import { createNewsModule } from './modules/news.js';
+import { enabledModules, preflightAll, startAll, stopAll } from './modules/registry.js';
+import type { BotContext, BotModule } from './modules/types.js';
+import type { StartedModule } from './modules/registry.js';
 import { runsPerHour, schedule, type ScheduledJob } from './scheduler.js';
 import { ImageDirSource } from './sources/imagedir.js';
 import { RssSource } from './sources/rss.js';
@@ -192,6 +196,40 @@ function renderPost(post: ComposedPost, address: string): void {
  * threshold logic has a direct unit test rather than relying on a full
  * `run()` integration test.
  */
+/**
+ * Whether the bot should refuse to start, and why.
+ *
+ * A bot with every module switched off is a VALID deployment — the control
+ * panel alone is a reason to run, and it is how an operator configures the thing
+ * in the first place. Before the module contract this was a hard error ("no
+ * sources are enabled"), which made a panel-only bot impossible.
+ *
+ * So refuse only when there would be genuinely nothing to do:
+ *   - `--once` with no module to run: the process would start and immediately
+ *     exit having done nothing.
+ *   - long-running with no modules AND no panel: it would idle forever with no
+ *     work and no way to reach it.
+ *
+ * Pure and exported so the policy is testable without standing up a node, a
+ * wallet and an AI provider — `run()` itself needs all three.
+ *
+ * Returns an operator-facing message, or `null` to proceed.
+ */
+export function startupRefusal(opts: {
+  readonly moduleCount: number;
+  readonly once: boolean;
+  readonly panelEnabled: boolean;
+}): string | null {
+  if (opts.moduleCount > 0) return null;
+  if (!opts.once && opts.panelEnabled) return null;
+  return (
+    '\nNothing to run: no modules are enabled' +
+    (opts.once ? ' (and --once has nothing to do).' : ' and the control panel is off.') +
+    '\nEnable a source under `sources:`, or turn on `panel.enabled` to configure ' +
+    'the bot from its web UI.'
+  );
+}
+
 export function dailyBudgetWarning(
   maxPostsPerHour: number,
   dailyLimit: number,
@@ -209,50 +247,6 @@ export function dailyBudgetWarning(
 }
 
 /** Build the enabled sources from config. */
-function buildSources(config: Config): Source[] {
-  const sources: Source[] = [];
-
-  const rss = config.sources.rss;
-  if (rss.enabled) {
-    if (rss.feeds.length === 0) {
-      console.warn('Warning: sources.rss is enabled but no feeds are configured.');
-    } else {
-      sources.push(
-        new RssSource({
-          feeds: rss.feeds,
-          timeoutMs: rss.timeoutMs,
-          maxBytes: rss.maxBytes,
-          maxAgeDays: rss.maxAgeDays,
-        }),
-      );
-    }
-  }
-
-  const topics = config.sources.topics;
-  if (topics.enabled) {
-    if (topics.topics.length === 0) {
-      console.warn('Warning: sources.topics is enabled but no topics are configured.');
-    } else {
-      sources.push(
-        new TopicsSource({ topics: topics.topics, minIntervalHours: topics.minIntervalHours }),
-      );
-    }
-  }
-
-  const imagedir = config.sources.imagedir;
-  if (imagedir.enabled) {
-    if (imagedir.directories.length === 0) {
-      console.warn('Warning: sources.imagedir is enabled but no directories are configured.');
-    } else {
-      sources.push(
-        new ImageDirSource({ directories: imagedir.directories, maxBytes: imagedir.maxBytes }),
-      );
-    }
-  }
-
-  return sources;
-}
-
 /** Report a run outcome to the console. */
 function reportOutcome(outcome: RunOutcome, address: string): void {
   switch (outcome.status) {
@@ -500,44 +494,68 @@ async function run(args: CliArgs): Promise<number> {
     imagedir: loadTemplate(effective.ai.imagePromptPath),
   };
 
-  const sources = buildSources(effective);
-  if (sources.length === 0) {
-    console.error(
-      '\nNo sources are enabled. Enable at least one under `sources:` in your config.',
-    );
-    return 2;
-  }
-  console.log(`Sources: ${sources.map((s) => s.name).join(', ')}`);
+  // --- Modules -------------------------------------------------------------
+  //
+  // Optional features the operator switches on. Core — node, panel, storage,
+  // wallet identity — is deliberately NOT a module: it cannot be turned off,
+  // and a bot with no reachable panel is a bot nobody can fix.
+  const ctx: BotContext = {
+    config: effective,
+    secrets,
+    publisher,
+    log: (m) => console.log(m),
+    warn: (m) => console.warn(m),
+  };
+
+  const allModules: BotModule[] = [
+    createNewsModule({
+      ledger,
+      queue,
+      provider,
+      templates,
+      report: (outcome: RunOutcome) => reportOutcome(outcome, publisher.address),
+      // The health already fetched above for the startup banner — passed in so
+      // the module's media-uploads precondition does not make a second network
+      // round trip for information the core already has.
+      health,
+    }),
+  ];
+  const modules = enabledModules(allModules, effective);
+
   console.log(
     effective.posting.dryRun
       ? 'Mode:    dry run — nothing will be published'
       : `Mode:    LIVE — up to ${effective.posting.maxPostsPerHour} post(s)/hour`,
   );
+  console.log(`Modules: ${modules.length > 0 ? modules.map((m) => m.name).join(', ') : 'none enabled'}`);
 
-  // Fail here rather than at the first image post: a text-only model would
-  // otherwise caption a picture it never saw, which looks like it worked.
-  if (effective.sources.imagedir.enabled && !provider.supportsVision) {
-    console.error(
-      `\nsources.imagedir is enabled but the configured model (${provider.id}/${provider.model}) ` +
-        'cannot accept images.\nUse a vision-capable model, or set ' +
-        'ai.compatibleSupportsVision: true if your local model does support them.',
-    );
+  // A bot with every module off is a VALID deployment — the panel alone is a
+  // reason to run, and it is how an operator configures the thing in the first
+  // place. Only refuse when there would be nothing to do at all, which for
+  // `--once` means nothing to run and no panel to serve.
+  const refusal = startupRefusal({
+    moduleCount: modules.length,
+    once: args.once,
+    panelEnabled: effective.panel.enabled,
+  });
+  if (refusal !== null) {
+    console.error(refusal);
     return 2;
   }
 
-  if (effective.sources.imagedir.enabled && !health.mediaUploads) {
-    console.error(
-      '\nsources.imagedir is enabled but the node reports media uploads are unavailable ' +
-        '(its IPFS backend is offline).\nStart IPFS on the node, or point the bot at a ' +
-        'media-capable node.',
-    );
+  // Preconditions that need the node, the filesystem or the AI provider —
+  // anything unavailable at config-load time, which is why these are not Zod
+  // refinements.
+  const failure = await preflightAll(modules, ctx);
+  if (failure !== null) {
+    console.error(failure.message);
     return 2;
   }
-
-  const deps = { config: effective, sources, ledger, queue, publisher, provider, templates };
 
   if (args.once) {
-    reportOutcome(await runOnce(deps), publisher.address);
+    for (const m of modules) {
+      if (m.runOnce !== undefined) await m.runOnce(ctx);
+    }
     return 0;
   }
 
@@ -573,29 +591,16 @@ async function run(args: CliArgs): Promise<number> {
     panel = await startControlPanel(effective, secrets, publisher, queue, statsHistory, takeStatsSnapshotNow);
   }
 
-  // One job per enabled source, each on its own cron. They share the run
-  // pipeline, and the scheduler's overlap guard is per-job, so two sources
-  // firing on the same minute run sequentially rather than racing the ledger.
-  const jobs: ScheduledJob[] = [];
-  const schedules: Array<{ name: string; cron: string }> = [];
-  if (effective.sources.rss.enabled) {
-    schedules.push({ name: 'rss', cron: effective.sources.rss.schedule });
-  }
-  if (effective.sources.topics.enabled) {
-    schedules.push({ name: 'topics', cron: effective.sources.topics.schedule });
-  }
-  if (effective.sources.imagedir.enabled) {
-    schedules.push({ name: 'imagedir', cron: effective.sources.imagedir.schedule });
-  }
-
-  for (const { name, cron } of schedules) {
-    const job = schedule(cron, async () => {
-      console.log(`\n[${new Date().toISOString()}] ${name} run`);
-      reportOutcome(await runOnce(deps), publisher.address);
-    });
-    jobs.push(job);
-    console.log(`Schedule: ${name} "${cron}" — next ${job.nextRun()?.toISOString() ?? 'never'}`);
-  }
+  // Each module registers its own crons. The scheduler's overlap guard is
+  // per-job, so two jobs firing on the same minute run sequentially rather than
+  // racing the ledger.
+  const started: StartedModule[] = await startAll(modules, ctx);
+  const moduleJobs = started.flatMap((m) => [...m.handle.jobs]);
+  // CORE crons only — the stats snapshot below. Module crons live on their
+  // module handles and are stopped through the registry; keeping the two lists
+  // separate is what stops a module's job being stopped twice, or a core job
+  // not at all.
+  const coreJobs: ScheduledJob[] = [];
 
   // The dashboard's history chart, not the posting pipeline — a separate
   // cron entirely, so its cadence (and whether it runs at all) is
@@ -620,7 +625,7 @@ async function run(args: CliArgs): Promise<number> {
         console.warn(`  warning: stats snapshot failed: ${err instanceof Error ? err.message : err}`);
       }
     });
-    jobs.push(job);
+    coreJobs.push(job);
   }
 
   // A schedule controls WHEN the bot attempts a post; posting.maxPostsPerHour
@@ -630,7 +635,7 @@ async function run(args: CliArgs): Promise<number> {
   // that is easy to mistake for the schedule simply not being applied. Only
   // meaningful in LIVE mode: dry-run posts are never budget-checked at all.
   if (!effective.posting.dryRun) {
-    const attemptsPerHour = schedules.reduce((sum, s) => sum + runsPerHour(s.cron), 0);
+    const attemptsPerHour = moduleJobs.reduce((sum, j) => sum + runsPerHour(j.cron), 0);
     if (attemptsPerHour > effective.posting.maxPostsPerHour) {
       console.log(
         `\nNote: your schedule(s) can attempt up to ${attemptsPerHour} post(s) in an hour, ` +
@@ -664,15 +669,19 @@ async function run(args: CliArgs): Promise<number> {
       if (shuttingDown) return;
       shuttingDown = true;
       console.log('\nStopping…');
-      for (const job of jobs) job.stop();
-      if (panel === undefined) {
-        resolve();
-        return;
-      }
-      // close() cannot reject today (its callback ignores its error
-      // argument), but guarding it costs nothing and removes the dependence
-      // on that staying true.
-      panel.close().catch(() => {}).finally(resolve);
+      // Core crons first, then every module through the registry — a module may
+      // hold more than crons, and one module failing to stop must not leave the
+      // others running. A "stopped" bot whose cron survived keeps posting.
+      for (const job of coreJobs) job.stop();
+      // AWAITED, not fire-and-forget. With one module whose stop is synchronous
+      // nothing currently survives shutdown — but that is an accident of there
+      // being one module. The moment a second registers, or a stop does real
+      // async I/O, an un-awaited shutdown could resolve and exit while a cron is
+      // still alive, and a "stopped" bot that keeps posting is the failure this
+      // whole path exists to prevent.
+      void stopAll(started, (m) => console.warn(m))
+        .then(() => (panel === undefined ? undefined : panel.close().catch(() => {})))
+        .finally(resolve);
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);

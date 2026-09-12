@@ -195,7 +195,13 @@ const imageDirSourceSchema = z.object({
   contentRating: contentRating.optional(),
 });
 
-const sourcesSchema = z.object({
+/**
+ * Owned by the `news` module (`src/modules/news.ts`), which re-exports it in its
+ * `schemas` map. Exported here rather than moved so the composition below stays
+ * readable; the module is the declared owner and the settings UI reads it from
+ * there.
+ */
+export const sourcesSchema = z.object({
   rss: rssSourceSchema.prefault({}),
   topics: topicsSourceSchema.prefault({}),
   imagedir: imageDirSourceSchema.prefault({}),

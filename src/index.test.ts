@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { dailyBudgetWarning } from './index.js';
+import { dailyBudgetWarning, startupRefusal } from './index.js';
 
 /**
  * `index.ts` is mostly CLI orchestration and isn't otherwise unit-tested,
@@ -34,5 +34,37 @@ describe('dailyBudgetWarning', () => {
   it('returns undefined right at the boundary (exactly 80%)', () => {
     // 1/hour x 24h = 24, exactly 80% of a 30/day ceiling.
     expect(dailyBudgetWarning(1, 30, false)).toBeUndefined();
+  });
+});
+
+describe('startupRefusal', () => {
+  it('lets a panel-only bot run with no modules enabled', () => {
+    // THE scenario the module contract exists to allow: news disabled, panel on.
+    // Before the contract this was a hard error ("no sources are enabled"),
+    // which made a panel-only bot impossible — even though the panel is how an
+    // operator configures the bot in the first place.
+    expect(startupRefusal({ moduleCount: 0, once: false, panelEnabled: true })).toBeNull();
+  });
+
+  it('refuses when nothing is enabled and the panel is off', () => {
+    // Nothing to do and no way to reach it — it would idle forever.
+    const msg = startupRefusal({ moduleCount: 0, once: false, panelEnabled: false });
+    expect(msg).toContain('Nothing to run');
+    expect(msg).toContain('panel.enabled');
+  });
+
+  it('refuses --once with no modules, even when the panel is on', () => {
+    // `--once` exits immediately, so a panel it would never serve is no reason
+    // to start.
+    const msg = startupRefusal({ moduleCount: 0, once: true, panelEnabled: true });
+    expect(msg).toContain('--once has nothing to do');
+  });
+
+  it('proceeds whenever any module is enabled', () => {
+    for (const once of [true, false]) {
+      for (const panelEnabled of [true, false]) {
+        expect(startupRefusal({ moduleCount: 1, once, panelEnabled })).toBeNull();
+      }
+    }
   });
 });

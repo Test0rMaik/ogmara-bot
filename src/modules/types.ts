@@ -1,0 +1,130 @@
+/**
+ * The bot module contract.
+ *
+ * `ogmara-bot` is no longer only a news bot. A *module* is one optional feature
+ * an operator can switch on — news posting today, answering channel slash
+ * commands next — and the point of this contract is that a module declares
+ * everything about itself in one place:
+ *
+ *   - its config section AND the Zod schema for it,
+ *   - whether it is enabled,
+ *   - what must be true before the bot can start with it on,
+ *   - how to run one pass, and how to run on a schedule.
+ *
+ * The payoff compounds: because a module owns its schema, the operator settings
+ * page can render itself FROM that schema rather than being hand-written per
+ * feature. A contributor adding a module gets config validation, settings UI and
+ * documented options in one step, and cannot forget any of the three.
+ *
+ * ## What is NOT a module
+ *
+ * `node`, `panel`, `storage` and the wallet identity are CORE. They cannot be
+ * switched off — without them there is no bot, and no way back in to fix a
+ * misconfiguration. Only genuinely optional features are modules.
+ *
+ * ## Rules a module must not break
+ *
+ *   - **Route posting through the shared rate budget, never around it.** A
+ *     module that publishes is a new posting path and gets the same budget as
+ *     every other.
+ *   - **`posting.dryRun` is global and a module cannot opt out of it.** It is
+ *     the safety catch that lets an operator run a new module against a live
+ *     network without publishing anything.
+ *   - **Validate shape and caps in `schema`; never validate anything that
+ *     depends on runtime or network state there.** Config load happens before
+ *     the node is reachable — that belongs in `preflight`, which runs after.
+ *     (Putting a network-dependent check in a Zod `.refine()` is what produced
+ *     the 0.12.0 cadence bug.)
+ */
+
+import type { ZodTypeAny } from 'zod';
+import type { Config, Secrets } from '../config.js';
+import type { OgmaraPublisher } from '../ogmara.js';
+import type { ScheduledJob } from '../scheduler.js';
+
+/**
+ * Everything a module is handed at startup.
+ *
+ * Deliberately narrow: a module gets the shared, core-owned services and its own
+ * slice of config, not the whole process.
+ */
+export interface BotContext {
+  /** Fully parsed config, including this module's own section. */
+  readonly config: Config;
+  /** Secrets from the environment. Never logged, never written to config. */
+  readonly secrets: Secrets;
+  /** The shared publisher — owns the wallet, the rate budget and dry-run. */
+  readonly publisher: OgmaraPublisher;
+  /** Structured console output, so module logs look like core logs. */
+  readonly log: (message: string) => void;
+  /** Non-fatal warning. */
+  readonly warn: (message: string) => void;
+}
+
+/**
+ * A cron job a module registered, with the expression that produced it.
+ *
+ * The expression is carried alongside the job because the core needs it: it
+ * compares total scheduled attempts per hour against `posting.maxPostsPerHour`
+ * and warns when a schedule can out-run the budget. `ScheduledJob` itself does
+ * not expose its cron, and a module knowing its own schedules while the core
+ * cannot see them would silently drop that warning.
+ */
+export interface ModuleJob {
+  /** Short label for startup output, e.g. the source name. */
+  readonly name: string;
+  /** The cron expression, already validated by the module's schema. */
+  readonly cron: string;
+  readonly job: ScheduledJob;
+}
+
+/** A module's live state, returned by `start`. */
+export interface ModuleHandle {
+  /**
+   * Cron jobs the module registered, so the core can report them at startup and
+   * stop them on shutdown. Empty is valid — a module need not be scheduled.
+   */
+  readonly jobs: readonly ModuleJob[];
+  /** Release anything the module holds. Must be safe to call twice. */
+  stop(): Promise<void>;
+}
+
+/** Something that must be true before the bot may start with this module on. */
+export interface PreflightFailure {
+  /** Operator-facing explanation, including how to fix it. */
+  readonly message: string;
+}
+
+export interface BotModule {
+  /** Stable id. Matches the module's config key. */
+  readonly name: string;
+
+  /**
+   * Zod schema for this module's config section(s), keyed by config key.
+   *
+   * The single source of truth for the section: `config.ts` composes these
+   * rather than declaring them, and the settings UI renders from them.
+   */
+  readonly schemas: Readonly<Record<string, ZodTypeAny>>;
+
+  /**
+   * Whether the operator has switched this module on.
+   *
+   * An absent or disabled config section means "not started" — never an error.
+   * A bot running only the panel, with every module off, is a valid deployment.
+   */
+  isEnabled(config: Config): boolean;
+
+  /**
+   * Checks that need the node, the filesystem or the AI provider — anything
+   * unavailable at config-load time. Returning a failure aborts startup with
+   * that message rather than starting a module that cannot work.
+   */
+  preflight?(ctx: BotContext): Promise<PreflightFailure | null>;
+
+  /** Run exactly one pass and return. Backs `--once`. */
+  runOnce?(ctx: BotContext): Promise<void>;
+
+  /** Begin scheduled operation. */
+  start(ctx: BotContext): Promise<ModuleHandle>;
+}
