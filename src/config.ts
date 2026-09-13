@@ -660,7 +660,25 @@ export function readConfigFileRaw(
 }
 
 /**
- * Every dotted path the configuration schema declares.
+ * What the settings UI needs to know to render an input for one field.
+ *
+ * Derived from the Zod schema, not guessed from a runtime value: a value can
+ * be `undefined` (an unset optional field), which carries no type information
+ * at all — the schema is the only place that knows a field is a number with a
+ * 1-600 range versus a free-form string.
+ */
+export interface ConfigFieldType {
+  readonly kind: 'boolean' | 'number' | 'string' | 'enum' | 'array' | 'unknown';
+  /** For `kind: 'enum'`, the allowed values, in declaration order. */
+  readonly enumValues?: readonly string[];
+  readonly min?: number;
+  readonly max?: number;
+  /** For `kind: 'number'`: the input step, set only for a non-integer field. */
+  readonly step?: number;
+}
+
+/**
+ * Every dotted path the configuration schema declares, with its field type.
  *
  * Derived from the SCHEMA, not from a loaded config's present values — those
  * are different sets, and the difference is every `.optional()` field that
@@ -668,14 +686,23 @@ export function readConfigFileRaw(
  * `profile.bio`, `bot.handle` and `ai.baseUrl` could never be set through the
  * settings API at all: the write was refused as a misspelling, which is the
  * "rename the bot" surface the panel exists for.
+ *
+ * One walk produces both this and {@link configPaths} — two separate walkers
+ * over the same schema is how they would eventually enumerate different sets
+ * without anyone noticing until a field went missing from one of them.
  */
-export function configPaths(): ReadonlySet<string> {
-  const out = new Set<string>();
+export function configFieldTypes(): ReadonlyMap<string, ConfigFieldType> {
+  const out = new Map<string, ConfigFieldType>();
   walkSchema(configSchema, '', out);
   return out;
 }
 
-function walkSchema(schema: unknown, prefix: string, out: Set<string>): void {
+/** Every dotted path the configuration schema declares. */
+export function configPaths(): ReadonlySet<string> {
+  return new Set(configFieldTypes().keys());
+}
+
+function walkSchema(schema: unknown, prefix: string, out: Map<string, ConfigFieldType>): void {
   // Unwrap the wrappers Zod puts around a field — optional, default, prefault,
   // nullable — until the thing underneath is reachable.
   let node = schema as { def?: Record<string, unknown> };
@@ -698,7 +725,44 @@ function walkSchema(schema: unknown, prefix: string, out: Set<string>): void {
   }
   // A leaf: a scalar, an array, an enum, a union. Arrays are leaves here for
   // the same reason they are in `leafPaths` — the whole list is one value.
-  if (prefix !== '') out.add(prefix);
+  if (prefix === '') return;
+
+  const zodType = node.def?.['type'];
+  if (zodType === 'boolean' || zodType === 'string' || zodType === 'array') {
+    out.set(prefix, { kind: zodType });
+    return;
+  }
+  if (zodType === 'number') {
+    const bounded = node as {
+      minValue?: number | null;
+      maxValue?: number | null;
+      def?: Record<string, unknown>;
+    };
+    // `z.int()` carries `format: 'safeint'`; plain `z.number()` does not. Used
+    // by the settings UI to pick a `<input step>` — without it, a fractional
+    // range like the commands module's 0.05-1 budget shares got the browser's
+    // default integer step, and the native spinner arrows were useless on it.
+    const isInt = bounded.def?.['format'] === 'safeint';
+    out.set(prefix, {
+      kind: 'number',
+      ...(typeof bounded.minValue === 'number' ? { min: bounded.minValue } : {}),
+      ...(typeof bounded.maxValue === 'number' ? { max: bounded.maxValue } : {}),
+      ...(isInt ? {} : { step: 0.01 }),
+    });
+    return;
+  }
+  if (zodType === 'enum') {
+    const entries = node.def?.['entries'];
+    const enumValues =
+      typeof entries === 'object' && entries !== null ? Object.keys(entries) : [];
+    out.set(prefix, { kind: 'enum', enumValues });
+    return;
+  }
+  // A union (e.g. a discriminated variant) or anything else this walker does
+  // not specialise. The field is still settable — `unknown` renders as a plain
+  // text input carrying its raw JSON, which is honest about the UI's ignorance
+  // rather than silently mis-typing it as a string.
+  out.set(prefix, { kind: 'unknown' });
 }
 
 /**

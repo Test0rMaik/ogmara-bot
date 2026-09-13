@@ -18,6 +18,7 @@ import {
   type LayeredConfig,
   type Secrets,
 } from './config.js';
+import { CORE_UI_SCHEMA } from './coreUiSchema.js';
 import type { BotModule } from './modules/types.js';
 import type { SettingsDeps } from './panel/server.js';
 import type { DescribeInput } from './panel/settings.js';
@@ -79,11 +80,29 @@ function secretsPresent(secrets: Secrets): Record<string, boolean> {
  * thing an operator most needs to trust — see `describeFields`, where a missing
  * entry used to mean "applied".
  */
-function collectUiSchema(
-  modules: readonly BotModule[],
-): Record<string, { restart: boolean; confirm?: boolean }> {
-  const out: Record<string, { restart: boolean; confirm?: boolean }> = {};
+type UiMeta = { restart: boolean; confirm?: boolean; label?: string; help?: string };
+
+function collectUiSchema(modules: readonly BotModule[]): Record<string, UiMeta> {
+  const out: Record<string, UiMeta> = {};
+  // Seeded into `owner` too, not just `out` — a module claiming a path core
+  // already owns (say a future module touching `posting.dryRun`) must be
+  // refused the same way two modules colliding with each other are refused.
+  // Populating `out` without `owner` meant that collision was legal and
+  // silent: the module's entry would overwrite core's with no error, quietly
+  // taking `confirm: true` off a field specifically flagged for it because a
+  // wrong value is expensive or public. "No current module touches a core
+  // path" was true when this was written and is not a guarantee.
   const owner = new Map<string, string>();
+  for (const path of Object.keys(CORE_UI_SCHEMA)) owner.set(path, 'core');
+  for (const [path, field] of Object.entries(CORE_UI_SCHEMA)) {
+    out[path] = {
+      restart: field.restart,
+      ...(field.confirm === true ? { confirm: true } : {}),
+      ...(field.label !== undefined ? { label: field.label } : {}),
+      ...(field.help !== undefined ? { help: field.help } : {}),
+    };
+  }
+
   for (const module of modules) {
     for (const [path, field] of Object.entries(module.uiSchema ?? {})) {
       // Refuse a collision loudly at startup rather than letting the
@@ -101,17 +120,11 @@ function collectUiSchema(
       out[path] = {
         restart: field.restart,
         ...(field.confirm === true ? { confirm: true } : {}),
+        ...(field.label !== undefined ? { label: field.label } : {}),
+        ...(field.help !== undefined ? { help: field.help } : {}),
       };
     }
   }
-  // Core fields no module owns. `dryRun` is a confirmation step rather than a
-  // toggle in either direction: turning it OFF points a live wallet at a live
-  // network under the operator's identity, and turning it ON is how someone
-  // stops a bot that is posting — which is exactly when a wrong answer about
-  // whether it took effect does the most damage.
-  out['posting.dryRun'] = { restart: true, confirm: true };
-  out['node.url'] = { restart: true };
-  out['node.network'] = { restart: true, confirm: true };
   return out;
 }
 

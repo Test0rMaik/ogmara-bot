@@ -1067,6 +1067,8 @@ function isRegistrationPending(state: PanelState, registeredOnChain: boolean): b
  */
 interface SettingsWriteBody {
   changes?: unknown;
+  /** Required when any changed path is flagged `confirm` in its uiSchema. */
+  confirm?: unknown;
 }
 
 /**
@@ -1181,6 +1183,28 @@ async function handleSettings(
 
     const before = settings.describe();
 
+    // A field flagged `confirm` (turning dry run off, changing the network)
+    // needs an explicit `confirm: true` in the BODY, mirroring `/api/register`
+    // — not because the panel's dialog is a security boundary (an authenticated
+    // admin already has unconditional authority to write any non-file-only
+    // path, and a network-level replay of this same request bypasses the
+    // dialog anyway), but so the two write endpoints in this API agree on what
+    // "I meant it" looks like, rather than one requiring it and the other
+    // trusting whatever a client sent.
+    const needsConfirm = paths.filter((p) => before.ui[p]?.confirm === true);
+    if (needsConfirm.length > 0 && body.confirm !== true) {
+      const reason =
+        `changing ${needsConfirm.map((p) => `"${p}"`).join(', ')} needs "confirm": true in the request body`;
+      // Audited like every other rejection in this handler — a refusal is
+      // exactly the event an operator later goes looking for, and this one is
+      // no less informative than a file-only or unknown-path refusal.
+      for (const p of needsConfirm) {
+        settings.audit({ actor, ip, path: p, outcome: 'rejected', reason: truncate(reason, MAX_AUDIT_REASON) });
+      }
+      sendJson(res, 400, { error: reason, requiresConfirm: needsConfirm });
+      return;
+    }
+
     // A path the config does not have is refused rather than silently stripped
     // by Zod — see rejectUnknownPaths for why a stripped key is worse than a
     // rejected one.
@@ -1243,7 +1267,7 @@ async function handleSettings(
 
   if (method === 'POST' && path === '/api/settings/reset') {
     if (!requireJsonContentType(req, res)) return;
-    const body = await readJsonBody<{ path?: unknown }>(req, res);
+    const body = await readJsonBody<{ path?: unknown; confirm?: unknown }>(req, res);
     if (body === undefined) return;
     if (typeof body.path !== 'string' || body.path.length === 0) {
       sendJson(res, 400, { error: '"path" is required' });
@@ -1265,6 +1289,21 @@ async function handleSettings(
     }
 
     const before = settings.describe();
+
+    // Same gate as PUT, and for the same reason: resetting `posting.dryRun` or
+    // `node.network` back to whatever config.yaml says is exactly as
+    // consequential as writing it directly — an operator could unknowingly
+    // hand a live wallet back to the file's `dryRun: false`. Not a security
+    // boundary (an authenticated admin already has unconditional authority
+    // here), but the two write endpoints should not disagree about what "I
+    // meant it" requires.
+    if (before.ui[target]?.confirm === true && body.confirm !== true) {
+      const reason = `resetting "${target}" needs "confirm": true in the request body`;
+      settings.audit({ actor, ip, path: target, outcome: 'rejected', reason });
+      sendJson(res, 400, { error: reason, requiresConfirm: [target] });
+      return;
+    }
+
     const result = settings.reset(target);
     if (!result.ok) {
       settings.audit({

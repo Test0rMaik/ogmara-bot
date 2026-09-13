@@ -14,7 +14,7 @@
  *     precisely the event an operator later goes looking for.
  */
 
-import type { Config } from '../config.js';
+import { configFieldTypes, type Config, type ConfigFieldType } from '../config.js';
 import { getPath, hasDangerousKey, leafPaths, type Overrides } from '../settings.js';
 
 /**
@@ -111,6 +111,18 @@ export interface FieldView {
   readonly restart: boolean;
   /** Needs an explicit confirmation step rather than an autosaving control. */
   readonly confirm: boolean;
+  /**
+   * i18n key for this field's label, when a module supplied one.
+   *
+   * Absent for a path no module claimed — the UI falls back to a humanised
+   * version of the path itself, which is what keeps "nearly free" true for a
+   * module that declares no `uiSchema` at all.
+   */
+  readonly labelKey?: string;
+  /** i18n key for help text, when a module supplied one. */
+  readonly helpKey?: string;
+  /** Shape info from the Zod schema, for choosing an input widget. */
+  readonly type: ConfigFieldType;
 }
 
 export interface DescribeInput {
@@ -118,8 +130,12 @@ export interface DescribeInput {
   readonly fromFile: Record<string, unknown>;
   readonly fromUi: Record<string, unknown>;
   /** Per-path presentation metadata, merged from every enabled module. */
-  readonly ui: Readonly<Record<string, { restart: boolean; confirm?: boolean }>>;
+  readonly ui: Readonly<
+    Record<string, { restart: boolean; confirm?: boolean; label?: string; help?: string }>
+  >;
 }
+
+const UNKNOWN_TYPE: ConfigFieldType = { kind: 'unknown' };
 
 /**
  * Describe every field of the effective config, with provenance.
@@ -129,6 +145,9 @@ export interface DescribeInput {
  * it is computed from the raw layers rather than guessed.
  */
 export function describeFields(input: DescribeInput): FieldView[] {
+  // Computed once per call, not per field — walking the schema is a few tens
+  // of microseconds, but there is no reason to pay it 80 times over.
+  const types = configFieldTypes();
   return leafPaths(input.effective as unknown as Record<string, unknown>).map((path) => {
     const section = path.split('.')[0] ?? '';
     const meta = input.ui[path];
@@ -143,6 +162,9 @@ export function describeFields(input: DescribeInput): FieldView[] {
       value: fileOnly ? null : redact(path, getPath(input.effective, path)),
       source: sourceOf(path, input),
       fileOnly,
+      ...(meta?.label !== undefined ? { labelKey: meta.label } : {}),
+      ...(meta?.help !== undefined ? { helpKey: meta.help } : {}),
+      type: types.get(path) ?? UNKNOWN_TYPE,
       // Restart-required by DEFAULT. A path with no metadata is one no module
       // claimed, and nothing in the process re-reads the config after a write —
       // so "we do not know" must read as "not applied yet", never as "applied".

@@ -166,6 +166,57 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
 
     schemas: { bot: botSchema as ZodTypeAny },
 
+    // Every one of these is read once, at `start()`, and closed over — there
+    // is no live-apply path, so all of them are restart-required. Left explicit
+    // rather than relying on the settings page's restart-by-default fallback:
+    // that default exists for paths NO module claimed, and silently matching it
+    // here would make it easy to forget when a live-apply path is eventually
+    // added for one of these.
+    uiSchema: {
+      'bot.enabled': {
+        label: 'field.bot.enabled.label',
+        help: 'field.bot.enabled.help',
+        restart: true,
+      },
+      'bot.handle': {
+        label: 'field.bot.handle.label',
+        help: 'field.bot.handle.help',
+        restart: true,
+      },
+      'bot.channels': {
+        label: 'field.bot.channels.label',
+        help: 'field.bot.channels.help',
+        restart: true,
+      },
+      'bot.commands': {
+        label: 'field.bot.commands.label',
+        help: 'field.bot.commands.help',
+        restart: true,
+      },
+      'bot.rateLimit.perWalletPerMinute': {
+        label: 'field.bot.rateLimit.perWalletPerMinute.label',
+        restart: true,
+      },
+      'bot.rateLimit.globalPerMinute': {
+        label: 'field.bot.rateLimit.globalPerMinute.label',
+        restart: true,
+      },
+      'bot.rateLimit.noticeCooldownSeconds': {
+        label: 'field.bot.rateLimit.noticeCooldownSeconds.label',
+        restart: true,
+      },
+      'bot.rateLimit.maxShareOfNodeBudget': {
+        label: 'field.bot.rateLimit.maxShareOfNodeBudget.label',
+        help: 'field.bot.rateLimit.maxShareOfNodeBudget.help',
+        restart: true,
+      },
+      'bot.rateLimit.perWalletShareOfBudget': {
+        label: 'field.bot.rateLimit.perWalletShareOfBudget.label',
+        help: 'field.bot.rateLimit.perWalletShareOfBudget.help',
+        restart: true,
+      },
+    },
+
     isEnabled: (config) => botConfig(config).enabled,
 
     async preflight(ctx: BotContext): Promise<PreflightFailure | null> {

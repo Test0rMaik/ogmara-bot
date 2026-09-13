@@ -114,7 +114,7 @@ describe('renderScript success/error feedback', () => {
 
   it('calls showSuccess (not showError) for a successful registration', () => {
     const fn = extractFunction(script, 'register');
-    expect(fn).toMatch(/showSuccess\(\s*'Registered/);
+    expect(fn).toMatch(/showSuccess\(t\('account\.registration\.success'/);
   });
 
   it('reports both other register outcomes (already-registered, insufficient-funds), not just the happy path', () => {
@@ -199,9 +199,9 @@ describe('dashboard tab', () => {
     expect(script).not.toMatch(/refresh\(\)\s*\.then\(refreshPosts\)/);
   });
 
-  it('shows "never" rather than a broken date/NaN when there are no posts yet', () => {
+  it('shows a translated fallback rather than a broken date/NaN when there are no posts yet', () => {
     const fn = extractFunction(script, 'refreshPosts');
-    expect(fn).toContain("'never'");
+    expect(fn).toContain("t('posts.never')");
   });
 
   it('uses roughly 80% of the screen width rather than a fixed narrow column', () => {
@@ -681,3 +681,513 @@ function extractFunction(source: string, name: string): string {
   }
   return source.slice(start, i);
 }
+
+/**
+ * Regression coverage for the settings-panel additions (Configuration and
+ * Audit-log tabs, i18n runtime, theme switching). Uses the same
+ * extract-and-execute pattern as the chart/date-math tests above: these are
+ * plain functions with no framework dependency, so pulling the real source out
+ * of the generated script and running it directly catches an actual behavior
+ * regression, not just a change in wording.
+ */
+describe('restart banner: visible regardless of the active tab', () => {
+  it('sits OUTSIDE every tab-content div, like the backup banner', () => {
+    // Exactly the shape backup-banner's own regression test guards against:
+    // an element nested inside a tab-content div is invisible the moment a
+    // different tab is active — and this banner exists specifically so an
+    // operator sees it no matter which tab they are looking at.
+    const divs = topLevelDivs(page);
+    for (const [id, html] of divs) {
+      if (id.startsWith('tab-')) {
+        expect(html, `#${id} must not contain the restart banner`).not.toContain('id="restart-banner"');
+      }
+    }
+    expect(page).toContain('id="restart-banner"');
+  });
+
+  it('is a sibling of backup-banner, not nested inside #panel', () => {
+    const bannerIdx = page.indexOf('id="restart-banner"');
+    const panelIdx = page.indexOf('id="panel"');
+    expect(bannerIdx).toBeGreaterThan(-1);
+    expect(bannerIdx).toBeLessThan(panelIdx);
+  });
+});
+
+describe('setNestedValue', () => {
+  function load(): (obj: unknown, path: string, value: unknown) => void {
+    const fn = extractFunction(script, 'setNestedValue');
+    return new Function(`${fn}\nreturn setNestedValue;`)();
+  }
+
+  it('writes a top-level path', () => {
+    const setNestedValue = load();
+    const obj: Record<string, unknown> = {};
+    setNestedValue(obj, 'dryRun', true);
+    expect(obj).toEqual({ dryRun: true });
+  });
+
+  it('creates intermediate objects for a nested path', () => {
+    const setNestedValue = load();
+    const obj: Record<string, unknown> = {};
+    setNestedValue(obj, 'bot.rateLimit.perWalletPerMinute', 5);
+    expect(obj).toEqual({ bot: { rateLimit: { perWalletPerMinute: 5 } } });
+  });
+
+  it('merges a second path under the same parent without clobbering the first', () => {
+    const setNestedValue = load();
+    const obj: Record<string, unknown> = {};
+    setNestedValue(obj, 'bot.enabled', true);
+    setNestedValue(obj, 'bot.handle', 'x');
+    expect(obj).toEqual({ bot: { enabled: true, handle: 'x' } });
+  });
+
+  it('overwrites a non-object intermediate rather than throwing', () => {
+    // Defensive: this builds a fresh `changes` object each save from scratch,
+    // so a stale non-object at an intermediate key should never occur in
+    // practice — but a throw here would abort an otherwise-valid save.
+    const setNestedValue = load();
+    const obj: Record<string, unknown> = { bot: 'not an object yet' };
+    setNestedValue(obj, 'bot.enabled', true);
+    expect(obj).toEqual({ bot: { enabled: true } });
+  });
+});
+
+describe('fieldIsDirty / fieldCurrentValue', () => {
+  function load(): {
+    fieldIsDirty: (f: { path: string; value: unknown }) => boolean;
+    fieldCurrentValue: (f: { path: string; value: unknown }) => unknown;
+  } {
+    const currentFn = extractFunction(script, 'fieldCurrentValue');
+    const dirtyFn = extractFunction(script, 'fieldIsDirty');
+    return new Function(
+      'configPending',
+      `${currentFn}\n${dirtyFn}\nreturn { fieldIsDirty, fieldCurrentValue };`,
+    )({});
+  }
+
+  it('is not dirty when nothing has been edited', () => {
+    const { fieldIsDirty } = load();
+    expect(fieldIsDirty({ path: 'posting.dryRun', value: true })).toBe(false);
+  });
+
+  it('is dirty once a DIFFERENT value is pending', () => {
+    const currentFn = extractFunction(script, 'fieldCurrentValue');
+    const dirtyFn = extractFunction(script, 'fieldIsDirty');
+    const pending = { 'posting.dryRun': false };
+    const { fieldIsDirty, fieldCurrentValue } = new Function(
+      'configPending',
+      `${currentFn}\n${dirtyFn}\nreturn { fieldIsDirty, fieldCurrentValue };`,
+    )(pending);
+    const field = { path: 'posting.dryRun', value: true };
+    expect(fieldCurrentValue(field)).toBe(false); // shows the PENDING edit
+    expect(fieldIsDirty(field)).toBe(true);
+  });
+
+  it('is NOT dirty when the pending edit matches the original — editing back counts as clean', () => {
+    const currentFn = extractFunction(script, 'fieldCurrentValue');
+    const dirtyFn = extractFunction(script, 'fieldIsDirty');
+    const pending = { 'posting.maxPostsPerHour': 3 };
+    const { fieldIsDirty } = new Function(
+      'configPending',
+      `${currentFn}\n${dirtyFn}\nreturn { fieldIsDirty, fieldCurrentValue };`,
+    )(pending);
+    expect(fieldIsDirty({ path: 'posting.maxPostsPerHour', value: 3 })).toBe(false);
+  });
+
+  it('compares by VALUE (JSON), not by reference — an array edited back to an equal one is clean', () => {
+    const currentFn = extractFunction(script, 'fieldCurrentValue');
+    const dirtyFn = extractFunction(script, 'fieldIsDirty');
+    const pending = { 'bot.channels': [7, 8] };
+    const { fieldIsDirty } = new Function(
+      'configPending',
+      `${currentFn}\n${dirtyFn}\nreturn { fieldIsDirty, fieldCurrentValue };`,
+    )(pending);
+    expect(fieldIsDirty({ path: 'bot.channels', value: [7, 8] })).toBe(false);
+  });
+});
+
+describe('humanizeFieldLabel', () => {
+  function load(): (path: string) => string {
+    const fn = extractFunction(script, 'humanizeFieldLabel');
+    return new Function(`${fn}\nreturn humanizeFieldLabel;`)();
+  }
+
+  it('splits camelCase and capitalises the first letter, for a path no module labelled', () => {
+    const humanizeFieldLabel = load();
+    expect(humanizeFieldLabel('posting.maxPostsPerHour')).toBe('Max Posts Per Hour');
+  });
+
+  it('leaves an already-lowercase single word alone but capitalised', () => {
+    const humanizeFieldLabel = load();
+    expect(humanizeFieldLabel('node.url')).toBe('Url');
+  });
+});
+
+describe('i18n runtime: t()', () => {
+  function load(locale: string, table: Record<string, Record<string, string>>): (key: string, vars?: Record<string, unknown>) => string {
+    const fn = extractFunction(script, 't');
+    return new Function('I18N', 'locale', `${fn}\nreturn t;`)(table, locale);
+  }
+
+  it('substitutes a {placeholder}', () => {
+    const t = load('en', { en: { greet: 'Hello {name}' } });
+    expect(t('greet', { name: 'Bob' })).toBe('Hello Bob');
+  });
+
+  it('substitutes the SAME placeholder appearing more than once', () => {
+    const t = load('en', { en: { echo: '{x} and {x}' } });
+    expect(t('echo', { x: 'A' })).toBe('A and A');
+  });
+
+  it('falls back to English when the active locale is missing the key', () => {
+    const t = load('de', { en: { 'only.english': 'only in English' }, de: {} });
+    expect(t('only.english')).toBe('only in English');
+  });
+
+  it('falls back to the raw key when NO locale has it — a visibly broken string beats a blank control', () => {
+    const t = load('en', { en: {} });
+    expect(t('totally.missing.key')).toBe('totally.missing.key');
+  });
+
+  it('does not crash on a key with no vars object', () => {
+    const t = load('en', { en: { plain: 'no placeholders here' } });
+    expect(t('plain')).toBe('no placeholders here');
+  });
+});
+
+describe('detectLocale / detectTheme: reading persisted preferences', () => {
+  function loadLocale(stored: string | null, navLang: string): () => string {
+    const fn = extractFunction(script, 'detectLocale');
+    const storage = {
+      getItem: (k: string) => (k === 'ogmara_bot_locale' ? stored : null),
+    };
+    return new Function(
+      'localStorage',
+      'navigator',
+      'LOCALES',
+      `${fn}\nreturn detectLocale;`,
+    )(storage, { language: navLang }, ['en', 'de', 'es', 'pt', 'ru', 'ja', 'zh']);
+  }
+
+  it('uses the stored locale when it is one this panel ships', () => {
+    expect(loadLocale('de', 'en-US')()).toBe('de');
+  });
+
+  it('falls back to the browser language when nothing is stored', () => {
+    expect(loadLocale(null, 'ja-JP')()).toBe('ja');
+  });
+
+  it('falls back to English when the browser language is not one of the seven', () => {
+    expect(loadLocale(null, 'ko-KR')()).toBe('en');
+  });
+
+  it('IGNORES a stored value that is not a real locale — never trusts storage blindly', () => {
+    // A locale list saved by a newer build and then rolled back to an older
+    // one must not crash the older build reading it.
+    expect(loadLocale('klingon', 'en-US')()).toBe('en');
+  });
+
+  function loadTheme(stored: string | null): () => string {
+    const fn = extractFunction(script, 'detectTheme');
+    const storage = {
+      getItem: (k: string) => (k === 'ogmara_bot_theme' ? stored : null),
+    };
+    return new Function('localStorage', `${fn}\nreturn detectTheme;`)(storage);
+  }
+
+  it('uses a stored "light" or "dark" verbatim', () => {
+    expect(loadTheme('light')()).toBe('light');
+    expect(loadTheme('dark')()).toBe('dark');
+  });
+
+  it('falls back to "system" for anything else, including garbage', () => {
+    expect(loadTheme(null)()).toBe('system');
+    expect(loadTheme('purple')()).toBe('system');
+  });
+});
+
+describe('confirmMessageFor: the right warning for the right field', () => {
+  function load(): (field: { path: string }, from: unknown, to: unknown) => string {
+    const fieldLabelStub = 'function fieldLabel(f) { return f.path; }';
+    const tStub = `function t(key, vars) {
+      const table = {
+        'config.confirm.dryRunOff': 'TURN OFF',
+        'config.confirm.dryRunOn': 'TURN ON',
+        'config.confirm.network': 'NETWORK CHANGE',
+        'config.confirm.generic': 'generic ' + (vars ? vars.field : ''),
+      };
+      return table[key] || key;
+    }`;
+    const fn = extractFunction(script, 'confirmMessageFor');
+    return new Function(`${tStub}\n${fieldLabelStub}\n${fn}\nreturn confirmMessageFor;`)();
+  }
+
+  it('uses the dry-run-OFF message when dryRun is being set to false', () => {
+    const confirmMessageFor = load();
+    expect(confirmMessageFor({ path: 'posting.dryRun' }, true, false)).toBe('TURN OFF');
+  });
+
+  it('uses the dry-run-ON message when dryRun is being set to true', () => {
+    const confirmMessageFor = load();
+    expect(confirmMessageFor({ path: 'posting.dryRun' }, false, true)).toBe('TURN ON');
+  });
+
+  it('uses the network-specific message for node.network, not the generic one', () => {
+    const confirmMessageFor = load();
+    expect(confirmMessageFor({ path: 'node.network' }, 'testnet', 'mainnet')).toBe('NETWORK CHANGE');
+  });
+
+  it('falls back to the generic message for any other confirm-flagged field', () => {
+    const confirmMessageFor = load();
+    expect(confirmMessageFor({ path: 'ai.provider' }, 'anthropic', 'openai')).toContain('ai.provider');
+  });
+});
+
+describe('saveConfig: REAL execution, not just source-text checks', () => {
+  // A source-text grep is exactly what missed the bug this suite exists to
+  // catch: `onChange` correctly computed `undefined` for a cleared field, and
+  // `saveConfig`'s own source correctly read `confirmed ? {...} : {...}` — but
+  // `JSON.stringify({profile:{bio: undefined}})` silently drops the `bio` key
+  // entirely (JSON has no way to encode an "own property with value
+  // undefined"), so the wire payload for a lone cleared field was
+  // `{"changes":{"profile":{}}}` — an EMPTY object, which the server reads as
+  // the leaf path "profile" and rejects as an unrecognised setting. Bundled
+  // alongside a sibling edit, the clear vanished with no error at all and
+  // "Saved." was shown for an edit that had not fully happened. No amount of
+  // grepping the source text for the right-looking code would ever catch
+  // this — only actually running it and inspecting what left the function.
+  //
+  // No DOM is available in this test environment, so `document`/`window` are
+  // minimal stand-ins — this exercises `saveConfig`'s own control flow (which
+  // endpoint(s) it calls, with what bodies, in what order), not real widget
+  // interaction (covered separately, and by the live end-to-end check this
+  // session ran against a real running instance).
+  function loadSaveConfig(): {
+    run: () => Promise<void>;
+    calls: Array<{ path: string; options: { method: string; body: string } }>;
+    configPendingRef: Record<string, unknown>;
+  } {
+    const fieldIsDirtyFn = extractFunction(script, 'fieldIsDirty');
+    const fieldCurrentValueFn = extractFunction(script, 'fieldCurrentValue');
+    const setNestedValueFn = extractFunction(script, 'setNestedValue');
+    const confirmMessageForFn = extractFunction(script, 'confirmMessageFor');
+    const saveConfigFn = extractFunction(script, 'saveConfig');
+
+    const calls: Array<{ path: string; options: { method: string; body: string } }> = [];
+    const elements: Record<string, { disabled: boolean; textContent: string }> = {
+      'config-save-btn': { disabled: false, textContent: '' },
+    };
+
+    const sandbox = new Function(
+      'configFields',
+      'configPending',
+      'document',
+      'window',
+      'api',
+      't',
+      'showSuccess',
+      'showError',
+      'addRestartPending',
+      'refreshConfig',
+      `
+      ${fieldCurrentValueFn}
+      ${fieldIsDirtyFn}
+      ${setNestedValueFn}
+      function fieldLabel(f) { return f.path; }
+      ${confirmMessageForFn}
+      ${saveConfigFn}
+      return saveConfig;
+      `,
+    );
+
+    const configPending: Record<string, unknown> = {};
+    const configFields = [
+      { path: 'profile.bio', value: 'old bio', confirm: false },
+      { path: 'profile.displayName', value: 'Old Name', confirm: false },
+    ];
+
+    const api = async (path: string, options: { method: string; body: string }) => {
+      calls.push({ path, options });
+      return { status: 'saved', restartPending: [] };
+    };
+
+    const run = (): Promise<void> =>
+      sandbox(
+        configFields,
+        configPending,
+        { getElementById: (id: string) => elements[id] },
+        { confirm: () => true },
+        api,
+        (key: string) => key,
+        () => {},
+        () => {},
+        () => {},
+        async () => {},
+      )();
+
+    return { run, calls, configPendingRef: configPending };
+  }
+
+  it('routes a CLEARED field through reset, never through the bulk PUT', async () => {
+    const { run, calls, configPendingRef } = loadSaveConfig();
+    configPendingRef['profile.bio'] = undefined;
+    await run();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.path).toBe('/api/settings/reset');
+    expect(JSON.parse(calls[0]!.options.body)).toEqual({ path: 'profile.bio' });
+  });
+
+  it('does NOT silently drop a sibling edit when a sibling field is cleared in the same save', async () => {
+    // THE regression, reproduced end to end: before the fix, both edits went
+    // into one bulk PUT, JSON.stringify dropped the cleared key, and the
+    // sibling edit's own field never got a value written for the one that was
+    // supposed to be cleared.
+    const { run, calls, configPendingRef } = loadSaveConfig();
+    configPendingRef['profile.bio'] = undefined;
+    configPendingRef['profile.displayName'] = 'New Name';
+    await run();
+
+    const resetCall = calls.find((c) => c.path === '/api/settings/reset');
+    const putCall = calls.find((c) => c.path === '/api/settings');
+    expect(resetCall, 'the cleared field must reach the server via reset').toBeDefined();
+    expect(JSON.parse(resetCall!.options.body)).toEqual({ path: 'profile.bio' });
+    expect(putCall, 'the sibling edit must still be saved').toBeDefined();
+    const putBody = JSON.parse(putCall!.options.body);
+    expect(putBody.changes).toEqual({ profile: { displayName: 'New Name' } });
+    // And the cleared field must NOT appear anywhere in the PUT body — it was
+    // already handled by the reset call above.
+    expect(JSON.stringify(putBody)).not.toContain('bio');
+  });
+
+  it('sends an ordinary edit through the bulk PUT, unchanged from before', async () => {
+    const { run, calls, configPendingRef } = loadSaveConfig();
+    configPendingRef['profile.displayName'] = 'New Name';
+    await run();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.path).toBe('/api/settings');
+    expect(JSON.parse(calls[0]!.options.body)).toEqual({
+      changes: { profile: { displayName: 'New Name' } },
+    });
+  });
+
+  it('includes confirm:true in the PUT body when any dirty field is confirm-flagged', async () => {
+    const fieldIsDirtyFn = extractFunction(script, 'fieldIsDirty');
+    const fieldCurrentValueFn = extractFunction(script, 'fieldCurrentValue');
+    const setNestedValueFn = extractFunction(script, 'setNestedValue');
+    const confirmMessageForFn = extractFunction(script, 'confirmMessageFor');
+    const saveConfigFn = extractFunction(script, 'saveConfig');
+    const calls: Array<{ path: string; options: { method: string; body: string } }> = [];
+    const elements: Record<string, { disabled: boolean; textContent: string }> = {
+      'config-save-btn': { disabled: false, textContent: '' },
+    };
+    const sandbox = new Function(
+      'configFields',
+      'configPending',
+      'document',
+      'window',
+      'api',
+      't',
+      'showSuccess',
+      'showError',
+      'addRestartPending',
+      'refreshConfig',
+      `
+      ${fieldCurrentValueFn}
+      ${fieldIsDirtyFn}
+      ${setNestedValueFn}
+      function fieldLabel(f) { return f.path; }
+      ${confirmMessageForFn}
+      ${saveConfigFn}
+      return saveConfig;
+      `,
+    );
+    const configPending: Record<string, unknown> = { 'posting.dryRun': false };
+    const configFields = [{ path: 'posting.dryRun', value: true, confirm: true }];
+    const api = async (path: string, options: { method: string; body: string }) => {
+      calls.push({ path, options });
+      return { status: 'saved', restartPending: [] };
+    };
+    await sandbox(
+      configFields,
+      configPending,
+      { getElementById: (id: string) => elements[id] },
+      { confirm: () => true },
+      api,
+      (key: string) => key,
+      () => {},
+      () => {},
+      () => {},
+      async () => {},
+    )();
+
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0]!.options.body).confirm).toBe(true);
+  });
+});
+
+describe('refreshAudit: a failed fetch clears the loading placeholder', () => {
+  it('does not leave "Loading..." on screen alongside the error banner', async () => {
+    // REGRESSION GUARD. refreshConfig already clears its own loading state in
+    // its catch block; refreshAudit's catch only touched audit-error, so a
+    // transient failure while opening the tab left BOTH the real error and a
+    // permanently stuck loading message underneath it.
+    const fn = extractFunction(script, 'refreshAudit');
+    const emptyEl = { hidden: false, textContent: '' };
+    const errorEl = { textContent: '' };
+    const elements: Record<string, unknown> = { 'audit-empty': emptyEl, 'audit-error': errorEl };
+    const sandbox = new Function(
+      'document',
+      'api',
+      't',
+      'auditEvents',
+      'renderAuditTable',
+      `
+      let auditEvents_ = auditEvents;
+      ${fn.replace('async function refreshAudit()', 'async function refreshAudit()').replace(/\bauditEvents\b/g, 'auditEvents_')}
+      return refreshAudit;
+      `,
+    );
+    const run = sandbox(
+      { getElementById: (id: string) => elements[id] },
+      async () => {
+        throw new Error('node unreachable');
+      },
+      (key: string) => key,
+      null,
+      () => {},
+    );
+    await run();
+    expect(emptyEl.hidden).toBe(true);
+    expect(errorEl.textContent).toContain('node unreachable');
+  });
+});
+
+describe('audit tab: null sentinel distinguishes "never fetched" from "genuinely empty"', () => {
+  it('renderAuditTable does not run before the first fetch', () => {
+    const fn = extractFunction(script, 'renderAuditTable');
+    expect(fn).toContain('if (auditEvents === null) return;');
+  });
+
+  it('refreshLocalizedViews only re-renders the audit table once it has been fetched', () => {
+    const fn = extractFunction(script, 'refreshLocalizedViews');
+    expect(fn).toContain("if (auditEvents !== null) renderAuditTable();");
+  });
+
+  it('auditEvents starts as the null sentinel, not an empty array', () => {
+    expect(script).toContain('let auditEvents = null;');
+  });
+});
+
+describe('optional string fields can be cleared back to unset', () => {
+  it('a blanked text input always sends undefined, regardless of the field\'s previous value', () => {
+    // REGRESSION GUARD. This used to be conditional on the field having
+    // already been unset, so blanking a field that DID hold a value sent ''
+    // instead — which fails validation for every optional string field in
+    // this schema (each is either `.min(1)` or format-validated), leaving no
+    // way to clear one through the panel except by hand-editing a file.
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toContain("onChange(input.value === '' ? undefined : input.value);");
+  });
+});

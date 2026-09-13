@@ -137,6 +137,33 @@ export function createNewsModule(deps: NewsDeps): BotModule {
 
     schemas: { sources: sourcesSchema as ZodTypeAny },
 
+    // Cron schedules and the source list are read once, at `start()`, and
+    // registered as jobs — there is no live-apply path, so a change is
+    // restart-required across the board.
+    uiSchema: {
+      'sources.rss.enabled': { label: 'field.sources.rss.enabled.label', restart: true },
+      'sources.rss.schedule': { label: 'field.sources.rss.schedule.label', restart: true },
+      'sources.rss.feeds': {
+        label: 'field.sources.rss.feeds.label',
+        help: 'field.sources.rss.feeds.help',
+        restart: true,
+      },
+      'sources.topics.enabled': { label: 'field.sources.topics.enabled.label', restart: true },
+      'sources.topics.schedule': { label: 'field.sources.topics.schedule.label', restart: true },
+      'sources.topics.topics': {
+        label: 'field.sources.topics.topics.label',
+        help: 'field.sources.topics.topics.help',
+        restart: true,
+      },
+      'sources.imagedir.enabled': { label: 'field.sources.imagedir.enabled.label', restart: true },
+      'sources.imagedir.schedule': { label: 'field.sources.imagedir.schedule.label', restart: true },
+      'sources.imagedir.directories': {
+        label: 'field.sources.imagedir.directories.label',
+        help: 'field.sources.imagedir.directories.help',
+        restart: true,
+      },
+    },
+
     isEnabled: newsEnabled,
 
     async preflight(ctx: BotContext): Promise<PreflightFailure | null> {

@@ -176,6 +176,30 @@ describe('uiSchema collisions', () => {
     // Which module's `restart`/`confirm` applied would otherwise depend on
     // registration order — and a field mislabelled as live when it is not is
     // exactly the lie the restart flag exists to prevent.
+    //
+    // A path with no core entry, deliberately — using a core path here would
+    // also trip the module-vs-core guard below and stop isolating this case.
+    const mod = (name: string): never =>
+      ({ name, schemas: {}, uiSchema: { 'bot.handle': { label: 'x', restart: false } } }) as never;
+    writeFileSync(
+      configPath,
+      CONFIG_YAML().replace('OVERRIDES', overridesPath).replace('AUDIT', join(dir, 'audit.log')),
+      'utf8',
+    );
+    const layered = loadLayeredConfig(configPath, overridesPath, () => {});
+    expect(() =>
+      createSettingsDeps({ configPath, layered, modules: [mod('a'), mod('b')], secrets }),
+    ).toThrow(/both declare a uiSchema/);
+  });
+
+  it('refuses a module claiming a path CORE already owns, not just another module', () => {
+    // REGRESSION GUARD. `owner` used to be seeded only inside the module loop,
+    // so a module touching a core path (posting.dryRun, node.network, ...)
+    // silently overwrote core's entry with no error — including dropping
+    // `confirm: true` from a field flagged specifically because a wrong value
+    // is expensive (posting.dryRun) or irreversible (node.network). "No
+    // current module touches a core path" was true when that code was written
+    // and is not a structural guarantee.
     const mod = (name: string): never =>
       ({ name, schemas: {}, uiSchema: { 'posting.dryRun': { label: 'x', restart: false } } }) as never;
     writeFileSync(
@@ -185,7 +209,7 @@ describe('uiSchema collisions', () => {
     );
     const layered = loadLayeredConfig(configPath, overridesPath, () => {});
     expect(() =>
-      createSettingsDeps({ configPath, layered, modules: [mod('a'), mod('b')], secrets }),
+      createSettingsDeps({ configPath, layered, modules: [mod('a')], secrets }),
     ).toThrow(/both declare a uiSchema/);
   });
 });

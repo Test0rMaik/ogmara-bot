@@ -5,6 +5,98 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-09-13
+
+Phase D of the modularisation: the settings UI. Everything Phase C's API
+exposed now has a page — a Configuration tab generated per module from
+`uiSchema`, an Audit-log tab, full i18n across the platform's 7 languages, and
+dark/light theming. No build step, no framework: still one server-generated
+template string, per this repo's standing constraint.
+
+### Added
+
+- **A Configuration tab.** One field per settable path, widget chosen straight
+  from the Zod schema (`configFieldTypes()`, in `config.ts`) — checkbox for a
+  boolean, dropdown for an enum in declaration order, number spinner with the
+  schema's own min/max/step, repeatable list for an array — so a module needs
+  no per-field UI code to get a working settings page. `configPaths()` is now
+  *derived* from `configFieldTypes()`'s single schema walk, not a second
+  independent one, closing off the class of bug where the two silently
+  disagreed.
+- **`uiSchema` on modules.** `label`/`help`/`restart`/`confirm` metadata,
+  merged across every enabled module plus a new `CORE_UI_SCHEMA` for the
+  unowned core paths (`node.*`, `posting.*`, `ai.*`, `profile.*`, etc.).
+  Collisions — two modules, or a module and core, claiming the same path — are
+  a startup error, not a silent last-write-wins.
+- **Provenance chips and a restart-required banner.** Each field shows
+  whether its value comes from `config.yaml`, an override, or the schema
+  default; saving a `restart: true` field queues a persistent (localStorage
+  survives a page reload) banner rather than implying the change is already
+  live — nothing in the running process re-reads config after a write, so
+  saying otherwise would be a lie the page tells the operator.
+- **Confirmation on consequential fields.** `posting.dryRun`, `node.network`,
+  and a few others carry `confirm: true`; both the client dialog and, now,
+  the server itself require `confirm: true` in the body on `PUT
+  /api/settings` and `POST /api/settings/reset` for any changed path so
+  flagged — mirroring the existing `/api/register` gate. This is behavioural
+  parity, not a security boundary: an authenticated admin already has
+  unconditional authority, and a replayed request bypasses a client dialog
+  regardless. The point is that a stolen/replayed request and a real click
+  produce the same *audited* outcome, not a silent one.
+- **An Audit-log tab**, same auth as the rest of the panel, with filters on
+  actor/path/outcome.
+- **Full i18n**, from scratch, no library: a JSON-embedded translation table
+  (`src/panel/i18n.ts`) for the 7 languages used across the rest of the
+  platform (en/de/es/pt/ru/ja/zh), a hand-written `t(key, vars)` with
+  `{placeholder}` substitution, and a key-parity test that fails on any
+  missing key, empty translation, or dropped placeholder in any locale.
+  Diagnostic/error text that passes through verbatim from the server is
+  deliberately out of scope — only UI chrome is translated.
+- **Dark/light theming** via CSS custom properties. Dark is the panel's
+  existing look and stays the unqualified `:root` default; light values are
+  declared once and applied both by `prefers-color-scheme` and by an explicit
+  toggle, persisted to `localStorage`. Spacing/font/radius are unaffected —
+  only color tokens differ between themes.
+
+### Fixed
+
+- **A field cleared back to "unset" could silently fail to clear, or silently
+  eat a sibling edit in the same save.** `JSON.stringify` drops an
+  `undefined`-valued object property entirely — `JSON.stringify({profile:
+  {bio: undefined}})` serializes to `{"profile":{}}`, not `{"profile":
+  {"bio":null}}`. Two real consequences, both reproduced before fixing: (1)
+  clearing the *only* dirty field in a section sent an empty object for that
+  section, which the server's path-walker reads as a leaf named after the
+  *parent* — rejected as "not a configuration setting"; (2) clearing a field
+  *alongside* an edit to a sibling field in the same save silently dropped
+  the clear from the wire entirely — the sibling edit succeeded, the save
+  reported success, and the field that was supposed to be cleared kept its
+  stale value. `null` is not a safe substitute either: several optional
+  string fields use `.min(1).optional()` without `.nullable()`, which rejects
+  `null` outright. Fixed by routing a cleared field through the existing
+  `POST /api/settings/reset` for that specific path instead of the bulk `PUT`
+  — reset already means "stop overriding this," which is exactly what
+  clearing an override-sourced field is asking for, without inventing a new
+  wire-protocol sentinel. Verified against a running instance: an override on
+  `profile.bio`, cleared via reset while `profile.displayName` was edited in
+  the same save, correctly reverted to the file's value while the sibling
+  edit was retained.
+- The Audit tab left a stale "Loading…" message on screen if the initial
+  fetch failed, alongside the real error.
+- The new server-side confirm rejection on `PUT /api/settings` was not
+  written to the audit log, unlike every other rejection branch in that
+  handler.
+- `POST /api/settings/reset` had no confirm gate at all, undercutting the
+  point of the `PUT` gate — resetting `posting.dryRun` or `node.network` is
+  exactly as consequential as setting them.
+- A module declaring a `uiSchema` entry for a path `CORE_UI_SCHEMA` already
+  owns used to silently win, including dropping `confirm: true` from a field
+  flagged for it specifically. Now a startup error, same as a module-vs-module
+  collision.
+- A fractional number field (e.g. the commands module's budget-share range)
+  rendered with the browser's default integer step, making the native
+  spinner unable to reach most of its range.
+
 ## [0.22.0] - 2026-09-12
 
 Phase C of the modularisation: the settings API. The panel can now read and

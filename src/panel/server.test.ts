@@ -1111,6 +1111,54 @@ describe('settings API', () => {
     expect((await json(res)).restartPending).toEqual(['node.url']);
   });
 
+  it('requires confirm:true when a changed path is flagged confirm — mirroring /api/register', async () => {
+    // The dialog in the panel is not the security boundary — an authenticated
+    // admin already has unconditional authority to write this path, and a
+    // network-level replay bypasses any client dialog anyway. This is here so
+    // the two write endpoints in this API agree on what "I meant it" looks
+    // like, rather than one requiring it and the other trusting the client.
+    const { deps, audited } = stubSettings({
+      describe: () => ({
+        effective: { posting: { dryRun: true } } as never,
+        fromFile: {},
+        fromUi: {},
+        ui: { 'posting.dryRun': { restart: true, confirm: true } },
+      }),
+    });
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const put = (extra: Record<string, unknown>): Promise<Response> =>
+      fetch(`${baseUrl}/api/settings`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+        body: JSON.stringify({ changes: { posting: { dryRun: false } }, ...extra }),
+      });
+
+    const withoutConfirm = await put({});
+    expect(withoutConfirm.status).toBe(400);
+    expect((await json(withoutConfirm)).requiresConfirm).toEqual(['posting.dryRun']);
+    // The refusal is exactly the event an operator later goes looking for —
+    // every OTHER rejection in this handler is audited, and this one was not.
+    expect(audited).toContainEqual(
+      expect.objectContaining({ path: 'posting.dryRun', outcome: 'rejected' }),
+    );
+
+    const withConfirm = await put({ confirm: true });
+    expect(withConfirm.status).toBe(200);
+  });
+
+  it('does not require confirm for an ordinary field with no confirm flag', async () => {
+    const { deps } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ changes: { posting: { maxPostsPerHour: 5 } } }),
+    });
+    expect(res.status).toBe(200);
+  });
+
   it('refuses to reset a file-only path', async () => {
     const { deps, audited } = stubSettings();
     const { baseUrl, auth } = await start({ settings: deps });
@@ -1122,6 +1170,47 @@ describe('settings API', () => {
     });
     expect(res.status).toBe(403);
     expect(audited[0]).toMatchObject({ outcome: 'rejected', path: 'panel.port' });
+  });
+
+  it('requires confirm:true to RESET a confirm-flagged path too, not just to write it', async () => {
+    // Resetting posting.dryRun back to whatever config.yaml says is exactly as
+    // consequential as writing it directly — the two write endpoints must not
+    // disagree about what "I meant it" requires.
+    const { deps } = stubSettings({
+      describe: () => ({
+        effective: { posting: { dryRun: false } } as never,
+        fromFile: {},
+        fromUi: { posting: { dryRun: false } },
+        ui: { 'posting.dryRun': { restart: true, confirm: true } },
+      }),
+    });
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const post = (extra: Record<string, unknown>): Promise<Response> =>
+      fetch(`${baseUrl}/api/settings/reset`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+        body: JSON.stringify({ path: 'posting.dryRun', ...extra }),
+      });
+
+    const withoutConfirm = await post({});
+    expect(withoutConfirm.status).toBe(400);
+    expect((await json(withoutConfirm)).requiresConfirm).toEqual(['posting.dryRun']);
+
+    const withConfirm = await post({ confirm: true });
+    expect(withConfirm.status).toBe(200);
+  });
+
+  it('does not require confirm to reset an ordinary field', async () => {
+    const { deps } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings/reset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ path: 'posting.maxPostsPerHour' }),
+    });
+    expect(res.status).toBe(200);
   });
 
   it('refuses a write carrying more settings than any form would send', async () => {
