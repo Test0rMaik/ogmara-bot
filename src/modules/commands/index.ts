@@ -17,13 +17,15 @@
  */
 
 import type { ZodTypeAny } from 'zod';
-import { MSG_TYPE_NAME, MessageType, parseCommand, type Envelope } from '@ogmara/sdk';
+import { MSG_TYPE_NAME, MessageType, parseCommand, type Envelope, type Notification } from '@ogmara/sdk';
 import { NODE_LIMITS, type Config } from '../../config.js';
-import type { BotContext, BotModule, ModuleHandle, PreflightFailure } from '../types.js';
+import { schedule } from '../../scheduler.js';
+import type { BotContext, BotModule, ModuleHandle, ModuleJob, PreflightFailure } from '../types.js';
 import { botSchema, type BotConfig } from './schema.js';
 import { CommandRateLimiter, NodeBudget, capFor } from './rateLimit.js';
 import { buildHandlers, type CommandHandler } from './handlers.js';
 import { decodeChatPayload } from './payload.js';
+import { extractChannelInvites, loadAutoJoinCursor, saveAutoJoinCursor } from './autojoin.js';
 
 /** What preflight needs to know about a channel before listening in it. */
 export interface ChannelFacts {
@@ -60,6 +62,20 @@ export interface CommandsDeps {
     handle?: string;
     commands: Array<{ name: string; description: string; args_hint?: string }>;
   }) => Promise<void>;
+  /** Join a channel by id — a real signed write, subject to `posting.dryRun`. */
+  readonly joinChannel: (channelId: number) => Promise<void>;
+  /**
+   * Fetch this wallet's notifications, newest first, optionally since a
+   * timestamp and/or filtered to one type. The type filter matters here: an
+   * untyped page mixes every notification together, and a mention fires on
+   * every command invocation — for a busy answering bot that can crowd
+   * `channel_invite` out of the page long before this wallet ever sees it.
+   */
+  readonly getNotifications: (
+    since?: number,
+    limit?: number,
+    type?: Notification['type'],
+  ) => Promise<readonly Notification[]>;
   /**
    * Override the handler table. Tests only.
    *
@@ -215,6 +231,16 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         help: 'field.bot.rateLimit.perWalletShareOfBudget.help',
         restart: true,
       },
+      'bot.autoJoin.schedule': {
+        label: 'field.bot.autoJoin.schedule.label',
+        help: 'field.bot.autoJoin.schedule.help',
+        restart: true,
+      },
+      'bot.autoJoin.statePath': {
+        label: 'field.bot.autoJoin.statePath.label',
+        help: 'field.bot.autoJoin.statePath.help',
+        restart: true,
+      },
     },
 
     isEnabled: (config) => botConfig(config).enabled,
@@ -330,7 +356,7 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
           // channels are created with encryption forced on.
           return {
             message:
-              `\nbot.channels lists channel ${id} ("${facts.name}"), which is end-to-end ` +
+              `\nbot.channels lists channel ${id} ("${forLog(facts.name)}"), which is end-to-end ` +
               'encrypted.\nThis build reads and replies in plaintext only, so it would answer ' +
               'nothing there. Remove it from bot.channels.',
           };
@@ -338,7 +364,7 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         if (!facts.canPost) {
           return {
             message:
-              `\nbot.channels lists channel ${id} ("${facts.name}"), where this wallet is not ` +
+              `\nbot.channels lists channel ${id} ("${forLog(facts.name)}"), where this wallet is not ` +
               'allowed to post.\nIt could read commands but never answer them.',
           };
         }
@@ -349,6 +375,25 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     async start(ctx: BotContext): Promise<ModuleHandle> {
       const cfg = botConfig(ctx.config);
       if (handlers.size === 0) handlers = (deps.handlersOverride ?? buildHandlers)(ctx.config, cfg);
+
+      // Join every configured channel, UNCONDITIONALLY on every start, the
+      // same way the descriptor is republished below — no local "already a
+      // member" check, relying on the join being idempotent server-side.
+      // Preflight already refused any of these that are encrypted or
+      // unpostable, so this is a direct attempt, not a recheck. Best-effort
+      // per channel: one failure must not stop the module from starting and
+      // answering in the channels that DID work.
+      for (const channelId of cfg.channels) {
+        if (ctx.config.posting.dryRun) {
+          ctx.log(`  [dry run] would join channel ${channelId}`);
+          continue;
+        }
+        try {
+          await deps.joinChannel(channelId);
+        } catch (err) {
+          ctx.warn(`  warning: could not join channel ${channelId} (${forLog(String(err))})`);
+        }
+      }
       // Read through getters, not snapshotted: the node's ceiling moves 6x when a
       // wallet registers on-chain, which an operator can do from the control
       // panel while the bot is running.
@@ -442,16 +487,138 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         });
       });
 
+      // Catch up once immediately (so a restart doesn't wait for the first
+      // scheduled tick before noticing an invite that arrived while the bot
+      // was down), then keep checking on a schedule. Awaited like the
+      // descriptor publish above: non-fatal on failure, but start() should
+      // not report "running" before this wallet's channel membership has
+      // actually settled.
+      try {
+        await pollForInvites(ctx, cfg);
+      } catch (err) {
+        ctx.warn(`  warning: initial invite check failed (${forLog(String(err))})`);
+      }
+      const autoJoinJob = schedule(cfg.autoJoin.schedule, () => pollForInvites(ctx, cfg));
+      ctx.log(
+        `Commands: checking for channel invites "${cfg.autoJoin.schedule}" — next ` +
+          `${autoJoinJob.nextRun()?.toISOString() ?? 'never'}`,
+      );
+      const jobs: ModuleJob[] = [
+        { name: 'commands-autojoin', cron: cfg.autoJoin.schedule, job: autoJoinJob },
+      ];
+
       return {
-        jobs: [],
+        jobs,
         async stop(): Promise<void> {
           running = false;
           close?.();
           close = undefined;
+          autoJoinJob.stop();
         },
       };
     },
   };
+
+  /**
+   * Check for `channel_invite` notifications since the last handled cursor
+   * and join each one. Joins ONLY — see the module doc comment for why this
+   * never adds the channel to `bot.channels` on its own.
+   *
+   * A failed join or a node hiccup on ONE invite is logged and skipped, not
+   * retried: the cursor advances past every notification seen this poll
+   * regardless of per-invite outcome, trading a rare missed invite (an
+   * unlikely transient failure right when an invite happens to land) for a
+   * simple, single-timestamp cursor rather than a per-invite retry queue.
+   * An operator who notices can always add the channel to `bot.channels`
+   * by hand — nothing about a missed auto-join is unrecoverable.
+   */
+  async function pollForInvites(ctx: BotContext, cfg: BotConfig): Promise<void> {
+    const cursorPath = cfg.autoJoin.statePath;
+    const since = loadAutoJoinCursor(cursorPath, ctx.warn);
+    let notifications: readonly Notification[];
+    try {
+      // The type filter matters, not just a nicety: an untyped page mixes
+      // every notification together, and a mention fires on every command
+      // invocation — for a busy bot that can crowd channel_invite out of
+      // the page before this wallet ever sees it (l2-node 0.129.0 widens
+      // its own scan for a type filter specifically to prevent that). The
+      // max page size (200) is extra headroom on top of that, in case this
+      // wallet is itself invited to many channels between polls.
+      notifications = await deps.getNotifications(since, 200, 'channel_invite');
+    } catch (err) {
+      ctx.warn(`  warning: could not check for channel invites (${forLog(String(err))})`);
+      return;
+    }
+    const { invites, newestTs } = extractChannelInvites(notifications);
+    for (const invite of invites) {
+      // Both wire strings from a payload another wallet controls, so both
+      // get the same treatment reply text and error text get elsewhere in
+      // this file: `forLog` strips control characters and ANSI escapes that
+      // could otherwise rewrite or hide what the operator's terminal shows.
+      const invitedBy = forLog(invite.invitedBy);
+      const noticeName = invite.channelName !== undefined ? forLog(invite.channelName) : undefined;
+
+      let facts: ChannelFacts | null | 'unreachable';
+      try {
+        facts = await deps.describeChannel(invite.channelId);
+      } catch (err) {
+        // Not part of describeChannel's documented contract today (every
+        // real implementation resolves to null/'unreachable' instead of
+        // rejecting), but this loop must not let one bad invite abort the
+        // rest of the page — or skip saving the cursor for invites already
+        // handled above it.
+        ctx.warn(
+          `  warning: could not check channel ${invite.channelId} ` +
+            `(${forLog(String(err))}) — skipping`,
+        );
+        continue;
+      }
+      if (facts === 'unreachable') {
+        ctx.warn(
+          `  warning: invited to channel ${invite.channelId}` +
+            (noticeName !== undefined ? ` ("${noticeName}")` : '') +
+            ` by ${invitedBy}, but could not reach the node to check it — not retried, ` +
+            'see bot.channels to add it by hand',
+        );
+        continue;
+      }
+      if (facts === null) {
+        ctx.warn(
+          `  warning: invited to channel ${invite.channelId}` +
+            (noticeName !== undefined ? ` ("${noticeName}")` : '') +
+            ` by ${invitedBy}, but this wallet cannot see it — skipping`,
+        );
+        continue;
+      }
+      const name = forLog(facts.name);
+      if (facts.encrypted) {
+        ctx.warn(
+          `  warning: invited to channel ${invite.channelId} ("${name}") by ${invitedBy}, but ` +
+            'it is end-to-end encrypted — this build reads and replies in plaintext only, skipping',
+        );
+        continue;
+      }
+      // Membership only — deliberately NOT added to cfg.channels/answering.
+      // canPost is irrelevant here: even a read-public channel this wallet
+      // cannot post in is a legitimate one to just be a member of.
+      if (ctx.config.posting.dryRun) {
+        ctx.log(`  [dry run] would join channel ${invite.channelId} ("${name}"), invited by ${invitedBy}`);
+        continue;
+      }
+      try {
+        await deps.joinChannel(invite.channelId);
+        ctx.log(
+          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ` +
+            `${invitedBy}. Add it to bot.channels to answer commands there too.`,
+        );
+      } catch (err) {
+        ctx.warn(
+          `  warning: could not join channel ${invite.channelId} (${forLog(String(err))})`,
+        );
+      }
+    }
+    if (newestTs !== null) saveAutoJoinCursor(cursorPath, newestTs);
+  }
 
   async function handleMessage(
     ctx: BotContext,

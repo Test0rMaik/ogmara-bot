@@ -32,7 +32,14 @@ import {
 export interface SettingsDepsInput {
   readonly configPath: string;
   readonly layered: LayeredConfig;
-  /** Enabled modules, for their `uiSchema` metadata. */
+  /**
+   * ALL constructed modules, for their `uiSchema` metadata — not filtered to
+   * enabled ones. A module's own `enabled` flag is itself a field its uiSchema
+   * describes (e.g. `bot.enabled`), so passing only the enabled subset meant
+   * an operator could never discover or turn on a disabled module from the
+   * settings page at all. `uiSchema` is a static property set at
+   * construction; it needs no running state to be described correctly.
+   */
   readonly modules: readonly BotModule[];
   readonly secrets: Secrets;
   /**

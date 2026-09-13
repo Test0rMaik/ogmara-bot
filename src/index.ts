@@ -590,6 +590,13 @@ async function run(args: CliArgs): Promise<number> {
       publishDescriptor: async (descriptor) => {
         await publisher.client.setBotCommands(descriptor);
       },
+      joinChannel: async (channelId) => {
+        await publisher.client.joinChannel(channelId);
+      },
+      getNotifications: async (since, limit, type) => {
+        const { notifications } = await publisher.client.getNotifications(since, limit, type);
+        return notifications;
+      },
     }),
   ];
   const modules = enabledModules(allModules, effective);
@@ -668,12 +675,23 @@ async function run(args: CliArgs): Promise<number> {
       statsHistory,
       takeStatsSnapshotNow,
       // Built here rather than inside the panel: this is the only scope that
-      // has the config layers, the enabled modules' uiSchemas, and the paths
-      // the overrides and audit log live at.
+      // has the config layers, every module's uiSchema, and the paths the
+      // overrides and audit log live at.
+      //
+      // ALL modules, not `modules` (the enabled-only list) — a module's
+      // `enabled` flag is itself a field ITS OWN uiSchema describes
+      // (`bot.enabled`), so passing only already-enabled modules meant an
+      // operator could never discover or turn on a disabled module from the
+      // settings page at all: the one uiSchema entry that would have shown
+      // it a proper label/help text was gated behind the module already
+      // being on. `uiSchema` is a static property set at module construction
+      // — it needs no running state — so this changes nothing about which
+      // modules actually START (still `modules`, everywhere else in this
+      // file), only which modules the settings page can describe.
       createSettingsDeps({
         configPath: args.configPath,
         layered: { ...layered, config: effective },
-        modules,
+        modules: allModules,
         secrets,
         // Re-applied on every commit, not just here: a freshly merged config
         // would otherwise drop `--dry-run` on the first save, and the panel

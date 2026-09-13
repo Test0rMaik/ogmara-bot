@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { encode } from '@msgpack/msgpack';
-import { MessageType, type Envelope } from '@ogmara/sdk';
+import { MessageType, type Envelope, type Notification } from '@ogmara/sdk';
 import type { Config } from '../../config.js';
 import type { BotContext } from '../types.js';
 import { botSchema, type BotConfig } from './schema.js';
@@ -42,6 +45,8 @@ function depsWith(over: Partial<CommandsDeps> = {}): CommandsDeps {
     subscribeChannels: vi.fn(async () => () => {}),
     describeChannel: vi.fn(async () => publicChannel),
     publishDescriptor: vi.fn(async () => {}),
+    joinChannel: vi.fn(async (_channelId: number) => {}),
+    getNotifications: vi.fn(async (_since?: number) => []),
     ...over,
   };
 }
@@ -142,6 +147,24 @@ describe('commands module preflight', () => {
     });
     const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
     expect(failure!.message).toContain('encrypted');
+  });
+
+  it('strips control characters from the channel name in a preflight failure message', async () => {
+    // The channel name comes from the node — ultimately set by whoever
+    // created or last renamed the channel, not this operator — and this
+    // message is printed with console.error verbatim (src/index.ts). Same
+    // untrusted-string risk `forLog` already closes for reply text and the
+    // invite poller's logs elsewhere in this file.
+    const deps = depsWith({
+      describeChannel: vi.fn(async () => ({
+        name: 'evil\x1b[31mFAKE\x1b[0m',
+        encrypted: true,
+        canPost: true,
+      })),
+    });
+    const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
+    // eslint-disable-next-line no-control-regex
+    expect(failure!.message).not.toMatch(/\x1b/);
   });
 
   it('refuses a command costing more than one wallet can ever spend', async () => {
@@ -340,6 +363,240 @@ describe('commands module start', () => {
     const handle = await mod.start(ctx);
     await handle.stop();
     await expect(handle.stop()).resolves.toBeUndefined();
+  });
+});
+
+describe('commands module auto-join', () => {
+  let stateDir: string;
+  let statePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'ogmara-autojoin-'));
+    statePath = join(stateDir, 'autojoin.json');
+  });
+  afterEach(() => rmSync(stateDir, { recursive: true, force: true }));
+
+  function cfgWithAutoJoin(over: Record<string, unknown> = {}): BotConfig {
+    return botCfg({ autoJoin: { statePath }, ...over });
+  }
+
+  it('joins every configured channel on start', async () => {
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7, 12] })));
+    const mod = createCommandsModule(depsWith({ joinChannel }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(joinChannel).toHaveBeenCalledWith(7);
+    expect(joinChannel).toHaveBeenCalledWith(12);
+  });
+
+  it('does NOT join configured channels in dry run', async () => {
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const ctx = ctxWith(configWith(cfgWithAutoJoin(), true));
+    const mod = createCommandsModule(depsWith({ joinChannel }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(joinChannel).not.toHaveBeenCalled();
+  });
+
+  it('a join failure for one configured channel does not stop the others or crash start()', async () => {
+    const joinChannel = vi.fn(async (id: number) => {
+      if (id === 7) throw new Error('node said no');
+    });
+    const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7, 12] })));
+    const mod = createCommandsModule(depsWith({ joinChannel }));
+    await mod.preflight!(ctx);
+    await expect((await mod.start(ctx)).stop()).resolves.toBeUndefined();
+
+    expect(joinChannel).toHaveBeenCalledWith(12);
+  });
+
+  it('joins a channel it was invited to, from a channel_invite notification', async () => {
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const describeChannel = vi.fn(async (_id: number): Promise<ChannelFacts> => ({
+      name: 'Bots & Co.',
+      encrypted: false,
+      canPost: true,
+    }));
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      channel_name: 'Bots & Co.',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ joinChannel, describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    // Once for the configured channel (7), once for the invite (99).
+    expect(joinChannel).toHaveBeenCalledWith(99);
+  });
+
+  it('does NOT add an invited channel to answering — only joins it', async () => {
+    // The whole point of keeping this separate from bot.channels: an
+    // arbitrary channel owner's invite must never expand what this wallet
+    // spends its posting quota answering in, only its membership.
+    const subscribeChannels = vi.fn(async (_channels: number[]) => () => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7] })));
+    const mod = createCommandsModule(depsWith({ subscribeChannels, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(subscribeChannels).toHaveBeenCalledWith([7], expect.any(Function));
+  });
+
+  it('skips an invite to an ENCRYPTED channel rather than joining it', async () => {
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
+      id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
+    );
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ joinChannel, describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(joinChannel).not.toHaveBeenCalledWith(99);
+  });
+
+  it('does NOT join an invited channel in dry run either', async () => {
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin(), true));
+    const mod = createCommandsModule(depsWith({ joinChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(joinChannel).not.toHaveBeenCalled();
+  });
+
+  it('persists the cursor so a later start does not re-fetch the same notification', async () => {
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 5000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.lastHandledTs).toBe(5000);
+
+    // A second start must pass the persisted cursor, not start over from 0.
+    const mod2 = createCommandsModule(depsWith({ getNotifications }));
+    await mod2.preflight!(ctx);
+    await (await mod2.start(ctx)).stop();
+    expect(getNotifications).toHaveBeenLastCalledWith(5000, 200, 'channel_invite');
+  });
+
+  it('an unreachable node while checking an invited channel does not crash start()', async () => {
+    const describeChannel = vi.fn(async (_id: number) => 'unreachable' as const);
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await expect((await mod.start(ctx)).stop()).resolves.toBeUndefined();
+  });
+
+  it('requests the channel_invite TYPE explicitly, not just the raw feed', async () => {
+    // REGRESSION GUARD. An untyped page mixes every notification type
+    // together, and a mention fires on every command invocation — for a
+    // busy bot that crowds channel_invite out of the page long before this
+    // wallet would ever see it. The type filter is what makes l2-node widen
+    // its own scan instead of the caller's page size.
+    const getNotifications = vi.fn(async (_since?: number) => []);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+    expect(getNotifications).toHaveBeenCalledWith(0, 200, 'channel_invite');
+  });
+
+  it('strips control characters from an attacker-chosen inviter address before logging it', async () => {
+    // REGRESSION GUARD. `invite.invitedBy`/the channel name both come from
+    // another wallet's ChannelInvite payload — untrusted the same way reply
+    // text is, which is why `forLog` exists and is already applied to reply
+    // text and error strings elsewhere in this file. This closes the one
+    // place that skipped it.
+    const warn = vi.fn();
+    const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), warn } as unknown as BotContext;
+    const describeChannel = vi.fn(async (_id: number) => null); // "cannot see it" branch
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner\x1b[31mFAKE ERROR\x1b[0m',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const mod = createCommandsModule(depsWith({ describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    const loggedInvitedBy = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('klv1owner'));
+    expect(loggedInvitedBy).toBeDefined();
+    // eslint-disable-next-line no-control-regex
+    expect(loggedInvitedBy).not.toMatch(/\x1b/);
+  });
+
+  it('one invite whose describeChannel call throws does not abort the rest of the page', async () => {
+    // Not reachable through the real wiring today (every real
+    // describeChannel resolves rather than rejects), but the contract isn't
+    // enforced by the type — this pins that a rejection is isolated per
+    // invite, not left to abort the loop (and with it, saving the cursor).
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const describeChannel = vi.fn(async (id: number) => {
+      if (id === 98) throw new Error('boom');
+      return publicChannel;
+    });
+    const notifications: Notification[] = [
+      { type: 'channel_invite', channel_id: '98', from: 'klv1a', timestamp: 1000 },
+      { type: 'channel_invite', channel_id: '99', from: 'klv1b', timestamp: 2000 },
+    ];
+    const getNotifications = vi.fn(async (_since?: number) => notifications);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ joinChannel, describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await expect((await mod.start(ctx)).stop()).resolves.toBeUndefined();
+
+    expect(joinChannel).toHaveBeenCalledWith(99);
+    // The cursor must still advance — a mid-page failure must not make the
+    // NEXT poll re-fetch (and re-attempt) the whole page from scratch.
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.lastHandledTs).toBe(2000);
   });
 });
 

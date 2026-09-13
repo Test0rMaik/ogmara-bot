@@ -406,3 +406,21 @@ bot:
     # stated limit, or the node's own limits either. This bounds a wallet
     # against the quota that actually exists rather than against the clock.
     perWalletShareOfBudget: 0.25
+
+  # This wallet joins every channel listed above on startup (so it actually
+  # shows up as a member — clients only offer a bot's commands in the "/"
+  # picker for channels it has joined), and separately checks whether anyone
+  # has invited it to a channel not listed above, joining that too.
+  #
+  # An invite ONLY makes the wallet a member — it never adds the channel to
+  # `channels` above, so a channel owner inviting this bot can never, by
+  # itself, make it start spending its posting quota answering there. Add
+  # the channel to `channels` yourself once you want that.
+  autoJoin:
+    # Cron schedule for checking for new invites. Also runs once immediately
+    # on every startup, so a restart does not wait for the first tick.
+    schedule: "*/15 * * * *"
+
+    # Where the bot remembers which invites it has already handled, so a
+    # restart does not recheck (or re-attempt joining) the same ones.
+    statePath: data/autojoin.json

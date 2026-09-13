@@ -212,6 +212,38 @@ describe('uiSchema collisions', () => {
       createSettingsDeps({ configPath, layered, modules: [mod('a')], secrets }),
     ).toThrow(/both declare a uiSchema/);
   });
+
+  it('describes a DISABLED module\'s fields just as fully as an enabled one', () => {
+    // `collectUiSchema` must never filter by `isEnabled` — this is the
+    // invariant a real, user-found bug depended on: `index.ts` used to pass
+    // only the ENABLED-module list here (the same list it uses to actually
+    // START modules), so a module's own `enabled` flag — a field the
+    // module's OWN uiSchema describes, e.g. `bot.enabled` — was
+    // undiscoverable and unlabelled from the settings page for as long as it
+    // stayed off. An operator could never turn on a disabled module from the
+    // panel, only by hand-editing config.yaml first. The fix was entirely at
+    // that ONE call site (pass `allModules`, not the enabled-only list) —
+    // this file has no seam to unit-test `index.ts`'s own composition
+    // directly, so this test instead pins the mechanism the fix relies on:
+    // `isEnabled` is set on this fixture and never called by the code under
+    // test, which is exactly the property that must hold for `index.ts`'s
+    // fix to actually work.
+    const mod = { name: 'a', schemas: {}, isEnabled: () => false, uiSchema: {
+      'bot.handle': { label: 'field.a.label', help: 'field.a.help', restart: true },
+    } } as never;
+    writeFileSync(
+      configPath,
+      CONFIG_YAML().replace('OVERRIDES', overridesPath).replace('AUDIT', join(dir, 'audit.log')),
+      'utf8',
+    );
+    const layered = loadLayeredConfig(configPath, overridesPath, () => {});
+    const deps = createSettingsDeps({ configPath, layered, modules: [mod], secrets });
+    expect(deps.describe().ui['bot.handle']).toEqual({
+      label: 'field.a.label',
+      help: 'field.a.help',
+      restart: true,
+    });
+  });
 });
 
 describe('--dry-run forcing', () => {

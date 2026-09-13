@@ -13,6 +13,7 @@
  */
 
 import { z } from 'zod';
+import { isValidCron } from '../../scheduler.js';
 
 /**
  * Node-enforced caps (protocol §3.11), mirrored so a bad descriptor fails at
@@ -176,6 +177,27 @@ export const botSchema = z.object({
    */
   channels: z.array(z.int().min(1)).max(64).default([]),
   rateLimit: rateLimitSchema.prefault({}),
+  autoJoin: z
+    .object({
+      /**
+       * How often to check for new channel-invite notifications addressed to
+       * this wallet, so a channel owner can add the bot without the operator
+       * touching `channels` above. `channels` (the list this bot ANSWERS
+       * commands in) is unaffected by this — an auto-joined channel only
+       * becomes a member, so it appears in clients' "/" picker and member
+       * lists; the operator still opts it into answering by adding its id to
+       * `channels` themselves. Membership costs nothing; answering spends the
+       * wallet's posting quota, so that half stays something written down
+       * rather than inferred.
+       */
+      schedule: z
+        .string()
+        .default('*/15 * * * *')
+        .refine(isValidCron, { message: 'not a valid cron expression' }),
+      /** Where the "already handled up to" cursor is persisted. */
+      statePath: z.string().min(1).default('data/autojoin.json'),
+    })
+    .prefault({}),
 });
 
 export type BotConfig = z.infer<typeof botSchema>;

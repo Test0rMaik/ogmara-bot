@@ -5,6 +5,68 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-09-13
+
+The bot never joined a channel — it treated `bot.channels` as "already a
+member," so it never showed up in a channel's member list, and — the part
+that actually mattered — `get_channel_bots` (what powers every client's "/"
+command picker) filters strictly by membership, so the bot's commands were
+never discoverable through the UI even when everything else was configured
+correctly. Also fixes a settings-panel gap found in the same session: an
+operator could never turn ON a disabled module from the panel at all,
+because the module's own `enabled` field is described by that module's own
+`uiSchema`, which was only exposed once the module was already enabled.
+
+### Added
+
+- **Auto-join.** On every start, the bot joins every channel in
+  `bot.channels` (best-effort per channel; skipped in `posting.dryRun`).
+  Separately, it now polls for `channel_invite` notifications (l2-node
+  0.128.0+) — so a channel owner can invite the bot directly, without its
+  operator touching config at all — and joins those too, on
+  `bot.autoJoin.schedule` (default every 15 minutes, plus once immediately
+  on every startup so a restart doesn't wait for the first tick).
+  **Deliberately join-only**: an invited channel is never added to
+  `bot.channels` automatically. Joining only makes the wallet a member
+  (visible, in the picker); answering spends the wallet's rate-limited
+  posting quota, and this codebase already has a stated principle that
+  where that happens should be something the operator wrote down, not
+  something an arbitrary channel owner could inject by inviting the bot.
+  New config: `bot.autoJoin.schedule`, `bot.autoJoin.statePath` (an atomic,
+  corruption-tolerant cursor file — unlike the ledger, a lost cursor just
+  means re-checking already-joined channels, which `joinChannel` treats as
+  a harmless no-op, so it resets to 0 with a warning rather than refusing
+  to start).
+- Uses sdk-js 0.59.0's new `getNotifications(..., type)` filter (added
+  alongside this feature, see l2-node 0.129.0 / sdk-js 0.59.0 changelogs):
+  an untyped notification page mixes every type together, and a mention
+  fires on every command invocation — for a busy bot that would otherwise
+  crowd the rare `channel_invite` out of the page before it's ever seen.
+
+### Fixed
+
+- **A disabled module's settings could never be discovered or turned on
+  from the panel.** `createSettingsDeps` was given only the already-ENABLED
+  module list — the same list used to actually start modules — so a
+  module's own `enabled` flag (a field that module's own `uiSchema`
+  describes, e.g. `bot.enabled`) had no label or help text on the settings
+  page for as long as it stayed off, and the underlying config value was
+  effectively undiscoverable there. Now sourced from every constructed
+  module regardless of its current enabled state; this only changes what
+  the settings page can DESCRIBE, not which modules actually start.
+
+### Security
+
+- **Untrusted wire strings (an inviter's address, a channel name — both set
+  by another wallet, not this bot's operator) reached the operator's
+  terminal unsanitized** in the new invite-poller's log/warn output, and in
+  one pre-existing `bot.channels` preflight-failure message. Every other
+  untrusted string this file logs (reply text, error text) already goes
+  through `forLog()`, which strips control characters and ANSI escape
+  sequences that could otherwise rewrite or hide what the operator's
+  terminal shows; both gaps now get the same treatment. Found in this
+  session's security audit before it shipped anywhere.
+
 ## [0.23.1] - 2026-09-13
 
 CI had been failing since the 0.22.0 push — not noticed until this release,
