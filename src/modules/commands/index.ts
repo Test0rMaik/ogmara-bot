@@ -25,7 +25,7 @@ import { botSchema, type BotConfig } from './schema.js';
 import { CommandRateLimiter, NodeBudget, capFor } from './rateLimit.js';
 import { buildHandlers, type CommandHandler } from './handlers.js';
 import { decodeChatPayload } from './payload.js';
-import { extractChannelInvites, loadAutoJoinCursor, saveAutoJoinCursor } from './autojoin.js';
+import { extractChannelInvites, loadAutoJoinState, saveAutoJoinState } from './autojoin.js';
 
 /** What preflight needs to know about a channel before listening in it. */
 export interface ChannelFacts {
@@ -163,6 +163,18 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
    */
   let running = false;
   /**
+   * Channel ids granted answer rights via invite (on top of `cfg.channels`,
+   * which the operator wrote down by hand and has no cap). Loaded from the
+   * persisted auto-join state at `start()` and grown by `pollForInvites` as
+   * new invites are approved, up to `bot.autoJoin.maxAutoAnsweredChannels`.
+   * Checked alongside `cfg.channels` in `handleMessage`'s channel gate —
+   * this is a live JS-side set, not a WebSocket re-subscription: the node
+   * broadcasts every public-channel message to every connected client
+   * regardless of what it subscribed to (see the gate itself), so growing
+   * this set is sufficient on its own for the bot to start answering there.
+   */
+  let autoAnsweredChannels = new Set<number>();
+  /**
    * Message ids already answered, newest last.
    *
    * The WebSocket can re-deliver — a reconnect replays, and the node fans the
@@ -239,6 +251,16 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       'bot.autoJoin.statePath': {
         label: 'field.bot.autoJoin.statePath.label',
         help: 'field.bot.autoJoin.statePath.help',
+        restart: true,
+      },
+      'bot.autoJoin.answerInvitedChannels': {
+        label: 'field.bot.autoJoin.answerInvitedChannels.label',
+        help: 'field.bot.autoJoin.answerInvitedChannels.help',
+        restart: true,
+      },
+      'bot.autoJoin.maxAutoAnsweredChannels': {
+        label: 'field.bot.autoJoin.maxAutoAnsweredChannels.label',
+        help: 'field.bot.autoJoin.maxAutoAnsweredChannels.help',
         restart: true,
       },
     },
@@ -375,6 +397,29 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     async start(ctx: BotContext): Promise<ModuleHandle> {
       const cfg = botConfig(ctx.config);
       if (handlers.size === 0) handlers = (deps.handlersOverride ?? buildHandlers)(ctx.config, cfg);
+
+      // Restore previously-earned answer grants BEFORE subscribing, so a
+      // restart does not silently stop answering somewhere it already had a
+      // slot until the next invite poll rediscovers it — but RE-VALIDATED
+      // against the CURRENT config on every start, not trusted as-is.
+      // `pollForInvites` only checks the cap/flag when granting a NEW
+      // channel, so without this a stale restored set could ratchet in two
+      // ways an operator would reasonably expect to work and silently
+      // wouldn't: lowering `maxAutoAnsweredChannels` after 20 channels were
+      // already granted would never shrink back to the new cap (grants
+      // only ever check `>=` against NEW ids, never re-trim the restored
+      // set), and — worse — flipping `answerInvitedChannels` to `false` as
+      // an incident-response "turn this off" reflex would leave every
+      // already-granted channel answering forever, since that flag was
+      // never consulted here at all. Both are exactly the safety valve an
+      // operator reaches for and needs to actually work. The persisted
+      // file itself is left untouched either way — flipping the flag back
+      // on resumes every previously-earned grant without needing fresh
+      // invites, which is what "pause", not "wipe", should mean.
+      const persistedAnswerIds = loadAutoJoinState(cfg.autoJoin.statePath, ctx.warn).answerChannelIds;
+      autoAnsweredChannels = cfg.autoJoin.answerInvitedChannels
+        ? new Set(persistedAnswerIds.slice(0, cfg.autoJoin.maxAutoAnsweredChannels))
+        : new Set();
 
       // Join every configured channel, UNCONDITIONALLY on every start, the
       // same way the descriptor is republished below — no local "already a
@@ -533,8 +578,13 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
    * by hand — nothing about a missed auto-join is unrecoverable.
    */
   async function pollForInvites(ctx: BotContext, cfg: BotConfig): Promise<void> {
-    const cursorPath = cfg.autoJoin.statePath;
-    const since = loadAutoJoinCursor(cursorPath, ctx.warn);
+    const statePath = cfg.autoJoin.statePath;
+    // Only the cursor is re-read from disk here — `autoAnsweredChannels` is
+    // loaded once at start() and lives in memory from then on, mutated below
+    // and written back at the end. Re-reading it mid-run would let a stale
+    // on-disk snapshot silently undo a grant made earlier in this same
+    // process's lifetime.
+    const since = loadAutoJoinState(statePath, ctx.warn).lastHandledTs;
     let notifications: readonly Notification[];
     try {
       // The type filter matters, not just a nicety: an untyped page mixes
@@ -558,7 +608,58 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       `Commands: checked for channel invites — ${notifications.length} notification(s), ` +
         `${invites.length} invite(s)`,
     );
+
+    // Revalidate EXISTING grants every poll, not just new invites. Without
+    // this, a cheap, throwaway channel — create it, invite the bot, delete
+    // it (or let the bot get kicked/banned) — permanently occupies one of
+    // the limited auto-answer slots forever, since nothing else ever frees
+    // one: an attacker could exhaust every slot this way for the price of
+    // `maxAutoAnsweredChannels` disposable channels, denying the feature to
+    // every legitimate future inviter until the operator notices and hand-
+    // edits the state file. `null` (gone, or membership/visibility lost) and
+    // newly-encrypted (safe today — a failed msgpack decode just means no
+    // reply — but a permanently dead slot regardless) both free the slot.
+    // `'unreachable'` is left alone: a node hiccup must not cost a channel
+    // its grant.
+    let grantsChanged = false;
+    for (const channelId of [...autoAnsweredChannels]) {
+      let facts: ChannelFacts | null | 'unreachable';
+      try {
+        facts = await deps.describeChannel(channelId);
+      } catch {
+        continue;
+      }
+      if (facts === 'unreachable') continue;
+      if (facts === null) {
+        autoAnsweredChannels.delete(channelId);
+        grantsChanged = true;
+        ctx.warn(
+          `  warning: channel ${channelId} is no longer visible — removed from the auto-answer ` +
+            'set, freeing its slot',
+        );
+      } else if (facts.encrypted) {
+        autoAnsweredChannels.delete(channelId);
+        grantsChanged = true;
+        ctx.warn(
+          `  warning: channel ${channelId} ("${forLog(facts.name)}") is now end-to-end encrypted — ` +
+            'removed from the auto-answer set, freeing its slot',
+        );
+      }
+    }
+
     for (const invite of invites) {
+      // A channel the operator already wrote into bot.channels answers
+      // unconditionally regardless of this pipeline — nothing here can add
+      // to that, so there is nothing to do beyond membership, which the
+      // static join loop in start() already covers on every restart.
+      // Skipped BEFORE describeChannel/joinChannel entirely: processing it
+      // would waste a cap slot (or a confusing "cap reached" warning) on a
+      // channel that never needed one.
+      if (cfg.channels.includes(invite.channelId)) continue;
+      // Already granted (e.g. this wallet was invited more than once, or
+      // the same notification appears twice in one page) — nothing new to
+      // do, and re-joining/re-logging would just be noise.
+      if (autoAnsweredChannels.has(invite.channelId)) continue;
       // Both wire strings from a payload another wallet controls, so both
       // get the same treatment reply text and error text get elsewhere in
       // this file: `forLog` strips control characters and ANSI escapes that
@@ -620,20 +721,58 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       }
       try {
         await deps.joinChannel(invite.channelId);
-        ctx.log(
-          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}.` +
-            (facts.encrypted
-              ? ' It is end-to-end encrypted, so this build cannot read or answer there — ' +
-                'membership only.'
-              : ' Add it to bot.channels to answer commands there too.'),
-        );
       } catch (err) {
         ctx.warn(
           `  warning: could not join channel ${invite.channelId} (${forLog(String(err))})`,
         );
+        continue;
       }
+
+      if (facts.encrypted) {
+        ctx.log(
+          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}. ` +
+            'It is end-to-end encrypted, so this build cannot read or answer there — membership only.',
+        );
+        continue;
+      }
+      if (!cfg.autoJoin.answerInvitedChannels) {
+        ctx.log(
+          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}. ` +
+            'Add it to bot.channels to answer commands there too.',
+        );
+        continue;
+      }
+      // Not `!autoAnsweredChannels.has(...) && ...` — an already-granted
+      // channel was already skipped above, so reaching here means this IS a
+      // new grant candidate and only the cap itself needs checking.
+      if (autoAnsweredChannels.size >= cfg.autoJoin.maxAutoAnsweredChannels) {
+        ctx.warn(
+          `  warning: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}, but ` +
+            `the auto-answer cap (${cfg.autoJoin.maxAutoAnsweredChannels}) is reached — membership ` +
+            'only. This channel is NOT retried automatically — raising the cap only helps future ' +
+            'invites. To answer here, either have the owner invite again after raising ' +
+            'bot.autoJoin.maxAutoAnsweredChannels, or add it to bot.channels by hand.',
+        );
+        continue;
+      }
+      autoAnsweredChannels.add(invite.channelId);
+      ctx.log(
+        `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}, and ` +
+          'will now answer commands there too.',
+      );
     }
-    if (newestTs !== null) saveAutoJoinCursor(cursorPath, newestTs);
+    // Saved when EITHER the cursor advanced OR cleanup freed a slot — a
+    // cleanup-only run (no new notifications this poll) must still persist
+    // the freed slot, or a restart before the next new invite would restore
+    // the stale, now-invalid grant right back from disk. The cursor itself
+    // only ever advances to `newestTs`; when there is nothing new to advance
+    // to, the existing `since` is kept rather than reset.
+    if (newestTs !== null || grantsChanged) {
+      saveAutoJoinState(statePath, {
+        lastHandledTs: newestTs ?? since,
+        answerChannelIds: [...autoAnsweredChannels],
+      });
+    }
   }
 
   async function handleMessage(
@@ -676,7 +815,11 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     // WebSocket audience is everyone, so every public-channel message on the
     // node reaches this bot regardless of what it subscribed to. Checked before
     // any decoding, so out-of-scope traffic costs almost nothing.
-    if (!cfg.channels.includes(channelId)) return;
+    //
+    // `cfg.channels` is what the operator wrote down by hand, uncapped;
+    // `autoAnsweredChannels` is what an invite earned, capped at
+    // `maxAutoAnsweredChannels` — see the module doc comment.
+    if (!cfg.channels.includes(channelId) && !autoAnsweredChannels.has(channelId)) return;
 
     // Re-delivery is normal — a reconnect replays, and the same frame reaches
     // every connection. Answering twice doubles the quota spend and looks like

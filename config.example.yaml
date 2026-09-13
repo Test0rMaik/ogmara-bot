@@ -412,15 +412,50 @@ bot:
   # picker for channels it has joined), and separately checks whether anyone
   # has invited it to a channel not listed above, joining that too.
   #
-  # An invite ONLY makes the wallet a member — it never adds the channel to
-  # `channels` above, so a channel owner inviting this bot can never, by
-  # itself, make it start spending its posting quota answering there. Add
-  # the channel to `channels` yourself once you want that.
+  # By default an invited, non-encrypted channel ALSO gets answered — see
+  # answerInvitedChannels below — so inviting the bot is enough by itself,
+  # with no separate step here. `channels` above still has no cap of its
+  # own (you wrote that list down by hand); invited channels are bounded by
+  # maxAutoAnsweredChannels instead, since an unbounded grant would let any
+  # number of channel owners each claim a slice of this wallet's posting
+  # quota just by inviting it. Encrypted channels always join as
+  # membership-only, regardless of this setting — this build cannot decrypt
+  # or answer there.
   autoJoin:
     # Cron schedule for checking for new invites. Also runs once immediately
     # on every startup, so a restart does not wait for the first tick.
     schedule: "*/15 * * * *"
 
-    # Where the bot remembers which invites it has already handled, so a
-    # restart does not recheck (or re-attempt joining) the same ones.
+    # Where the bot remembers which invites it has already handled and which
+    # channels it has been granted answer rights in, so a restart does not
+    # recheck (or re-attempt joining) the same ones, and does not lose an
+    # answer grant it already earned.
     statePath: data/autojoin.json
+
+    # Whether an invited, non-encrypted channel also gets ANSWERED, not just
+    # joined. Set to false to keep invites join-only, the way earlier builds
+    # of this bot always worked — an invited channel becomes a member but
+    # you add it to `channels` above yourself to make it answer there.
+    #
+    # Re-checked on EVERY restart, not just when an invite first arrives:
+    # flipping this to false stops the bot answering in every previously
+    # invited channel too, not only new ones — the incident-response "turn
+    # this off" reflex actually works. Flipping it back on resumes every
+    # earlier grant without needing a fresh invite; nothing is deleted while
+    # paused.
+    #
+    # Every poll ALSO re-checks each currently-granted channel and drops one
+    # that has disappeared or turned encrypted since it was granted, freeing
+    # its slot — otherwise a cheap, throwaway channel (invite the bot, then
+    # delete the channel or get it banned) would permanently occupy one of
+    # the limited slots below forever.
+    answerInvitedChannels: true
+
+    # Cap on how many invited channels may be in the live answering set at
+    # once, on top of `channels` above. Past the cap, further invited
+    # channels still get membership, just not a share of the answer budget,
+    # until you raise this or add a channel to `channels` yourself.
+    #
+    # Also re-checked on every restart: lowering this trims the live set
+    # back down immediately, not just going forward.
+    maxAutoAnsweredChannels: 20

@@ -182,20 +182,36 @@ export const botSchema = z.object({
       /**
        * How often to check for new channel-invite notifications addressed to
        * this wallet, so a channel owner can add the bot without the operator
-       * touching `channels` above. `channels` (the list this bot ANSWERS
-       * commands in) is unaffected by this — an auto-joined channel only
-       * becomes a member, so it appears in clients' "/" picker and member
-       * lists; the operator still opts it into answering by adding its id to
-       * `channels` themselves. Membership costs nothing; answering spends the
-       * wallet's posting quota, so that half stays something written down
-       * rather than inferred.
+       * touching `channels` above. Also runs once immediately on every
+       * startup, so a restart does not wait for the first tick.
        */
       schedule: z
         .string()
         .default('*/15 * * * *')
         .refine(isValidCron, { message: 'not a valid cron expression' }),
-      /** Where the "already handled up to" cursor is persisted. */
+      /** Where the "already handled up to" cursor and answer grants are persisted. */
       statePath: z.string().min(1).default('data/autojoin.json'),
+      /**
+       * Whether an invited, non-encrypted channel also gets ANSWERED, not
+       * just joined. Membership always happens regardless of this setting;
+       * this only controls whether the channel is also added to the live
+       * answering set. Defaults on, so inviting the bot is enough by itself
+       * — no separate operator step needed to make it usable in a channel
+       * someone else invited it to. Bounded by `maxAutoAnsweredChannels`
+       * below, since answering spends the wallet's posting quota and an
+       * unbounded grant would let any number of channel owners each claim a
+       * slice of it just by inviting.
+       */
+      answerInvitedChannels: z.boolean().default(true),
+      /**
+       * Cap on how many invite-granted channels may be in the live
+       * answering set at once (on top of `channels` above, which has no
+       * cap of its own — the operator wrote that list down by hand). Past
+       * the cap, further invited channels still get MEMBERSHIP, just not a
+       * share of the answer budget, until the operator raises this or adds
+       * a channel to `channels` themselves.
+       */
+      maxAutoAnsweredChannels: z.int().min(0).max(500).default(20),
     })
     .prefault({}),
 });

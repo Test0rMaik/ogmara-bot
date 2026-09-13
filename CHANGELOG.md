@@ -5,6 +5,65 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-09-13
+
+Live-tested 0.25.0: joining now worked, but `/help` in an invited channel
+listed commands (the "/" picker doesn't need the bot to do anything — it's
+driven by the advertised descriptor) yet sending one got no reply, because
+join-only was working exactly as designed. That design turned out not to
+match the actual requirement: full automatic operation, with no per-invite
+confirmation step on the bot's side ever — "the bot owner never ever will
+confirm any invites, so this must work automatically."
+
+### Added
+
+- **Invited, non-encrypted channels are now also ANSWERED, not just
+  joined**, by default — `bot.autoJoin.answerInvitedChannels` (default
+  `true`). Inviting the bot is now enough by itself for it to become fully
+  usable in that channel, matching how join-driven auto-answer was always
+  meant to work end to end.
+- **Bounded by `bot.autoJoin.maxAutoAnsweredChannels`** (default 20): since
+  answering spends the wallet's shared, rate-limited posting quota with no
+  per-inviter trust check at all, an unbounded grant would let any number
+  of channel owners each claim a slice of it just by inviting. Past the
+  cap, further invited channels still get membership, just not a share of
+  the answer budget.
+- **Both settings are re-validated on every restart**, not just checked
+  when a new invite arrives — found in this session's own audit before
+  shipping. Without this, flipping `answerInvitedChannels` to `false` as an
+  incident-response "turn this off" reflex would have left every
+  ALREADY-granted channel answering forever (the flag only gated new
+  grants), and lowering `maxAutoAnsweredChannels` after channels were
+  already granted would never shrink the live set back down. Turning
+  `answerInvitedChannels` back on resumes every earlier grant with no fresh
+  invite needed — nothing is deleted while paused, only the live set is
+  emptied.
+- **Every poll also re-validates each currently-granted channel** and frees
+  its slot if the channel has disappeared or turned encrypted since being
+  granted. Also found in the security audit: without this, a cheap,
+  disposable channel — invite the bot, then delete the channel or get it
+  banned — would permanently occupy one of the limited slots forever, since
+  nothing else ever freed one. An attacker could exhaust every slot this
+  way for the price of `maxAutoAnsweredChannels` throwaway channels, denying
+  the feature to every legitimate future inviter. A merely unreachable
+  node does NOT free a slot — a hiccup must not cost an earned grant.
+- An invite to a channel already listed in `bot.channels` is now a pure
+  no-op (it already answers unconditionally) instead of needlessly
+  spending a cap slot or logging a confusing "cap reached" warning for a
+  channel that never needed one.
+
+### Fixed
+
+- The cap-reached warning's remedy text implied raising the cap alone would
+  let the just-rejected channel through — it does not, since the poller's
+  cursor has already advanced past that notification by the time the
+  warning is logged. Reworded to say a fresh invite (or a manual
+  `bot.channels` addition) is what that specific channel actually needs.
+
+Full pipeline: code audit + security audit in parallel on the new
+auto-answer/cap logic, both moderate-severity findings fixed (the two
+restart re-validation gaps above), then all new behavior mutation-tested.
+
 ## [0.25.0] - 2026-09-13
 
 Found live-testing 0.24.0: a private-channel invite always hit the

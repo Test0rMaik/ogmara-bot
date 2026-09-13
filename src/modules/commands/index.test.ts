@@ -377,7 +377,11 @@ describe('commands module auto-join', () => {
   afterEach(() => rmSync(stateDir, { recursive: true, force: true }));
 
   function cfgWithAutoJoin(over: Record<string, unknown> = {}): BotConfig {
-    return botCfg({ autoJoin: { statePath }, ...over });
+    return botCfg({
+      autoJoin: { statePath },
+      commands: [{ name: 'about', description: 'who I am' }],
+      ...over,
+    });
   }
 
   it('joins every configured channel on start', async () => {
@@ -437,11 +441,11 @@ describe('commands module auto-join', () => {
     expect(joinChannel).toHaveBeenCalledWith(99);
   });
 
-  it('does NOT add an invited channel to answering — only joins it', async () => {
-    // The whole point of keeping this separate from bot.channels: an
-    // arbitrary channel owner's invite must never expand what this wallet
-    // spends its posting quota answering in, only its membership.
-    const subscribeChannels = vi.fn(async (_channels: number[]) => () => {});
+  it('auto-answers an invited PLAINTEXT channel by default — end to end', async () => {
+    // answerInvitedChannels defaults to true: inviting the bot should be
+    // enough by itself, with no separate operator step, for it to actually
+    // become usable in that channel — not just a member.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '99',
@@ -449,12 +453,302 @@ describe('commands module auto-join', () => {
       timestamp: 1000,
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
-    const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7] })));
-    const mod = createCommandsModule(depsWith({ subscribeChannels, getNotifications }));
-    await mod.preflight!(ctx);
-    await (await mod.start(ctx)).stop();
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ reply, getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin({ channels: [7] }))),
+    );
+    deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledWith(99, expect.any(String), expect.any(Array));
+    await stop();
+  });
 
-    expect(subscribeChannels).toHaveBeenCalledWith([7], expect.any(Function));
+  it('does NOT auto-answer an invited channel when answerInvitedChannels is false', async () => {
+    // The opt-out: still joins (membership), never answers.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ reply, joinChannel, getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin({ channels: [7], autoJoin: { statePath, answerInvitedChannels: false } }))),
+    );
+    deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(joinChannel).toHaveBeenCalledWith(99);
+    expect(reply).not.toHaveBeenCalled();
+    await stop();
+  });
+
+  it('stops auto-answering new invites once maxAutoAnsweredChannels is reached', async () => {
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const notifications: Notification[] = [
+      { type: 'channel_invite', channel_id: '98', from: 'klv1a', timestamp: 1000 },
+      { type: 'channel_invite', channel_id: '99', from: 'klv1b', timestamp: 2000 },
+    ];
+    const getNotifications = vi.fn(async (_since?: number) => notifications);
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ reply, getNotifications }),
+      ctxWith(
+        configWith(cfgWithAutoJoin({ autoJoin: { statePath, maxAutoAnsweredChannels: 1 } })),
+      ),
+    );
+    deliver(msg('/about', { channel: 98, mentions: ['klv1bot'] }));
+    deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    // The FIRST invite processed gets the one available slot; the second is
+    // joined (proven by the earlier "joins every invite" tests) but not
+    // answered.
+    expect(reply).toHaveBeenCalledWith(98, expect.any(String), expect.any(Array));
+    expect(reply).not.toHaveBeenCalledWith(99, expect.any(String), expect.any(Array));
+    await stop();
+  });
+
+  it('an auto-answer grant survives a restart, without a fresh invite', async () => {
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+
+    // First run: earns the grant.
+    const first = await startAndCapture(depsWith({ getNotifications }), ctx);
+    await first.stop();
+
+    // Second run: NO new invite (getNotifications now returns nothing new),
+    // yet the channel must still be answered — the grant is state, not a
+    // one-time reaction to seeing the invite.
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(depsWith({ reply, getNotifications: noNewInvites }), ctx);
+    second.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledWith(99, expect.any(String), expect.any(Array));
+    await second.stop();
+  });
+
+  it('flipping answerInvitedChannels to false stops answering an ALREADY-granted channel on restart', async () => {
+    // REGRESSION GUARD. This is the incident-response "turn it off" reflex —
+    // it has to actually revoke existing grants on the next restart, not
+    // just refuse NEW ones, or the one manual override this design offers
+    // during abuse does not work.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+
+    const first = await startAndCapture(
+      depsWith({ getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    await first.stop();
+
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(
+      depsWith({ reply, getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, answerInvitedChannels: false } }))),
+    );
+    second.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await second.stop();
+  });
+
+  it('re-enabling answerInvitedChannels resumes a previously-earned grant, no fresh invite needed', async () => {
+    // The flip side of the test above: turning it back on must not require
+    // re-inviting from scratch — the persisted grant is preserved even
+    // while paused, only the LIVE set is emptied while the flag is off.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+
+    const first = await startAndCapture(
+      depsWith({ getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    await first.stop();
+    const paused = await startAndCapture(
+      depsWith({ getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, answerInvitedChannels: false } }))),
+    );
+    await paused.stop();
+
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const resumed = await startAndCapture(
+      depsWith({ reply, getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    resumed.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledWith(99, expect.any(String), expect.any(Array));
+    await resumed.stop();
+  });
+
+  it('lowering maxAutoAnsweredChannels on restart trims the live set down to the new cap', async () => {
+    // REGRESSION GUARD. Without this, an operator lowering the cap after
+    // several channels were already granted would see NO effect at all
+    // until every one of those channels happened to churn — the cap would
+    // bound future growth only, never the actual live total.
+    const notifications: Notification[] = [
+      { type: 'channel_invite', channel_id: '10', from: 'klv1a', timestamp: 1000 },
+      { type: 'channel_invite', channel_id: '20', from: 'klv1b', timestamp: 2000 },
+      { type: 'channel_invite', channel_id: '30', from: 'klv1c', timestamp: 3000 },
+    ];
+    const getNotifications = vi.fn(async (_since?: number) => notifications);
+    const first = await startAndCapture(
+      depsWith({ getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, maxAutoAnsweredChannels: 10 } }))),
+    );
+    await first.stop();
+
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(
+      depsWith({ reply, getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, maxAutoAnsweredChannels: 1 } }))),
+    );
+    second.deliver(msg('/about', { channel: 10, mentions: ['klv1bot'] }));
+    second.deliver(msg('/about', { channel: 20, mentions: ['klv1bot'] }));
+    second.deliver(msg('/about', { channel: 30, mentions: ['klv1bot'] }));
+    await settle();
+    // Exactly one of the three restored grants survives the trim — which
+    // one is an implementation detail (array order), the COUNT is the point.
+    expect(reply).toHaveBeenCalledTimes(1);
+    await second.stop();
+  });
+
+  it('removes a channel from the auto-answer set once it is no longer visible — freeing the slot', async () => {
+    // REGRESSION GUARD (security-audit finding). Without this, a cheap
+    // throwaway channel — invite the bot, then delete the channel or get it
+    // kicked/banned — permanently occupies one of the limited auto-answer
+    // slots forever, since nothing else ever frees one. An attacker could
+    // exhaust every slot this way for the cost of maxAutoAnsweredChannels
+    // disposable channels, denying the feature to every legitimate future
+    // inviter.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const first = await startAndCapture(depsWith({ getNotifications }), ctxWith(configWith(cfgWithAutoJoin())));
+    await first.stop();
+
+    // Second run: the channel has since become invisible (deleted, or this
+    // wallet's membership/visibility was lost) — describeChannel now
+    // returns null for it. No new invites this poll.
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts | null> =>
+      id === 99 ? null : publicChannel,
+    );
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(
+      depsWith({ reply, describeChannel, getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    second.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+
+    // The freed slot must be PERSISTED too, or a further restart would
+    // restore the stale, now-invalid grant right back from the state file.
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).not.toContain(99);
+    await second.stop();
+  });
+
+  it('removes a channel from the auto-answer set once it turns encrypted', async () => {
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const first = await startAndCapture(depsWith({ getNotifications }), ctxWith(configWith(cfgWithAutoJoin())));
+    await first.stop();
+
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
+      id === 99 ? { name: 'now secret', encrypted: true, canPost: true } : publicChannel,
+    );
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(
+      depsWith({ reply, describeChannel, getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    second.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).not.toHaveBeenCalled();
+    await second.stop();
+  });
+
+  it('does NOT free a slot for a merely UNREACHABLE channel — a node hiccup must not cost the grant', async () => {
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const first = await startAndCapture(depsWith({ getNotifications }), ctxWith(configWith(cfgWithAutoJoin())));
+    await first.stop();
+
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts | 'unreachable'> =>
+      id === 99 ? 'unreachable' : publicChannel,
+    );
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(
+      depsWith({ reply, describeChannel, getNotifications: noNewInvites }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    second.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    // Still answered — the grant is a live JS Set check independent of this
+    // poll's describeChannel outcome; only a REMOVED grant would block it.
+    expect(reply).toHaveBeenCalledWith(99, expect.any(String), expect.any(Array));
+    await second.stop();
+  });
+
+  it('an invite to a channel already in bot.channels is a pure no-op — no cap slot spent', async () => {
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '7', // already in bot.channels via cfgWithAutoJoin's default
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, maxAutoAnsweredChannels: 0 } })));
+    const mod = createCommandsModule(depsWith({ joinChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    // maxAutoAnsweredChannels: 0 would normally refuse a NEW grant and warn
+    // — if channel 7 were processed as an invite at all, start() would log
+    // that warning even though 7 already answers unconditionally. Proven
+    // indirectly here via joinChannel: the static loop in start() already
+    // joins every cfg.channels entry once, so a SECOND call for the same id
+    // from the invite path would be the tell that it was processed twice.
+    await (await mod.start(ctx)).stop();
+    expect(joinChannel).toHaveBeenCalledTimes(1);
   });
 
   it('JOINS an invite to an ENCRYPTED channel — membership only, still cannot answer there', async () => {

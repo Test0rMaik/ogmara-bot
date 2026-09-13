@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   extractChannelInvites,
-  loadAutoJoinCursor,
-  saveAutoJoinCursor,
+  loadAutoJoinState,
+  saveAutoJoinState,
   type RawNotification,
 } from './autojoin.js';
 
@@ -68,7 +68,7 @@ describe('extractChannelInvites', () => {
   });
 });
 
-describe('auto-join cursor persistence', () => {
+describe('auto-join state persistence', () => {
   let dir: string;
   let path: string;
   const warnings: string[] = [];
@@ -81,43 +81,65 @@ describe('auto-join cursor persistence', () => {
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it('a missing file starts from 0, silently — the normal first-run case', () => {
-    expect(loadAutoJoinCursor(path, warn)).toBe(0);
+  it('a missing file starts empty, silently — the normal first-run case', () => {
+    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 0, answerChannelIds: [] });
     expect(warnings).toEqual([]);
   });
 
-  it('round-trips a saved cursor', () => {
-    saveAutoJoinCursor(path, 123456789);
-    expect(loadAutoJoinCursor(path, warn)).toBe(123456789);
+  it('round-trips a saved state, cursor and answer-channel list together', () => {
+    saveAutoJoinState(path, { lastHandledTs: 123456789, answerChannelIds: [17, 42] });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 123456789,
+      answerChannelIds: [17, 42],
+    });
     expect(warnings).toEqual([]);
   });
 
-  it('a corrupt file resets to 0 WITH a warning, rather than refusing to start', () => {
+  it('reads a file written before answerChannelIds existed as an empty list, not a crash', () => {
+    // A live bot already has a state file written by the version of this
+    // module that only ever persisted lastHandledTs — that file must keep
+    // loading correctly, not lose its cursor or throw, once this field is read.
+    writeFileSync(path, JSON.stringify({ version: 1, lastHandledTs: 999 }), 'utf8');
+    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 999, answerChannelIds: [] });
+    expect(warnings).toEqual([]);
+  });
+
+  it('a corrupt file resets to empty WITH a warning, rather than refusing to start', () => {
     // Unlike the ledger (where a corrupt file is a hard startup error because
-    // silently resetting would repost the whole backlog), losing this cursor
-    // only means re-checking channels this wallet may already be a member
-    // of — joinChannel is idempotent, so the safe default is to keep going.
+    // silently resetting would repost the whole backlog), losing this state
+    // only means re-checking channels this wallet may already be a member of
+    // and re-granting answer slots it already earned — both idempotent/
+    // harmless to redo — so the safe default is to keep going.
     writeFileSync(path, 'not json at all', 'utf8');
-    expect(loadAutoJoinCursor(path, warn)).toBe(0);
+    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 0, answerChannelIds: [] });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('corrupt');
   });
 
-  it('a wrong-shaped file (e.g. a future version) resets to 0 WITH a warning', () => {
+  it('a wrong-shaped file (e.g. a future version) resets to empty WITH a warning', () => {
     writeFileSync(path, JSON.stringify({ version: 2, somethingElse: true }), 'utf8');
-    expect(loadAutoJoinCursor(path, warn)).toBe(0);
+    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 0, answerChannelIds: [] });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('unexpected shape');
   });
 
+  it('drops non-number entries from a tampered/malformed answerChannelIds array', () => {
+    writeFileSync(
+      path,
+      JSON.stringify({ version: 1, lastHandledTs: 5, answerChannelIds: [1, 'two', null, 3] }),
+      'utf8',
+    );
+    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 5, answerChannelIds: [1, 3] });
+  });
+
   it('survives a crash mid-write: the previous good file is untouched until rename', () => {
-    saveAutoJoinCursor(path, 111);
-    // saveAutoJoinCursor writes a temp file then renames over the target —
+    saveAutoJoinState(path, { lastHandledTs: 111, answerChannelIds: [1] });
+    // saveAutoJoinState writes a temp file then renames over the target —
     // there is no way to observe a partially-written target file from the
     // outside, so the property under test is simply that a second save
     // fully replaces the first rather than corrupting it.
-    saveAutoJoinCursor(path, 222);
-    expect(loadAutoJoinCursor(path, warn)).toBe(222);
+    saveAutoJoinState(path, { lastHandledTs: 222, answerChannelIds: [1, 2] });
+    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 222, answerChannelIds: [1, 2] });
     expect(warnings).toEqual([]);
   });
 });
