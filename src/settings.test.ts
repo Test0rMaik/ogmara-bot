@@ -238,9 +238,13 @@ describe('file-only sections in the overrides FILE', () => {
     // loadOverrides promises never to throw. A RangeError escaping it reached
     // loadLayeredConfig and stopped the bot booting until someone deleted the
     // file by hand — a config lockout from an untrusted file.
-    let deep: unknown = 'leaf';
-    for (let i = 0; i < 20_000; i += 1) deep = { a: deep };
-    writeFileSync(file, JSON.stringify({ values: deep }), 'utf8');
+    // Built as text, not via JSON.stringify(deepObject): stringify walks the
+    // object graph recursively too, so on a runner with a smaller stack than
+    // this machine's it blew ITS OWN stack building the fixture — failing
+    // the test before loadOverrides (the thing actually under test) ever ran.
+    // String concatenation has no call depth regardless of nesting depth.
+    const deepJson = `${'{"a":'.repeat(20_000)}"leaf"${'}'.repeat(20_000)}`;
+    writeFileSync(file, `{"values":${deepJson}}`, 'utf8');
     expect(() => loadOverrides(file)).not.toThrow();
   });
 });

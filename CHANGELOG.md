@@ -5,6 +5,35 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.1] - 2026-09-13
+
+CI had been failing since the 0.22.0 push — not noticed until this release,
+since the local suite passed and the pipeline result was never checked after
+a push. Fixed the test, and checking CI status is now part of shipping a
+change here, not an afterthought.
+
+### Fixed
+
+- **`settings.test.ts`'s over-deep-file test blew its OWN stack building the
+  test fixture**, on Node 22 (what CI runs) though not on this machine's
+  Node 26 (a larger default stack masked it locally). The test built a
+  20,000-level-deep object with a loop and then called `JSON.stringify` on
+  it to write the fixture file — but `JSON.stringify` walks the object graph
+  recursively in V8 too, so on a smaller stack it threw `RangeError: Maximum
+  call stack size exceeded` during test *setup*, before `loadOverrides` (the
+  function actually under test) ever ran. No production code was affected —
+  `loadOverrides`'s own depth guard (`MAX_OVERRIDE_DEPTH = 32` in
+  `settings.ts`) was never in question. Rebuilt the fixture as a JSON string
+  via `.repeat()` and concatenation instead, which has no call depth
+  regardless of nesting depth. Reproduced the original failure and verified
+  the fix in a `node:22-alpine` container matching CI's pinned Node version
+  exactly (`actions/setup-node@v6`, `node-version: 22`), run as a non-root
+  user to also match how the GitHub Actions runner executes (an earlier
+  root-user container run surfaced an unrelated, container-only false
+  failure in `statsHistory.test.ts` — a permission test that root
+  legitimately bypasses — which does not occur on the actual runner or as a
+  non-root user locally).
+
 ## [0.23.0] - 2026-09-13
 
 Phase D of the modularisation: the settings UI. Everything Phase C's API
