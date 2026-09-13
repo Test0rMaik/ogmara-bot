@@ -95,6 +95,44 @@ export interface PreflightFailure {
   readonly message: string;
 }
 
+/**
+ * How one config field is presented and treated by the settings UI.
+ *
+ * Deliberately NOT derived from the Zod schema. Zod knows a field is
+ * `z.int().min(1).max(600)`; it does not know that changing it needs a restart,
+ * that it spends money, or what to call it in seven languages. Those are
+ * editorial facts about the field, and inventing them from types is how a
+ * settings page ends up labelling things `perWalletPerMinute`.
+ */
+export interface UiField {
+  /** i18n key for the label. The UI translates it like any other chrome. */
+  readonly label: string;
+  /** i18n key for help text shown under the input. */
+  readonly help?: string;
+  /**
+   * Whether the running process picks this up, or it waits for a restart.
+   *
+   * The operator must never have to guess. A page that says "saved" for a value
+   * that is inert until the next boot is worse than one that says nothing.
+   */
+  readonly restart: boolean;
+  /**
+   * Needs an explicit confirmation step rather than an autosaving control.
+   *
+   * For anything whose wrong value is expensive or public: turning off dry run
+   * points a live wallet at a live network; spending KLV cannot be undone.
+   */
+  readonly confirm?: boolean;
+  /**
+   * Holds a secret. The API reports `{ set: boolean }` and never the value.
+   *
+   * Nothing in this config is secret today — every secret is an environment
+   * variable, which is strictly safer — so this exists for the day a module
+   * needs one, and to keep the API's contract honest in the meantime.
+   */
+  readonly secret?: boolean;
+}
+
 export interface BotModule {
   /** Stable id. Matches the module's config key. */
   readonly name: string;
@@ -106,6 +144,16 @@ export interface BotModule {
    * rather than declaring them, and the settings UI renders from them.
    */
   readonly schemas: Readonly<Record<string, ZodTypeAny>>;
+
+  /**
+   * Presentation metadata for this module's fields, keyed by dotted config path
+   * (`bot.rateLimit.perWalletPerMinute`).
+   *
+   * A field with no entry is still editable — it renders from its schema with a
+   * humanised label and is assumed live-appliable. The map is for the facts the
+   * schema cannot carry, not a second declaration of every field.
+   */
+  readonly uiSchema?: Readonly<Record<string, UiField>>;
 
   /**
    * Whether the operator has switched this module on.

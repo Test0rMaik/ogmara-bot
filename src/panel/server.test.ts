@@ -81,6 +81,7 @@ interface StartOptions {
   uploadAvatar?: PanelDeps['uploadAvatar'];
   botDescriptor?: PanelDeps['botDescriptor'];
   setRegistered?: PanelDeps['setRegistered'];
+  settings?: PanelDeps['settings'];
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -170,6 +171,7 @@ async function start(options: StartOptions = {}): Promise<{
     nodeUrl: options.nodeUrl ?? 'https://node.example.test',
     fetchProfile: fetchProfileFn,
     setRegistered: setRegisteredFn,
+    ...(options.settings !== undefined ? { settings: options.settings } : {}),
     botDescriptor:
       options.botDescriptor ?? ((): ReturnType<PanelDeps['botDescriptor']> => ({ enabled: false, channels: [], commands: [] })),
     uploadAvatar: uploadAvatarFn,
@@ -192,6 +194,7 @@ async function start(options: StartOptions = {}): Promise<{
       fetchProfile: fetchProfileFn,
       uploadAvatar: uploadAvatarFn,
       setRegistered: setRegisteredFn,
+    ...(options.settings !== undefined ? { settings: options.settings } : {}),
     },
   };
 }
@@ -989,6 +992,201 @@ describe('/api/register — spends real KLV, must never fire by accident', () =>
     const status = await json(await fetch(`${baseUrl}/api/status`));
     expect(status.registered).toBe(true);
     expect(status.registrationPending).toBe(false);
+  });
+});
+
+describe('settings API', () => {
+  const stubSettings = (over: Partial<NonNullable<PanelDeps['settings']>> = {}) => {
+    const audited: unknown[] = [];
+    const deps: NonNullable<PanelDeps['settings']> = {
+      describe: () => ({
+        effective: { posting: { dryRun: true } } as never,
+        fromFile: {},
+        fromUi: {},
+        ui: {},
+      }),
+      apply: () => ({ ok: true }),
+      reset: () => ({ ok: true }),
+      audit: (e) => audited.push(e),
+      readAudit: () => [],
+      // A real-looking secret VALUE lives here so the "never returns a secret"
+      // test has something it could actually leak.
+      secretsPresent: () => {
+        const actualKey = 'sk-ant-REAL-do-not-leak';
+        return { ANTHROPIC_API_KEY: actualKey.length > 0, OGMARA_WALLET_KEY: true };
+      },
+      ...over,
+    };
+    return { deps, audited };
+  };
+
+  it('requires a signed-in session EVEN FROM LOCALHOST', async () => {
+    // The rest of the panel renames a bot; this reads and writes every setting.
+    // The loopback bypass is defensible for the former and not for the latter —
+    // anything reaching loopback would otherwise inherit full config access.
+    const { deps } = stubSettings();
+    const { baseUrl } = await start({ settings: deps });
+    const res = await fetch(`${baseUrl}/api/settings`); // loopback, no cookie
+    expect(res.status).toBe(401);
+    expect((await json(res)).error).toContain('even from localhost');
+  });
+
+  it('serves settings to a real session from localhost', async () => {
+    // The bypass must stop GRANTING access without also stopping a genuine
+    // session from working.
+    const { deps } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      headers: { cookie: `ogmara_bot_session=${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('NEVER returns a secret value — only whether it is set', async () => {
+    // A masked value is still a value once it is in a response body, a browser
+    // cache, or a proxy log.
+    const { deps } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const body = await (
+      await fetch(`${baseUrl}/api/settings`, { headers: { cookie: `ogmara_bot_session=${token}` } })
+    ).text();
+    expect(body).toContain('"ANTHROPIC_API_KEY":true');
+    // Asserted against a stub that genuinely HOLDS a secret-shaped value —
+    // `not.toContain('sk-')` against a stub with no secret in it passes however
+    // the implementation behaves.
+    expect(body).not.toContain('sk-ant-REAL');
+    expect(JSON.parse(body).secrets.ANTHROPIC_API_KEY).toBe(true);
+  });
+
+  it('rejects a write touching panel, with 403, and AUDITS the refusal', async () => {
+    // A refused write is exactly the event an operator goes looking for when a
+    // change "did not take".
+    const { deps, audited } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ changes: { panel: { requireLogin: false } } }),
+    });
+    expect(res.status).toBe(403);
+    expect(audited).toHaveLength(1);
+    expect(audited[0]).toMatchObject({ path: 'panel.requireLogin', outcome: 'rejected' });
+  });
+
+  it('refuses a write that would not produce a valid config, and audits it', async () => {
+    const { deps, audited } = stubSettings({
+      apply: () => ({ ok: false, issues: ['posting.maxPostsPerHour: too big'] }),
+    });
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ changes: { posting: { maxPostsPerHour: 9999 } } }),
+    });
+    expect(res.status).toBe(400);
+    expect(audited[0]).toMatchObject({ outcome: 'rejected' });
+  });
+
+  it('reports which saved changes are inert until a restart', async () => {
+    // Never claim "saved and applied" for something that only landed on disk.
+    const { deps } = stubSettings({
+      describe: () => ({
+        effective: { node: { url: 'https://a' } } as never,
+        fromFile: {},
+        fromUi: {},
+        ui: { 'node.url': { restart: true } },
+      }),
+    });
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ changes: { node: { url: 'https://b' } } }),
+    });
+    expect((await json(res)).restartPending).toEqual(['node.url']);
+  });
+
+  it('refuses to reset a file-only path', async () => {
+    const { deps, audited } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings/reset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ path: 'panel.port' }),
+    });
+    expect(res.status).toBe(403);
+    expect(audited[0]).toMatchObject({ outcome: 'rejected', path: 'panel.port' });
+  });
+
+  it('refuses a write carrying more settings than any form would send', async () => {
+    // Every rejected path wrote its own audit row, and nothing capped how many
+    // a write could carry — so one refused request could rotate the log more
+    // than once and erase what the session had done earlier.
+    const { deps, audited } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const many: Record<string, unknown> = {};
+    for (let i = 0; i < 200; i += 1) many[`f${i}`] = i;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ changes: many }),
+    });
+    expect(res.status).toBe(400);
+    // ONE row, not 200 — the cap is on the log as much as on the write.
+    expect(audited).toHaveLength(1);
+  });
+
+  it('refuses a literal dotted KEY rather than reporting it saved', async () => {
+    // `{"posting.dryRun": false}` flattens to the same string as the real
+    // nested path, so every downstream check waved it through — then Zod
+    // stripped the root key, so the write changed nothing, said "saved", and
+    // left junk no reset could remove.
+    const { deps } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ changes: { 'posting.dryRun': false } }),
+    });
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toContain('nested objects');
+  });
+
+  it('reports restart-pending on a RESET too, not just a write', async () => {
+    // The two routes disagreeing about whether a change took effect is exactly
+    // the ambiguity the restart flag exists to remove.
+    const { deps } = stubSettings();
+    const { baseUrl, auth } = await start({ settings: deps });
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings/reset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: `ogmara_bot_session=${token}` },
+      body: JSON.stringify({ path: 'posting.dryRun' }),
+    });
+    expect((await json(res)).restartPending).toEqual(['posting.dryRun']);
+  });
+
+  it('404s the whole API when it is not enabled', async () => {
+    const { baseUrl, auth } = await start(); // no settings deps
+    const token = auth.issueSession(operator.address).token;
+    const res = await fetch(`${baseUrl}/api/settings`, {
+      headers: { cookie: `ogmara_bot_session=${token}` },
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it('gates the audit viewer behind the same session requirement', async () => {
+    const { deps } = stubSettings();
+    const { baseUrl } = await start({ settings: deps });
+    expect((await fetch(`${baseUrl}/api/audit`)).status).toBe(401);
   });
 });
 

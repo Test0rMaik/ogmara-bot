@@ -5,6 +5,193 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-09-12
+
+Phase C of the modularisation: the settings API. The panel can now read and
+write configuration, which is a far larger privilege than renaming a bot — most
+of what follows is about containing that.
+
+### Added
+
+- **A layered configuration.** `defaults < config.yaml < data/settings.json`.
+  The UI writes only the third layer, and only the keys actually changed, so
+  `config.yaml` keeps its comments — which in this repo are substantial operator
+  documentation — and an operator who hand-edits is never fought by a form.
+- **`GET /api/settings`** — every field with its effective value and where that
+  value came from (`default` / `file` / `ui`), so "reset to file" can mean
+  restoring a value the operator wrote rather than silently reverting to a
+  default they have never seen.
+- **`PUT /api/settings`** — validates the fully MERGED configuration with the
+  same Zod schema the loader uses, never the diff: a field that is individually
+  valid can still be invalid in combination, and divergence here would mean the
+  panel says "saved" for something the next boot refuses. Reports which saved
+  changes are inert until a restart rather than claiming everything applied.
+- **`POST /api/settings/reset`** — deletes an override so the field tracks
+  `config.yaml` again, including if that file later changes.
+- **`GET /api/audit`** and an append-only `data/audit.log` (JSONL, size-rotated)
+  recording every settings change: who, from where, which path, old and new
+  value, and the outcome.
+- **`uiSchema` on the module contract** — per-field `restart` / `confirm` /
+  `secret`, the editorial facts a Zod schema cannot carry. A module that adds a
+  field gets its settings UI from this, rather than from a second hand-written
+  form.
+
+### Fixed
+
+*(Found by the audit pass on this feature, before release.)*
+
+- **The first settings save failed on any fresh install.** Neither the overrides
+  writer nor the audit log created `data/` — every other writer in this repo
+  does — so on a clean box the first save threw `ENOENT`, surfaced as a bare
+  `500 internal error`, and the audit log that should have explained it could
+  not be created either.
+- **The panel reported "applied" for changes that had not been applied.**
+  Nothing in the process re-reads the effective config after a write, so every
+  saved change is really inert until a restart — but an unclaimed field
+  defaulted to `restart: false`. The worst case was turning dry run ON to stop a
+  bot that was posting: the API said applied, the audit log said applied, and
+  the bot kept publishing to a live network under the operator's wallet.
+  Unknown paths are now restart-required; a module must opt in with
+  `{ restart: false }` *and* a real live-apply path before the panel says
+  otherwise.
+- **Optional settings could never be set.** Known paths were derived from the
+  effective config's *present values* rather than from the schema, and those sets
+  differ by exactly every `.optional()` field that happens to be unset — so
+  `profile.displayName`, `profile.bio`, `bot.handle` and `ai.baseUrl` were all
+  refused as misspellings. That is the "rename the bot" surface the panel exists
+  for, and the error blamed the operator for a typo they had not made. (Caused
+  by the unknown-path fix below, and caught by the audit round after it.)
+- **`/api/settings/reset` still claimed "applied"** while the write path had
+  been corrected to report restart-pending — the two routes disagreeing about
+  whether a change had taken effect.
+- **A misspelled setting was accepted, persisted and unremovable.** Zod strips
+  unknown keys rather than rejecting them, so a typo returned `saved`, wrote
+  junk into the overrides file, and then never rendered a field — so no reset
+  button existed for it and it accumulated forever. Unknown paths are refused.
+- **`{"panel":{}}` reached disk with no audit row.** An empty object produced no
+  leaf paths, so the file-only guard found nothing to refuse and the audit loop
+  had nothing to record. An empty object is now a path in its own right.
+- **The `.bak` was destroyed by the next save**, including a reset of a field
+  that was never overridden — so "recoverable by deleting one file" survived
+  exactly one more click. Unchanged content is no longer rewritten.
+- **The overrides write was not actually atomic.** It renamed the live file to
+  `.bak` first, leaving a window with no settings file at all if the second
+  rename then failed. It now copies the backup and replaces with one rename.
+- **An unreadable `config.yaml` read as empty**, which made every field report
+  its source as `default` while an operator had an editor open — so the
+  provenance badges lied and "reset to file" meant something else. It is now a
+  distinct outcome: provenance holds its last good read, and a write is refused
+  with an error naming `config.yaml` rather than blaming an untouched field.
+- **The audit log path was frozen at boot** while everything else re-read
+  `config.yaml`, so a hand-edited `auditPath` showed on the settings page while
+  the log kept being written to the old location.
+- **Lowering `auditKeep` orphaned the higher log generations permanently** —
+  nothing ever looked above the new limit, so the log grew and never shrank.
+
+### Security
+
+- **`node.url` is returned with any embedded credential stripped.**
+  `/api/profile` already returns only its origin for exactly this reason (a
+  0.14.0 audit decision); echoing the raw value here put a
+  `https://user:pass@host` credential back into the browser history, devtools
+  and any proxy log.
+- **A literal dotted KEY was reported saved while changing nothing.**
+  `{"posting.dryRun": false}` — one key containing a dot — flattens to exactly
+  the same string as the real nested path, so the file-only guard and the
+  known-path check both waved it through. Zod then stripped the root key, so the
+  write changed nothing, said `saved`, and left junk in the overrides file that
+  no reset could remove (the reset walks segments the object does not have). A
+  safety control that reports itself set and is not. Dotted keys are now refused
+  before anything flattens the shape.
+- **One request could still flush the audit log after the path cap.** The cap
+  bounded how many rows a write produced, but each row carried the full
+  validation-issue list — so a 2 KB request could produce hundreds of kilobytes
+  of log. A failed write is now one row with a bounded reason.
+- **A deeply nested request body exhausted the stack.** The depth cap was added
+  to the file loader but not to the sibling walkers that process the same shape
+  from an HTTP body, so a 16 KB payload reached ~3,000 levels and turned every
+  such request into a 500. Both walkers now share the cap.
+- **One planted section reverted every real override.** A file carrying a
+  smuggled `panel:` was reported as a whole-file problem, so the loader
+  discarded *all* of the operator's settings — while the warning said only that
+  section had been ignored. Partial stripping and whole-file failure are now
+  distinct outcomes.
+- **`--dry-run` was lost on the first save.** The forcing was applied when the
+  settings API was constructed, but a commit replaced the config with a freshly
+  merged one — so saving any unrelated setting made the page report
+  `dryRun: false` while the bot was genuinely in dry run. It is now re-applied
+  on every commit.
+- **A planted `data/settings.json` could take over panel authentication.** The
+  file-only rule lived only in the HTTP guard, so the LOADER merged whatever the
+  overrides file contained — `panel:` included. Anything able to write one file
+  into `data/` (a second container on a shared volume, any local process) could
+  turn the loopback bypass back on, install its own `adminWallets` and point
+  `trustedProxies` wherever it liked, on the next restart, without ever touching
+  the API. It compounded: the overrides file and the audit log are written to
+  paths from `settings:`, so the same write would have made the next save
+  overwrite an arbitrary file and every audit line land somewhere the attacker
+  chose. Both sections are now stripped at load with a warning naming the file.
+- **One request could flush the audit log.** Every rejected path wrote its own
+  row and nothing capped how many paths a write could carry, so a single refused
+  request produced many times its own size in log output — enough to rotate the
+  log more than once and erase what the session had done earlier. Refused paths
+  are logged by design, which is what made it work. A write is now capped at 100
+  settings.
+- **Credentials in `node.url` were redacted from the API but written verbatim to
+  the audit log**, the one file whose stated purpose is being safe to paste into
+  a bug report. The same redaction now applies to both — and it keys on the
+  VALUE rather than on one path name, which had left `ai.baseUrl` (also a URL,
+  also accepting `https://user:pass@host`) leaking into both.
+- **The audit viewer read the entire log into memory** to return 200 rows, with
+  `auditMaxBytes` configurable to 100 MB. It now reads only the tail.
+- **`--dry-run` was invisible to the settings API**, which could report
+  `dryRun: false` while the bot was genuinely in dry run.
+- **File-only values are withheld, not merely marked read-only.** The settings
+  response is exactly the reconnaissance a stolen session wants:
+  `adminWallets` names whose key to go after, `trustedProxies` names which
+  header to forge.
+- **A deeply nested overrides file crashed the boot.** `loadOverrides` promises
+  never to throw, but the strip pass recursed per level and a `RangeError`
+  escaped it — a config lockout from an untrusted file. Depth is now capped and
+  the failure degrades to "ignored and warned" like every other malformed case.
+- **A prototype-chain write cannot reach a file-only section.**
+  `{"__proto__":{"settings":{"auditPath":"/tmp/x"}}}` produced no leaf path
+  under `settings`, so the file-only guard saw nothing to refuse — and because
+  assigning `__proto__` sets an object's prototype rather than a property, the
+  merged config resolved `settings` through it and Zod read it as genuine. The
+  audit log was relocated past the guard whose entire purpose is stopping a
+  session from moving the record of what it did. Refused at the API (and
+  audited), skipped in the merge, and stripped when loading the file — three
+  independent layers, so no single forgotten check restores it.
+- **The settings API requires a signed-in session even from localhost.** The
+  loopback bypass is defensible for "rename the bot" and not for "read and write
+  every setting" — anything reaching loopback, including another container on
+  the host, would otherwise inherit it. The bypass stops granting access without
+  stopping a genuine session from working.
+- **`panel:` and `settings:` are file-only and rejected outright**, not merely
+  confirmed. A recovery path must require a strictly stronger credential than
+  the thing it recovers, and shell access outranks a panel session — so a
+  lockout stays fixable, and only by someone with shell. It also makes a stolen
+  session strictly non-escalating: it cannot add an attacker wallet to
+  `adminWallets`, remove the owner's, or touch `trustedProxies`, where one wrong
+  entry is a full authentication bypass this repo has been bitten by once.
+  `settings:` is protected for the same reason: a session that could relocate
+  the audit log could erase the record of what it did.
+- **No secret is readable or writable through this API.** Every secret in this
+  bot is an environment variable and none appears in the config surface at all,
+  so the API reports presence (`{ "ANTHROPIC_API_KEY": true }`) and nothing
+  else — no value, not even masked, since a masked value is still a value once
+  it is in a response body, a browser cache or a proxy log.
+- **A secret value cannot reach the audit log even by mistake.** The event type
+  is a union: a `secret` event structurally has no field to put a value in.
+- **Rejected writes are audited too** — the refusal is exactly the event an
+  operator goes looking for when a change "did not take".
+- **A bad save cannot lock an operator out.** Overrides are written atomically
+  with the previous version kept as `.bak`, and a malformed or no-longer-valid
+  overrides file is reported loudly and ignored in favour of `config.yaml`
+  rather than stopping the bot. Verified live: a corrupt file warns, falls back,
+  and the panel stays reachable.
+
 ## [0.21.0] - 2026-09-12
 
 ### Fixed

@@ -20,6 +20,7 @@ import { describeAddressProblem, validateAddress } from './address.js';
 import { TrustedProxies } from './panel/clientip.js';
 import { isValidCron } from './scheduler.js';
 import { botSchema } from './modules/commands/schema.js';
+import { loadOverrides, mergeOverrides } from './settings.js';
 
 /**
  * The node's per-wallet news limits, as of l2-node 0.122.0.
@@ -456,6 +457,24 @@ const panelSchema = z
     }
   });
 
+/**
+ * Where the settings UI keeps its state.
+ *
+ * File-only, like `panel:`, and for the same reason: these paths decide where
+ * the override layer and the audit trail live, so making them writable from the
+ * UI would let one session relocate the record of what it changed.
+ */
+const settingsSchema = z.object({
+  /** UI-written overrides. NOT a hand-editing surface — see settings.ts. */
+  path: z.string().min(1).default('data/settings.json'),
+  /** Append-only record of settings changes. */
+  auditPath: z.string().min(1).default('data/audit.log'),
+  /** Rotate the audit log past this size. */
+  auditMaxBytes: z.int().min(64_000).max(100_000_000).default(5_000_000),
+  /** Rotated generations kept. */
+  auditKeep: z.int().min(1).max(50).default(5),
+});
+
 const configSchema = z.object({
   node: nodeSchema,
   // `prefault` rather than `default`: Zod 4's `.default()` takes an *output*
@@ -470,6 +489,7 @@ const configSchema = z.object({
   storage: storageSchema.prefault({}),
   panel: panelSchema.prefault({}),
   stats: statsSchema.prefault({}),
+  settings: settingsSchema.prefault({}),
   // Owned by the `commands` module, per the module contract — the module is the
   // source of truth for its own section, which is what lets the operator
   // settings page render from the schema instead of being hand-written.
@@ -512,6 +532,22 @@ export class ConfigError extends Error {
   override readonly name = 'ConfigError';
 }
 
+/**
+ * A fully layered configuration, with the raw layers kept for provenance.
+ *
+ * (The provenance TYPE lives with the code that renders it, as `FieldSource` in
+ * `panel/settings.ts`. Two names for one concept in two files is how they
+ * drift.)
+ */
+export interface LayeredConfig {
+  /** Validated, merged, ready to use. */
+  readonly config: Config;
+  /** Exactly what `config.yaml` contained, before defaults were applied. */
+  readonly fromFile: Record<string, unknown>;
+  /** Exactly what the overrides file contained. */
+  readonly fromUi: Record<string, unknown>;
+}
+
 /** Parse and validate a YAML config file. */
 export function loadConfig(path: string): Config {
   let raw: string;
@@ -542,6 +578,145 @@ export function loadConfig(path: string): Config {
   }
 
   return result.data;
+}
+
+/**
+ * Load `config.yaml`, apply the UI's overrides on top, and validate the result.
+ *
+ * Precedence: defaults < config.yaml < data/settings.json.
+ *
+ * A malformed or invalid overrides file is REPORTED and IGNORED, never fatal —
+ * that file is written by a web form, and a bad save must not be able to stop
+ * the bot starting. `config.yaml` alone is always a valid configuration, so
+ * falling back to it is always safe.
+ */
+export function loadLayeredConfig(
+  configPath: string,
+  overridesPath: string,
+  warn: (message: string) => void = (m) => console.warn(m),
+): LayeredConfig {
+  // Throws on a bad config.yaml — that IS fatal, and it is the operator's own
+  // hand-edited file, not something a web form produced.
+  const base = loadConfig(configPath);
+  // loadConfig has already succeeded, so this cannot fail here — but the type
+  // forces the caller to say what it does when it can.
+  const rawFile = readConfigFileRaw(configPath);
+  const fromFile = rawFile.ok ? rawFile.values : {};
+
+  const loaded = loadOverrides(overridesPath);
+  if (loaded.problem !== undefined) {
+    warn(`  warning: ignoring the settings overrides — ${loaded.problem}`);
+    return { config: base, fromFile, fromUi: {} };
+  }
+  if (loaded.stripped !== undefined) {
+    // Part of the file was dropped and the rest still applies. Treating this
+    // like a whole-file problem discarded every real override, so one planted
+    // section silently reverted all of the operator's settings — while the
+    // message said only that section had been ignored.
+    warn(`  warning: ${loaded.stripped}`);
+  }
+  if (Object.keys(loaded.values).length === 0) {
+    return { config: base, fromFile, fromUi: {} };
+  }
+
+  const merged = validateConfig(mergeOverrides(fromFile, loaded.values));
+  if (!merged.ok) {
+    // The overrides file is stale or hand-mangled. Say so loudly and carry on
+    // with the file's configuration rather than refusing to start.
+    warn(
+      `  warning: ignoring "${overridesPath}" — it no longer produces a valid ` +
+        `configuration:\n${merged.issues.map((i) => `      - ${i}`).join('\n')}`,
+    );
+    return { config: base, fromFile, fromUi: {} };
+  }
+  return { config: merged.config, fromFile, fromUi: loaded.values };
+}
+
+/**
+ * Read the raw YAML without validating it.
+ *
+ * Needed for provenance: once defaults are applied there is no way to tell a
+ * value the operator wrote from one the schema supplied, and the settings UI
+ * has to show the difference — "reset to file" means something different when
+ * the file says nothing.
+ */
+export function readConfigFileRaw(
+  path: string,
+): { ok: true; values: Record<string, unknown> } | { ok: false; reason: string } {
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(readFileSync(path, 'utf8'));
+  } catch (err) {
+    // NOT silently `{}`. Substituting an empty object conflated "the operator
+    // has an editor open and the file is half-written" with "the file sets
+    // nothing" — which made every field report its source as `default`, so the
+    // provenance badges lied and "reset to file" meant something else entirely.
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: `"${path}" does not contain a YAML mapping` };
+  }
+  return { ok: true, values: parsed as Record<string, unknown> };
+}
+
+/**
+ * Every dotted path the configuration schema declares.
+ *
+ * Derived from the SCHEMA, not from a loaded config's present values — those
+ * are different sets, and the difference is every `.optional()` field that
+ * happens to be unset. Using the values meant `profile.displayName`,
+ * `profile.bio`, `bot.handle` and `ai.baseUrl` could never be set through the
+ * settings API at all: the write was refused as a misspelling, which is the
+ * "rename the bot" surface the panel exists for.
+ */
+export function configPaths(): ReadonlySet<string> {
+  const out = new Set<string>();
+  walkSchema(configSchema, '', out);
+  return out;
+}
+
+function walkSchema(schema: unknown, prefix: string, out: Set<string>): void {
+  // Unwrap the wrappers Zod puts around a field — optional, default, prefault,
+  // nullable — until the thing underneath is reachable.
+  let node = schema as { def?: Record<string, unknown> };
+  for (let i = 0; i < 10; i += 1) {
+    const inner = node.def?.['innerType'];
+    if (inner === undefined) break;
+    node = inner as typeof node;
+  }
+
+  const shape = node.def?.['shape'];
+  if (typeof shape === 'function' || (typeof shape === 'object' && shape !== null)) {
+    const resolved = (typeof shape === 'function' ? (shape as () => unknown)() : shape) as Record<
+      string,
+      unknown
+    >;
+    for (const [key, child] of Object.entries(resolved)) {
+      walkSchema(child, prefix === '' ? key : `${prefix}.${key}`, out);
+    }
+    return;
+  }
+  // A leaf: a scalar, an array, an enum, a union. Arrays are leaves here for
+  // the same reason they are in `leafPaths` — the whole list is one value.
+  if (prefix !== '') out.add(prefix);
+}
+
+/**
+ * Validate an already-merged configuration object.
+ *
+ * The settings API validates the fully MERGED result rather than the diff it
+ * was handed: a field that is individually valid can still be invalid in
+ * combination, and the same schema the loader uses is the only thing that knows
+ * the difference. Divergence here would mean the panel says "saved" for
+ * something the next boot refuses.
+ */
+export function validateConfig(candidate: unknown): { ok: true; config: Config } | { ok: false; issues: string[] } {
+  const result = configSchema.safeParse(candidate);
+  if (result.success) return { ok: true, config: result.data };
+  return {
+    ok: false,
+    issues: result.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`),
+  };
 }
 
 /**

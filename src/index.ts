@@ -25,7 +25,14 @@ import {
   readWalletKeyFromFile,
   type WalletBootstrapResult,
 } from './bootstrap.js';
-import { ConfigError, loadConfig, loadSecrets, type Config, type Secrets } from './config.js';
+import {
+  ConfigError,
+  loadConfig,
+  loadLayeredConfig,
+  loadSecrets,
+  type Config,
+  type Secrets,
+} from './config.js';
 import { applyProfile, checkRegistration, fetchProfile, registerWallet, uploadAvatar } from './identity.js';
 import { KleverError, REGISTRATION_COST_KLV } from './klever.js';
 import { Ledger } from './ledger.js';
@@ -57,6 +64,8 @@ import { aggregateAllPostStats } from './stats.js';
 import { StatsHistory } from './statsHistory.js';
 import { stripControlSequences } from './terminal.js';
 import { WALLET_BACKUP_PATH, acknowledgeBackup, isBackupPending } from './walletBackup.js';
+import { createSettingsDeps } from './settingsDeps.js';
+import type { SettingsDeps } from './panel/server.js';
 
 interface CliArgs {
   configPath: string;
@@ -433,7 +442,12 @@ function hexToKey(hex: string): Uint8Array {
 }
 
 async function run(args: CliArgs): Promise<number> {
-  const config: Config = loadConfig(args.configPath);
+  // config.yaml first, then the settings UI's overrides on top. A bad or stale
+  // overrides file is reported and ignored rather than fatal — it is written by
+  // a web form, and a bad save must never stop the bot starting.
+  const bootstrap = loadConfig(args.configPath);
+  const layered = loadLayeredConfig(args.configPath, bootstrap.settings.path);
+  const config: Config = layered.config;
   const secrets: Secrets = loadSecrets();
 
   const effective: Config = args.forceDryRun
@@ -646,7 +660,28 @@ async function run(args: CliArgs): Promise<number> {
       }
       return inFlight;
     };
-    panel = await startControlPanel(effective, secrets, publisher, queue, statsHistory, takeStatsSnapshotNow);
+    panel = await startControlPanel(
+      effective,
+      secrets,
+      publisher,
+      queue,
+      statsHistory,
+      takeStatsSnapshotNow,
+      // Built here rather than inside the panel: this is the only scope that
+      // has the config layers, the enabled modules' uiSchemas, and the paths
+      // the overrides and audit log live at.
+      createSettingsDeps({
+        configPath: args.configPath,
+        layered: { ...layered, config: effective },
+        modules,
+        secrets,
+        // Re-applied on every commit, not just here: a freshly merged config
+        // would otherwise drop `--dry-run` on the first save, and the panel
+        // would report `dryRun: false` while the bot was genuinely in dry run.
+        applyCliOverrides: (c) =>
+          args.forceDryRun ? { ...c, posting: { ...c.posting, dryRun: true } } : c,
+      }),
+    );
   }
 
   // Each module registers its own crons. The scheduler's overlap guard is
@@ -775,6 +810,7 @@ async function startControlPanel(
   queue: PostQueue,
   statsHistory: StatsHistory,
   takeStatsSnapshotNow: () => Promise<void>,
+  settingsDeps: SettingsDeps,
 ): Promise<Panel> {
   let trustedProxies: TrustedProxies;
   try {
@@ -829,6 +865,7 @@ async function startControlPanel(
     nodeUrl: config.node.url,
     fetchProfile: () => fetchProfile(publisher.client, publisher.address),
     setRegistered: (registered) => publisher.setRegistered(registered),
+    settings: settingsDeps,
     botDescriptor: () => ({
       enabled: config.bot.enabled,
       ...(config.bot.handle !== undefined ? { handle: config.bot.handle } : {}),

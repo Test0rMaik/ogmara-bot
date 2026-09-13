@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { loadConfig } from './config.js';
+import { configPaths, loadConfig } from './config.js';
+import { FILE_ONLY_IN_OVERRIDES, leafPaths } from './settings.js';
+import { FILE_ONLY_SECTIONS } from './panel/settings.js';
 
 /**
  * Regression coverage for a real user-reported bug: `posting.maxPostsPerHour`
@@ -56,5 +58,47 @@ describe('posting.maxPostsPerHour', () => {
     // configure without a startup failure.
     const config = load('posting:\n  dryRun: false\n  maxPostsPerHour: 10');
     expect(config.posting.maxPostsPerHour).toBe(10);
+  });
+});
+
+describe('configPaths', () => {
+  it('declares EXACTLY the paths a fully populated config has', () => {
+    // The one test that catches the whole class. `configPaths` walks the Zod
+    // schema unwrapping optional/default/prefault; if a section ever gains a
+    // `.transform()` or `.pipe()`, `walkSchema` stops at it and every child
+    // under it becomes unsettable through the API — silently re-breaking the
+    // regression that made `profile.displayName` and `bot.handle` impossible to
+    // set, with an error blaming the operator for a typo.
+    //
+    // config.example.yaml exercises far more of the schema than a minimal file;
+    // the only legitimate difference is optional fields it leaves unset.
+    const config = loadConfig('config.example.yaml');
+    const present = new Set(leafPaths(config as unknown as Record<string, unknown>));
+    const declared = configPaths();
+
+    const missing = [...present].filter((p) => !declared.has(p));
+    expect(missing, 'settable paths missing from configPaths').toEqual([]);
+
+    // Everything declared but absent must be an optional field, not a typo.
+    const extra = [...declared].filter((p) => !present.has(p));
+    expect(extra.sort()).toEqual(
+      ['ai.baseUrl', 'profile.avatarCid', 'profile.bio', 'profile.displayName'].sort(),
+    );
+  });
+
+  it('reaches nested module paths, not just top-level sections', () => {
+    const declared = configPaths();
+    expect(declared.has('bot.rateLimit.perWalletPerMinute')).toBe(true);
+    expect(declared.has('sources.rss.feeds')).toBe(true);
+  });
+});
+
+describe('file-only section lists', () => {
+  it('the loader and the HTTP guard protect the SAME sections', () => {
+    // Two copies, deliberately — the guard gives a good error message, the
+    // loader is the one that actually has to hold. Nothing asserted they agreed,
+    // so a section added to one and not the other would be protected at the API
+    // and wide open in the file.
+    expect([...FILE_ONLY_IN_OVERRIDES].sort()).toEqual([...FILE_ONLY_SECTIONS].sort());
   });
 });

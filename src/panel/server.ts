@@ -23,6 +23,23 @@ import { TrustedProxies, isLoopback, resolveClientIp } from './clientip.js';
 import type { PostStats } from './posts.js';
 import { renderPage, renderScript } from './ui.js';
 import { FAVICON_SVG } from './favicon.js';
+import type { AuditEvent } from '../audit.js';
+import {
+  findDottedKeys,
+  getPath,
+  hasDangerousKey,
+  leafPaths,
+  type Overrides,
+} from '../settings.js';
+import { configPaths } from '../config.js';
+import {
+  FILE_ONLY_SECTIONS,
+  describeFields,
+  redact,
+  rejectFileOnlyPaths,
+  rejectUnknownPaths,
+  type DescribeInput,
+} from './settings.js';
 
 /** Largest request body accepted, for ordinary panel actions (every one fits in a few hundred bytes). */
 const MAX_BODY_BYTES = 16 * 1024;
@@ -148,6 +165,24 @@ export interface PanelDeps {
    * is self-healing in both directions rather than only on the happy path.
    */
   setRegistered: (registered: boolean) => void;
+  /** Everything the settings API needs. Absent means the API is not served. */
+  settings?: SettingsDeps;
+}
+
+/** Services backing the settings API. */
+export interface SettingsDeps {
+  /** The effective config, its raw layers, and per-field UI metadata. */
+  readonly describe: () => DescribeInput;
+  /** Apply a validated set of overrides, returning issues if it does not merge. */
+  readonly apply: (changes: Overrides) => { ok: true } | { ok: false; issues: string[] };
+  /** Drop one override so the field falls back to config.yaml. */
+  readonly reset: (path: string) => { ok: true } | { ok: false; issues: string[] };
+  /** Record an attempted change, applied or refused. */
+  readonly audit: (event: AuditEvent) => void;
+  /** Recent audit events, newest first. */
+  readonly readAudit: (limit: number) => Array<Record<string, unknown>>;
+  /** Which env-provided secrets are present. Never their values. */
+  readonly secretsPresent: () => Readonly<Record<string, boolean>>;
 }
 
 /** The `bot:` config section, projected for the panel. */
@@ -471,6 +506,36 @@ async function handle(
       walletBackupPending,
       bot: deps.botDescriptor(),
     });
+    return;
+  }
+
+  // ── Settings API ────────────────────────────────────────────────────
+  //
+  // Gated HARDER than everything above it. The rest of the panel renames a bot
+  // and registers a wallet; this reads and writes every setting. The localhost
+  // bypass is defensible for the former and not for the latter — anything that
+  // reaches loopback (another container on the host, any local process, a page
+  // that defeats the rebinding protections) would inherit it. So these routes
+  // require a real session even from 127.0.0.1.
+  if (path === '/api/settings' || path.startsWith('/api/settings/') || path === '/api/audit') {
+    if (deps.settings === undefined) {
+      sendJson(res, 404, { error: 'the settings API is not enabled' });
+      return;
+    }
+    // Resolved INDEPENDENTLY of the loopback bypass. `sessionAddress` above is
+    // deliberately undefined whenever the bypass applies, so reusing it here
+    // would refuse an operator who had actually signed in — the bypass must
+    // stop granting access without also stopping a real session from working.
+    const actor = verifySession(req, deps.auth);
+    if (actor === undefined) {
+      sendJson(res, 401, {
+        error:
+          'the settings API requires a signed-in session, even from localhost. ' +
+          'Sign in with a wallet listed in adminWallets.',
+      });
+      return;
+    }
+    await handleSettings(req, res, deps.settings, method, path, actor, clientIp);
     return;
   }
 
@@ -989,6 +1054,247 @@ function isRegistrationPending(state: PanelState, registeredOnChain: boolean): b
     return false;
   }
   return state.registrationBroadcastAt > 0 && !isRegistrationLatchExpired(state);
+}
+
+/**
+ * Body of a settings write.
+ *
+ * `changes` is a NESTED OBJECT mirroring the config shape —
+ * `{"posting":{"dryRun":true}}` — not a map of dotted paths. (An earlier
+ * version of this comment said dotted paths, and a dotted-key body was
+ * therefore accepted, persisted and reported saved while changing nothing:
+ * a safety control that said it had been set and had not.)
+ */
+interface SettingsWriteBody {
+  changes?: unknown;
+}
+
+/**
+ * Most settings one request may change.
+ *
+ * Bounds the audit log against a request built to flood it — see the check at
+ * the top of the PUT handler.
+ */
+const MAX_PATHS_PER_WRITE = 100;
+
+/**
+ * Longest reason recorded for one audit row.
+ *
+ * The row COUNT is capped above; this caps the row SIZE. A validation failure
+ * can produce kilobytes of issues, and replaying that per path turned a small
+ * request into hundreds of kilobytes of log.
+ */
+const MAX_AUDIT_REASON = 400;
+
+const truncate = (text: string, max: number): string =>
+  text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+
+/**
+ * Serve the settings API.
+ *
+ * Every write — accepted or refused — is audited before the response is sent,
+ * because the refusals are what an operator later goes looking for when a
+ * change "did not take".
+ */
+async function handleSettings(
+  req: IncomingMessage,
+  res: ServerResponse,
+  settings: SettingsDeps,
+  method: string,
+  path: string,
+  actor: string,
+  ip: string,
+): Promise<void> {
+  if (method === 'GET' && path === '/api/settings') {
+    const input = settings.describe();
+    sendJson(res, 200, {
+      fields: describeFields(input),
+      // Presence only. Never the value, not even masked — a masked value is
+      // still a value once it is in a response body, a browser cache or a
+      // proxy log. These are environment variables and are not editable here
+      // at all; the panel shows only whether each one is set.
+      secrets: settings.secretsPresent(),
+    });
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/audit') {
+    sendJson(res, 200, { events: settings.readAudit(200) });
+    return;
+  }
+
+  if (method === 'PUT' && path === '/api/settings') {
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonBody<SettingsWriteBody>(req, res);
+    if (body === undefined) return;
+
+    const changes = body.changes;
+    if (typeof changes !== 'object' || changes === null || Array.isArray(changes)) {
+      sendJson(res, 400, { error: '"changes" must be an object of config values' });
+      return;
+    }
+
+    // A literal dotted KEY is refused before anything flattens the shape.
+    // `{"posting.dryRun": false}` flattens to the same string as the real
+    // nested path, so every check below would wave it through — and Zod then
+    // strips the root key, so the write reports "saved" and changes nothing.
+    const dotted = findDottedKeys(changes as Overrides);
+    if (dotted.length > 0) {
+      const reason =
+        `"${dotted[0]}" is a single key containing a dot. Send nested objects ` +
+        '({"posting":{"dryRun":true}}), not dotted paths.';
+      settings.audit({ actor, ip, path: dotted[0]!, outcome: 'rejected', reason });
+      sendJson(res, 400, { error: reason, rejected: dotted });
+      return;
+    }
+
+    // One audit row per rejected path, with no cap on paths, made a single
+    // refused request write many times its own size to the log — enough to
+    // rotate it more than once and flush every earlier trace of what the
+    // session had done. Refused paths are logged BY DESIGN, which is exactly
+    // what made that work. No legitimate form submits anywhere near this many.
+    const paths = leafPaths(changes as Overrides);
+    if (paths.length > MAX_PATHS_PER_WRITE) {
+      settings.audit({
+        actor,
+        ip,
+        path: `(${paths.length} paths)`,
+        outcome: 'rejected',
+        reason: `a single write may change at most ${MAX_PATHS_PER_WRITE} settings`,
+      });
+      sendJson(res, 400, {
+        error: `a single write may change at most ${MAX_PATHS_PER_WRITE} settings`,
+      });
+      return;
+    }
+
+    // File-only sections are refused OUTRIGHT, not merely confirmed. See
+    // FILE_ONLY_SECTIONS for why this is stricter than a dialog.
+    const refused = rejectFileOnlyPaths(changes as Overrides);
+    if (refused.length > 0) {
+      for (const r of refused) {
+        settings.audit({ actor, ip, path: r.path, outcome: 'rejected', reason: truncate(r.reason, MAX_AUDIT_REASON) });
+      }
+      sendJson(res, 403, { error: refused[0]!.reason, rejected: refused });
+      return;
+    }
+
+    const before = settings.describe();
+
+    // A path the config does not have is refused rather than silently stripped
+    // by Zod — see rejectUnknownPaths for why a stripped key is worse than a
+    // rejected one.
+    // From the SCHEMA, not from the present values: those differ by every
+    // optional field that happens to be unset, and using the values made
+    // `profile.displayName`, `bot.handle` and friends permanently unsettable
+    // with an error blaming the operator for a typo they had not made.
+    const unknown = rejectUnknownPaths(changes as Overrides, configPaths());
+    if (unknown.length > 0) {
+      for (const u of unknown) {
+        settings.audit({ actor, ip, path: u.path, outcome: 'rejected', reason: truncate(u.reason, MAX_AUDIT_REASON) });
+      }
+      sendJson(res, 400, { error: unknown[0]!.reason, rejected: unknown });
+      return;
+    }
+
+    const result = settings.apply(changes as Overrides);
+    if (!result.ok) {
+      // ONE row, with a bounded reason. Writing a row per path, each carrying
+      // the full issue list, meant a small request could produce hundreds of
+      // kilobytes of log — enough to rotate away every earlier trace of what
+      // the session had done. Capping the path COUNT alone did not close that,
+      // because the amplification was in the row size.
+      settings.audit({
+        actor,
+        ip,
+        path: paths.length === 1 ? paths[0]! : `(${paths.length} paths)`,
+        outcome: 'rejected',
+        reason: truncate(result.issues.join('; '), MAX_AUDIT_REASON),
+      });
+      sendJson(res, 400, { error: 'the resulting configuration is not valid', issues: result.issues });
+      return;
+    }
+
+    const after = settings.describe();
+    const restartPending: string[] = [];
+    for (const p of leafPaths(changes as Overrides)) {
+      // Defaults to restart-pending when no module claimed the path: nothing
+      // re-reads the effective config after a write, so an unclaimed field is
+      // inert until the next boot and must not be reported as applied.
+      const meta = before.ui[p];
+      const outcome = meta?.restart === false ? 'applied' : 'restart-pending';
+      if (outcome === 'restart-pending') restartPending.push(p);
+      settings.audit({
+        actor,
+        ip,
+        path: p,
+        outcome,
+        // Redacted the same way the read path is: recording the credential
+        // here would write it down permanently, in the one file whose stated
+        // purpose is being safe to paste into a bug report.
+        from: redact(p, getPath(before.effective, p)),
+        to: redact(p, getPath(after.effective, p)),
+      });
+    }
+    // Never claim "saved and applied" for something that only landed on disk.
+    sendJson(res, 200, { status: 'saved', restartPending });
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/settings/reset') {
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonBody<{ path?: unknown }>(req, res);
+    if (body === undefined) return;
+    if (typeof body.path !== 'string' || body.path.length === 0) {
+      sendJson(res, 400, { error: '"path" is required' });
+      return;
+    }
+    const target = body.path;
+    if (hasDangerousKey(target)) {
+      const reason = 'that path manipulates the prototype chain and is refused';
+      settings.audit({ actor, ip, path: target, outcome: 'rejected', reason });
+      sendJson(res, 403, { error: reason });
+      return;
+    }
+    const section = target.split('.')[0] ?? '';
+    if (FILE_ONLY_SECTIONS.includes(section)) {
+      const reason = `"${section}" is configured in config.yaml only`;
+      settings.audit({ actor, ip, path: target, outcome: 'rejected', reason });
+      sendJson(res, 403, { error: reason });
+      return;
+    }
+
+    const before = settings.describe();
+    const result = settings.reset(target);
+    if (!result.ok) {
+      settings.audit({
+        actor,
+        ip,
+        path: target,
+        outcome: 'rejected',
+        reason: result.issues.join('; '),
+      });
+      sendJson(res, 400, { error: 'resetting that field leaves an invalid configuration', issues: result.issues });
+      return;
+    }
+    const after = settings.describe();
+    // Same restart semantics as a write: a reset is equally inert until the
+    // process reloads, and the two routes disagreeing about that is exactly the
+    // ambiguity the restart flag exists to remove.
+    const resetRestart = before.ui[target]?.restart !== false;
+    settings.audit({
+      actor,
+      ip,
+      path: target,
+      outcome: resetRestart ? 'restart-pending' : 'applied',
+      from: redact(target, getPath(before.effective, target)),
+      to: redact(target, getPath(after.effective, target)),
+    });
+    sendJson(res, 200, { status: 'reset', restartPending: resetRestart ? [target] : [] });
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
 }
 
 function sendSvg(res: ServerResponse, svg: string, csp: string): void {
