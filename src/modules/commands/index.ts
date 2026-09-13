@@ -550,6 +550,14 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       return;
     }
     const { invites, newestTs } = extractChannelInvites(notifications);
+    // Always logged, including the zero-result case — otherwise there is no
+    // way to tell "the poller ran and found nothing" apart from "the poller
+    // never ran," "it crashed silently," or "the invite never reached the
+    // node" from the operator's log alone.
+    ctx.log(
+      `Commands: checked for channel invites — ${notifications.length} notification(s), ` +
+        `${invites.length} invite(s)`,
+    );
     for (const invite of invites) {
       // Both wire strings from a payload another wallet controls, so both
       // get the same treatment reply text and error text get elsewhere in
@@ -591,16 +599,21 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         continue;
       }
       const name = forLog(facts.name);
-      if (facts.encrypted) {
-        ctx.warn(
-          `  warning: invited to channel ${invite.channelId} ("${name}") by ${invitedBy}, but ` +
-            'it is end-to-end encrypted — this build reads and replies in plaintext only, skipping',
-        );
-        continue;
-      }
       // Membership only — deliberately NOT added to cfg.channels/answering.
       // canPost is irrelevant here: even a read-public channel this wallet
       // cannot post in is a legitimate one to just be a member of.
+      //
+      // Joined EVEN IF encrypted, unlike the static bot.channels preflight
+      // check (which refuses one outright, since answering there would be
+      // pointless). An explicit invite is a channel owner asking for this
+      // wallet specifically, with no confirmation step on this wallet's
+      // side at any point in the pipeline — a private channel is currently
+      // the ONLY channel type the client UI can even invite to, so refusing
+      // to join it would make invite-driven auto-join a no-op in practice.
+      // This build still cannot decrypt or answer there; only membership
+      // (visible in the member list and to `get_channel_bots`) results.
+      // `bot.channels` remains the one and only thing that makes it answer
+      // anywhere, and its own preflight check is unaffected by this.
       if (ctx.config.posting.dryRun) {
         ctx.log(`  [dry run] would join channel ${invite.channelId} ("${name}"), invited by ${invitedBy}`);
         continue;
@@ -608,8 +621,11 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       try {
         await deps.joinChannel(invite.channelId);
         ctx.log(
-          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ` +
-            `${invitedBy}. Add it to bot.channels to answer commands there too.`,
+          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}.` +
+            (facts.encrypted
+              ? ' It is end-to-end encrypted, so this build cannot read or answer there — ' +
+                'membership only.'
+              : ' Add it to bot.channels to answer commands there too.'),
         );
       } catch (err) {
         ctx.warn(

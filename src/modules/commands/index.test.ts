@@ -457,7 +457,15 @@ describe('commands module auto-join', () => {
     expect(subscribeChannels).toHaveBeenCalledWith([7], expect.any(Function));
   });
 
-  it('skips an invite to an ENCRYPTED channel rather than joining it', async () => {
+  it('JOINS an invite to an ENCRYPTED channel — membership only, still cannot answer there', async () => {
+    // A private channel is currently the ONLY channel type the client UI can
+    // even invite to, so refusing to join an encrypted invite would make
+    // invite-driven auto-join a no-op in every real-world case that exists
+    // today. There is no confirmation step on this wallet's side anywhere in
+    // the pipeline (an explicit design choice — the bot owner never approves
+    // invites one by one), and joining costs nothing: this build still
+    // cannot decrypt or answer there, and `bot.channels` (unaffected by
+    // this) remains the only thing that makes it answer anywhere.
     const joinChannel = vi.fn(async (_id: number) => {});
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
       id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
@@ -474,7 +482,29 @@ describe('commands module auto-join', () => {
     await mod.preflight!(ctx);
     await (await mod.start(ctx)).stop();
 
-    expect(joinChannel).not.toHaveBeenCalledWith(99);
+    expect(joinChannel).toHaveBeenCalledWith(99);
+  });
+
+  it('does NOT add an encrypted invited channel to answering either', async () => {
+    // Same boundary as the plaintext case: membership must never expand
+    // bot.channels, encrypted or not.
+    const subscribeChannels = vi.fn(async (_channels: number[]) => () => {});
+    const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
+      id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
+    );
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7] })));
+    const mod = createCommandsModule(depsWith({ subscribeChannels, describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(subscribeChannels).toHaveBeenCalledWith([7], expect.any(Function));
   });
 
   it('does NOT join an invited channel in dry run either', async () => {
@@ -544,6 +574,25 @@ describe('commands module auto-join', () => {
     await mod.preflight!(ctx);
     await (await mod.start(ctx)).stop();
     expect(getNotifications).toHaveBeenCalledWith(0, 200, 'channel_invite');
+  });
+
+  it('logs a summary EVERY poll, including when nothing was found', async () => {
+    // REGRESSION GUARD. Without this, "the poller ran and found nothing new"
+    // is indistinguishable from "the poller never ran," "it crashed
+    // silently," or "the invite never reached the node" — the operator's
+    // log alone can't tell those apart, which is exactly what made a live
+    // reported "the bot doesn't seem to join" impossible to diagnose.
+    const log = vi.fn();
+    const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), log } as unknown as BotContext;
+    const getNotifications = vi.fn(async (_since?: number) => []);
+    const mod = createCommandsModule(depsWith({ getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    const summary = log.mock.calls.map((c) => String(c[0])).find((m) => m.includes('checked for channel invites'));
+    expect(summary).toBeDefined();
+    expect(summary).toContain('0 notification(s)');
+    expect(summary).toContain('0 invite(s)');
   });
 
   it('strips control characters from an attacker-chosen inviter address before logging it', async () => {

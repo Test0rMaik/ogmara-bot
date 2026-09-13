@@ -5,6 +5,37 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-09-13
+
+Found live-testing 0.24.0: a private-channel invite always hit the
+"end-to-end encrypted, skipping" branch and never joined — which is correct
+by the letter of the old rule, but since a private channel is currently the
+*only* channel type the client UI can even invite to, invite-driven
+auto-join was a no-op in every real-world case that existed. There was also
+no way to tell "the poller ran and found nothing" apart from "it never ran"
+from the operator's log alone, since a clean poll produced no output at all.
+
+### Changed
+
+- **The bot now joins an encrypted/private channel when explicitly
+  invited**, instead of refusing. There is no confirmation step on this
+  wallet's side anywhere in the auto-join pipeline by design (the operator
+  never approves invites one by one), and joining costs nothing: this build
+  still cannot decrypt or answer there — `bot.channels` remains the one and
+  only thing that makes it answer anywhere, and its own preflight check
+  (which still refuses to *answer* in an encrypted channel) is unaffected.
+  The success log now says so explicitly when the channel is encrypted.
+
+### Added
+
+- **A poll-cycle summary is now always logged**, including the zero-result
+  case: `Commands: checked for channel invites — N notification(s), M
+  invite(s)`. Previously a clean poll with nothing new produced no output
+  at all, making "the poller ran and found nothing" indistinguishable from
+  "it never ran," "it crashed silently," or "the invite never reached the
+  node" — exactly the ambiguity that made a live-reported "the bot doesn't
+  seem to join" impossible to diagnose from the bot's own logs.
+
 ## [0.24.0] - 2026-09-13
 
 The bot never joined a channel — it treated `bot.channels` as "already a
