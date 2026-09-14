@@ -5,6 +5,36 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-09-14
+
+Live-tested 0.26.0: the bot joined an invited channel, logged "will now
+answer commands there too," and then never answered anything sent there.
+Root-caused live with the operator: the channel is genuinely end-to-end
+encrypted (its messages carry `enc_content`; other clients decrypt them
+fine), but this build has **no channel-key handling of any kind** — it
+never listens for the `channel_members_changed` key-delivery event, and
+has no code to store or use a key even if it did. That is true for every
+channel, invited or configured, encrypted or not; the reason a
+`bot.channels`-configured channel has always worked is that preflight
+already refuses to start with an encrypted one listed there — never that
+the bot obtained a key for it. An invited channel has no equivalent
+startup check, and — separately — its `encryption_enabled` metadata is not
+a fully reliable predictor of whether its messages are actually encrypted
+(confirmed live: this channel's own metadata did not clearly say so).
+
+### Fixed
+
+- **The bot now verifies encryption empirically instead of trusting
+  metadata alone, and self-corrects.** `decodeChatPayload` gained an
+  `encrypted` signal — whether the decoded payload carries `enc_content` —
+  distinct from `content === null`: a real encrypted message decodes
+  successfully as msgpack with `content` as an empty STRING, not absent,
+  so the previous null-check could never have caught this case anyway.
+  The first message `handleMessage` receives from an auto-answer-granted
+  channel that carries `enc_content` revokes that channel's grant on the
+  spot (it remains a member) and logs why, instead of continuing to
+  silently do nothing while its own earlier log claimed otherwise.
+
 ## [0.26.0] - 2026-09-13
 
 Live-tested 0.25.0: joining now worked, but `/help` in an invited channel

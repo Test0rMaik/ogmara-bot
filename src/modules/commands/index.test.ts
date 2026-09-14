@@ -941,6 +941,70 @@ describe('commands module auto-join', () => {
     const saved = JSON.parse(readFileSync(statePath, 'utf8'));
     expect(saved.lastHandledTs).toBe(2000);
   });
+
+  it('revokes an auto-answer grant on the first genuinely undecodable (encrypted) message', async () => {
+    // REGRESSION GUARD for a live finding (2026-09-14): a channel's
+    // encryption_enabled metadata was wrong/absent even though its
+    // messages were genuinely v2-encrypted, so the channel got auto-
+    // answer-granted despite the bot being unable to ever read anything
+    // there. Rather than keep insisting on a metadata check that proved
+    // wrong, the bot must self-correct on real evidence: the FIRST message
+    // it actually receives there that carries enc_content.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+
+    // A real encrypted envelope: content is an EMPTY STRING (present, not
+    // null) alongside enc_content — matching the live raw payload this
+    // guard was built from, and specifically NOT the shape a naive
+    // `content === null` check would have caught.
+    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
+    const payloadWithEncContent = Array.from(
+      encode({ content: '', mentions: ['klv1bot'], enc_content: [1, 2, 3], enc_nonce: [4, 5, 6] }),
+    );
+    deliver({ ...encryptedMsg, payload: payloadWithEncContent } as Envelope);
+    await settle();
+
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).not.toContain(99);
+    await stop();
+  });
+
+  it('does NOT revoke anything for an ordinary empty/blank message — only a genuinely encrypted one', async () => {
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ reply, getNotifications }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+
+    deliver(msg('just chatting, not a command', { channel: 99, mentions: [] }));
+    await settle();
+    // Still granted — a blank/off-topic message is normal traffic, not
+    // evidence of encryption.
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
+
+    // And it still answers a real command afterward.
+    deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
+    await settle();
+    expect(reply).toHaveBeenCalledWith(99, expect.any(String), expect.any(Array));
+    await stop();
+  });
 });
 
 describe('commands module message handling', () => {

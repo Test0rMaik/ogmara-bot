@@ -831,7 +831,37 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     // live inside `payload` as msgpack bytes, which is why the SDK's
     // `parseCommand` takes a decoded object rather than an envelope. Decoding is
     // a trust boundary — see payload.ts.
-    const { content, mentions } = decodeChatPayload(envelope.payload);
+    const { content, mentions, encrypted } = decodeChatPayload(envelope.payload);
+    if (encrypted) {
+      // This build has no channel-key support at all, so it can NEVER read
+      // an actually-encrypted message, no matter what the channel's own
+      // metadata claimed when it was granted auto-answer. Found live: a
+      // channel's `encryption_enabled` flag can be wrong/absent even
+      // though its messages are genuinely v2-encrypted (human clients
+      // decrypt fine via the per-message key, entirely independent of that
+      // channel-level flag) — a real encrypted message decodes
+      // successfully as msgpack with `content` as an empty STRING, not
+      // `null`, which is exactly why this checks `enc_content`'s presence
+      // rather than trying to infer encryption from empty content. Rather
+      // than keep insisting a metadata check that just proved wrong,
+      // self-correct: one message with `enc_content` from an auto-GRANTED
+      // channel (never `cfg.channels` — the operator's own written-down
+      // list, not second-guessed here) is a strong enough signal, since a
+      // genuinely encrypted channel carries it on literally every message,
+      // not intermittently.
+      if (autoAnsweredChannels.delete(channelId)) {
+        saveAutoJoinState(cfg.autoJoin.statePath, {
+          lastHandledTs: loadAutoJoinState(cfg.autoJoin.statePath, ctx.warn).lastHandledTs,
+          answerChannelIds: [...autoAnsweredChannels],
+        });
+        ctx.warn(
+          `  warning: channel ${channelId} is end-to-end encrypted — this build cannot read or ` +
+            'answer there. Revoked its auto-answer grant (it remains a member); the channel\'s own ' +
+            'metadata said otherwise when it was granted.',
+        );
+      }
+      return;
+    }
     if (content === null) return;
 
     const parsed = parseCommand({ content, mentions }, me, cfg.handle ?? null);

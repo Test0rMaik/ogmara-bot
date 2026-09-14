@@ -52,9 +52,18 @@ const MAX_MENTION_CHARS = 128;
 export interface ChatPayload {
   readonly content: string | null;
   readonly mentions: string[];
+  /**
+   * True when the decoded payload carries `enc_content` — a genuinely v2
+   * encrypted message this build has no channel key for, distinct from an
+   * ordinary empty/blank message. A real encrypted message decodes
+   * successfully as msgpack (it is a normal envelope shape) with `content`
+   * as an empty STRING, not absent — so this can NOT be inferred from
+   * `content === null`; it needs its own signal.
+   */
+  readonly encrypted: boolean;
 }
 
-const EMPTY: ChatPayload = { content: null, mentions: [] };
+const EMPTY: ChatPayload = { content: null, mentions: [], encrypted: false };
 
 /**
  * Decode a chat envelope payload, defensively.
@@ -101,7 +110,11 @@ export function decodeChatPayload(payload: unknown): ChatPayload {
         )
       : [];
 
-    return { content, mentions };
+    // Presence, not content — this build never attempts to decrypt, so the
+    // actual bytes are irrelevant, only whether they're there at all.
+    const encrypted = obj['enc_content'] !== undefined && obj['enc_content'] !== null;
+
+    return { content, mentions, encrypted };
   } catch {
     return EMPTY;
   }

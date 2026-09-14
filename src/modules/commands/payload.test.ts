@@ -8,7 +8,7 @@ const wire = (obj: unknown): number[] => Array.from(encode(obj));
 describe('decodeChatPayload', () => {
   it('reads content and mentions out of a real msgpack payload', () => {
     const p = wire({ content: '/about', mentions: ['klv1bot'] });
-    expect(decodeChatPayload(p)).toEqual({ content: '/about', mentions: ['klv1bot'] });
+    expect(decodeChatPayload(p)).toEqual({ content: '/about', mentions: ['klv1bot'], encrypted: false });
   });
 
   it('accepts a Uint8Array as well as a number array', () => {
@@ -19,6 +19,41 @@ describe('decodeChatPayload', () => {
     expect(decodeChatPayload(wire({ content: '/help' }))).toEqual({
       content: '/help',
       mentions: [],
+      encrypted: false,
+    });
+  });
+
+  describe('encrypted flag', () => {
+    it('is true when the payload carries enc_content — a real v2 encrypted message', () => {
+      // REGRESSION GUARD. A real encrypted message decodes SUCCESSFULLY as
+      // msgpack (it is a normal envelope shape) with `content` as an EMPTY
+      // STRING, not absent — matching the live raw payload this was built
+      // from. `content === null` can never distinguish this case; only
+      // enc_content's presence can.
+      const p = wire({
+        content: '',
+        mentions: [],
+        enc_content: new Uint8Array([1, 2, 3]),
+        enc_nonce: new Uint8Array([4, 5, 6]),
+        key_epoch: 1,
+      });
+      const out = decodeChatPayload(p);
+      expect(out.encrypted).toBe(true);
+      expect(out.content).toBe(''); // present, empty — NOT null
+    });
+
+    it('is false for an ordinary plaintext message', () => {
+      expect(decodeChatPayload(wire({ content: '/about', mentions: [] })).encrypted).toBe(false);
+    });
+
+    it('is false (not a crash) for anything that fails to decode at all', () => {
+      expect(decodeChatPayload([0xc1, 0xff, 0x00]).encrypted).toBe(false);
+      expect(decodeChatPayload(null).encrypted).toBe(false);
+    });
+
+    it('treats an explicit null enc_content the same as absent', () => {
+      const p = wire({ content: '', mentions: [], enc_content: null });
+      expect(decodeChatPayload(p).encrypted).toBe(false);
     });
   });
 

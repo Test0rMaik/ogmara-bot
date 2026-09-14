@@ -1,6 +1,6 @@
 {
   "name": "ogmara-bot",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "Self-hostable, modular Ogmara bot — publishes AI-composed news posts and answers slash commands in channels",
   "type": "module",
   "bin": {
