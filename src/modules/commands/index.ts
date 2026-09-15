@@ -65,6 +65,16 @@ export interface CommandsDeps {
   /** Join a channel by id — a real signed write, subject to `posting.dryRun`. */
   readonly joinChannel: (channelId: number) => Promise<void>;
   /**
+   * Federate (replicate) a private channel from its host node, so this
+   * wallet's own node — which may have never heard of it, since private
+   * channels are host-node-scoped — learns its metadata/membership before a
+   * join is attempted. Like `joinChannel`, the caller gates this on
+   * `posting.dryRun`: it makes this wallet's node fetch from and cache data
+   * about another node, which "nothing reaches the network in dry run"
+   * should cover even though it isn't itself a signed publish.
+   */
+  readonly federateChannel: (channelId: number, hostUrl: string) => Promise<void>;
+  /**
    * Fetch this wallet's notifications, newest first, optionally since a
    * timestamp and/or filtered to one type. The type filter matters here: an
    * untyped page mixes every notification together, and a mention fires on
@@ -736,6 +746,50 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
             'see bot.channels to add it by hand',
         );
         continue;
+      }
+      if (facts === null && invite.anchorNode !== undefined) {
+        // This wallet's own node has never heard of the channel — the common
+        // case for a brand-new private channel, since private channels are
+        // host-node-scoped and only federate (replicate) on demand.
+        // `anchor_node` names the host; federate from there, then retry the
+        // describe once. A failure here (bad/unreachable host, this wallet's
+        // federation cap reached) is treated exactly like the pre-existing
+        // "cannot see it" case below, not a reason to abort the whole poll.
+        if (ctx.config.posting.dryRun) {
+          ctx.log(
+            `  [dry run] would federate channel ${invite.channelId} from ${forLog(invite.anchorNode)}`,
+          );
+          continue;
+        }
+        try {
+          await deps.federateChannel(invite.channelId, invite.anchorNode);
+        } catch (err) {
+          ctx.warn(
+            `  warning: invited to channel ${invite.channelId}` +
+              (noticeName !== undefined ? ` ("${noticeName}")` : '') +
+              ` by ${invitedBy}, but could not federate it from its host ` +
+              `(${forLog(String(err))}) — skipping`,
+          );
+          continue;
+        }
+        try {
+          facts = await deps.describeChannel(invite.channelId);
+        } catch (err) {
+          ctx.warn(
+            `  warning: could not check channel ${invite.channelId} after federating ` +
+              `(${forLog(String(err))}) — skipping`,
+          );
+          continue;
+        }
+        if (facts === 'unreachable') {
+          ctx.warn(
+            `  warning: invited to channel ${invite.channelId}` +
+              (noticeName !== undefined ? ` ("${noticeName}")` : '') +
+              ` by ${invitedBy}, but could not reach the node to re-check it after ` +
+              'federating — not retried, see bot.channels to add it by hand',
+          );
+          continue;
+        }
       }
       if (facts === null) {
         ctx.warn(

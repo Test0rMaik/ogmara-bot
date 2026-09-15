@@ -26,6 +26,14 @@ export interface ChannelInviteNotice {
   readonly channelName: string | undefined;
   readonly invitedBy: string;
   readonly timestamp: number;
+  /**
+   * Host node API endpoint for the invited channel (l2-node 0.130.0+,
+   * cross-node invite delivery) — a private channel is host-node-scoped, so
+   * this is what lets a channel this bot's own node has never heard of be
+   * federated before joining. `undefined` when the inviter's client didn't
+   * set it (older node, or the inviter's own node URL wasn't public https).
+   */
+  readonly anchorNode: string | undefined;
 }
 
 /** The shape `getNotifications` returns one entry as, narrowed to what this module reads. */
@@ -33,9 +41,13 @@ export interface RawNotification {
   readonly type: string;
   readonly channel_id?: string;
   readonly channel_name?: string;
+  readonly anchor_node?: string;
   readonly from: string;
   readonly timestamp: number;
 }
+
+/** Longest `anchor_node` string this module will act on — a sanity bound, not a URL validator (the node re-validates for real before ever fetching it). */
+const MAX_ANCHOR_NODE_CHARS = 2048;
 
 /**
  * Pull `channel_invite` entries out of a page of notifications, and report
@@ -56,11 +68,18 @@ export function extractChannelInvites(
     // a missing or non-numeric one is a malformed entry, not a channel to join.
     const channelId = n.channel_id !== undefined ? Number(n.channel_id) : NaN;
     if (!Number.isInteger(channelId) || channelId < 1) continue;
+    const anchorNode =
+      typeof n.anchor_node === 'string' &&
+      n.anchor_node.length > 0 &&
+      n.anchor_node.length <= MAX_ANCHOR_NODE_CHARS
+        ? n.anchor_node
+        : undefined;
     invites.push({
       channelId,
       channelName: n.channel_name,
       invitedBy: n.from,
       timestamp: n.timestamp,
+      anchorNode,
     });
   }
   return { invites, newestTs };

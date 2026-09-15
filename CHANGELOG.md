@@ -5,6 +5,42 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-09-15
+
+Cross-node private-channel invite delivery, the client half of l2-node
+0.130.0. Live-tested 0.28.0's channel-key handling: public channels worked
+end to end, but a fresh private channel invite only worked when the bot's
+home node had somehow already heard of that channel — a genuinely new
+private channel, invited on a node that had never federated it, never
+even produced an invite notification for the bot to act on. Root cause
+was entirely on the node side (`ChannelInvite` gossiped on the channel's
+own topic, which requires prior federation to be subscribed to at all —
+see l2-node 0.130.0's CHANGELOG for the full fix, including a critical
+access-control bypass its first version introduced and fixed same
+session).
+
+### Added
+
+- **The invite poller now federates a channel from its `anchor_node`
+  before joining, when this wallet's own node doesn't know the channel
+  yet.** l2-node 0.130.0 surfaces `anchor_node` (the channel's host node
+  URL) on `channel_invite` notifications; when `describeChannel` returns
+  null for an invited channel, the poller calls the SDK's existing
+  `federateChannel(channelId, hostUrl)` — the same step a human clicking
+  the invite link already triggers — then retries. A failure (bad/
+  unreachable host) is treated like any other unusable invite: logged,
+  skipped, the rest of the poll continues. Gated on `posting.dryRun` like
+  every other network-reaching step in this loop.
+- `@ogmara/sdk` bumped to `^0.60.0` for `Notification.anchor_node`.
+
+### Security
+
+- **`anchor_node`, an untrusted string from another wallet's invite, is
+  now sanitized with `forLog` before the one dry-run log line that had
+  been printing it raw** — found in this session's own code audit,
+  matching the same terminal-injection class already closed for
+  `invitedBy`/channel names elsewhere in this file.
+
 ## [0.28.0] - 2026-09-15
 
 Real channel-key handling, replacing 0.27.0's stop-gap. This wallet now has

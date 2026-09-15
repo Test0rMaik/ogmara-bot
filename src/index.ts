@@ -621,6 +621,9 @@ async function run(args: CliArgs): Promise<number> {
       joinChannel: async (channelId) => {
         await publisher.client.joinChannel(channelId);
       },
+      federateChannel: async (channelId, hostUrl) => {
+        await publisher.client.federateChannel(channelId, hostUrl);
+      },
       getNotifications: async (since, limit, type) => {
         const { notifications } = await publisher.client.getNotifications(since, limit, type);
         return notifications;

@@ -47,6 +47,7 @@ function depsWith(over: Partial<CommandsDeps> = {}): CommandsDeps {
     describeChannel: vi.fn(async () => publicChannel),
     publishDescriptor: vi.fn(async () => {}),
     joinChannel: vi.fn(async (_channelId: number) => {}),
+    federateChannel: vi.fn(async (_channelId: number, _hostUrl: string) => {}),
     getNotifications: vi.fn(async (_since?: number) => []),
     decryptChannelText: vi.fn(
       async (_channelId: number, _encContent: Uint8Array, _encNonce: Uint8Array, _keyEpoch: number) =>
@@ -1019,6 +1020,32 @@ describe('commands module auto-join', () => {
     expect(loggedInvitedBy).not.toMatch(/\x1b/);
   });
 
+  it('strips control characters from anchor_node before logging it in dry run', async () => {
+    // REGRESSION GUARD (code-audit finding, 2026-09-15). anchor_node comes
+    // from the SAME untrusted, other-wallet-controlled payload as
+    // invitedBy/channel_name — the dry-run federate log line was the one
+    // place that logged it without forLog first.
+    const log = vi.fn();
+    const ctx = { ...ctxWith(configWith(cfgWithAutoJoin(), true)), log } as unknown as BotContext;
+    const describeChannel = vi.fn(async (_id: number) => null);
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+      anchor_node: 'https://host.example\x1b[31mFAKE\x1b[0m',
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const mod = createCommandsModule(depsWith({ describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    const loggedFederate = log.mock.calls.map((c) => String(c[0])).find((m) => m.includes('federate'));
+    expect(loggedFederate).toBeDefined();
+    // eslint-disable-next-line no-control-regex
+    expect(loggedFederate).not.toMatch(/\x1b/);
+  });
+
   it('one invite whose describeChannel call throws does not abort the rest of the page', async () => {
     // Not reachable through the real wiring today (every real
     // describeChannel resolves rather than rejects), but the contract isn't
@@ -1044,6 +1071,108 @@ describe('commands module auto-join', () => {
     // NEXT poll re-fetch (and re-attempt) the whole page from scratch.
     const saved = JSON.parse(readFileSync(statePath, 'utf8'));
     expect(saved.lastHandledTs).toBe(2000);
+  });
+
+  it('federates a channel from anchor_node before joining when this wallet\'s node has never heard of it', async () => {
+    // Cross-node private-channel invite fix (2026-09-15): a brand-new
+    // private channel only exists on its host node until some node
+    // federates (replicates) it — describeChannel returning null for an
+    // invited channel means THIS wallet's own node has never heard of it,
+    // not that the channel doesn't exist. anchor_node names the host;
+    // federate from there, then the channel becomes locally known and the
+    // invite proceeds exactly like the already-working case.
+    let federated = false;
+    const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {
+      federated = true;
+    });
+    const describeChannel = vi.fn(async (id: number) => {
+      if (id === 99 && !federated) return null;
+      return publicChannel;
+    });
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+      anchor_node: 'https://host.example',
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(
+      depsWith({ federateChannel, describeChannel, joinChannel, getNotifications }),
+    );
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(federateChannel).toHaveBeenCalledWith(99, 'https://host.example');
+    expect(joinChannel).toHaveBeenCalledWith(99);
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
+  });
+
+  it('does NOT attempt to federate when the invite carries no anchor_node', async () => {
+    // Older node, or the inviter's own node URL wasn't a public https
+    // address — falls back to today's "cannot see it" outcome, unchanged.
+    const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {});
+    const describeChannel = vi.fn(async (id: number) => (id === 99 ? null : publicChannel));
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(federateChannel).not.toHaveBeenCalled();
+  });
+
+  it('skips an invite whose federate attempt fails, without aborting the rest of the poll', async () => {
+    const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {
+      throw new Error('host unreachable');
+    });
+    const joinChannel = vi.fn(async (_id: number) => {});
+    const describeChannel = vi.fn(async (id: number) => (id === 99 ? null : publicChannel));
+    const notifications: Notification[] = [
+      { type: 'channel_invite', channel_id: '99', from: 'klv1a', timestamp: 1000, anchor_node: 'https://host.example' },
+      { type: 'channel_invite', channel_id: '7', from: 'klv1b', timestamp: 2000 },
+    ];
+    const getNotifications = vi.fn(async (_since?: number) => notifications);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(
+      depsWith({ federateChannel, describeChannel, joinChannel, getNotifications }),
+    );
+    await mod.preflight!(ctx);
+    await expect((await mod.start(ctx)).stop()).resolves.toBeUndefined();
+
+    expect(joinChannel).toHaveBeenCalledWith(7);
+    expect(joinChannel).not.toHaveBeenCalledWith(99);
+    // The cursor must still advance past the failed one.
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.lastHandledTs).toBe(2000);
+  });
+
+  it('does NOT federate in dry run — nothing reaches the network', async () => {
+    const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {});
+    const describeChannel = vi.fn(async (id: number) => (id === 99 ? null : publicChannel));
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+      anchor_node: 'https://host.example',
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin(), true));
+    const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    expect(federateChannel).not.toHaveBeenCalled();
   });
 
   /** Build a real encrypted-message wire payload, as `buildEncryptedChannelMessage` would. */

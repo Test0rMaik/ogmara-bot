@@ -66,6 +66,52 @@ describe('extractChannelInvites', () => {
     ];
     expect(extractChannelInvites(notifications).invites).toEqual([]);
   });
+
+  it('carries anchor_node through as anchorNode (cross-node invite delivery)', () => {
+    const notifications: RawNotification[] = [
+      {
+        type: 'channel_invite',
+        channel_id: '12',
+        from: 'klv1owner',
+        timestamp: 200,
+        anchor_node: 'https://host.example',
+      },
+    ];
+    expect(extractChannelInvites(notifications).invites[0]?.anchorNode).toBe('https://host.example');
+  });
+
+  it('drops a malformed anchor_node rather than passing it on', () => {
+    const notifications: RawNotification[] = [
+      { type: 'channel_invite', channel_id: '1', from: 'klv1owner', timestamp: 1, anchor_node: '' },
+      {
+        type: 'channel_invite',
+        channel_id: '2',
+        from: 'klv1owner',
+        timestamp: 2,
+        anchor_node: 'x'.repeat(2049),
+      },
+    ];
+    const { invites } = extractChannelInvites(notifications);
+    expect(invites[0]?.anchorNode).toBeUndefined();
+    expect(invites[1]?.anchorNode).toBeUndefined();
+  });
+
+  it('keeps anchor_node exactly at the length cap, drops one byte over it', () => {
+    const notifications: RawNotification[] = [
+      { type: 'channel_invite', channel_id: '1', from: 'klv1owner', timestamp: 1, anchor_node: 'x'.repeat(2048) },
+      { type: 'channel_invite', channel_id: '2', from: 'klv1owner', timestamp: 2, anchor_node: 'x'.repeat(2049) },
+    ];
+    const { invites } = extractChannelInvites(notifications);
+    expect(invites[0]?.anchorNode).toBe('x'.repeat(2048));
+    expect(invites[1]?.anchorNode).toBeUndefined();
+  });
+
+  it('leaves anchorNode undefined when the notification has no anchor_node (older node)', () => {
+    const notifications: RawNotification[] = [
+      { type: 'channel_invite', channel_id: '12', from: 'klv1owner', timestamp: 200 },
+    ];
+    expect(extractChannelInvites(notifications).invites[0]?.anchorNode).toBeUndefined();
+  });
 });
 
 describe('auto-join state persistence', () => {
