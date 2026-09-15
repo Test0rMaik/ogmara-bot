@@ -103,10 +103,27 @@ export function renderPage(ctx: PageContext): string {
 
   .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem; }
 
-  /* ── Sidebar rail (primary nav) ── */
-  .app-grid { display: grid; grid-template-columns: 210px 1fr; gap: 1.5rem; align-items: start; }
+  /* ── Sidebar rail (primary nav) ──
+   * Deliberately stays INSIDE the page's own centered/max-width container
+   * (see body, above) rather than breaking out to an edge-to-edge app-shell
+   * sidebar flush against the browser viewport — the latter reads as
+   * lopsided on a very wide screen, with the rail pinned left and a huge
+   * gap of empty space accumulating only on the right of the content.
+   */
+  .app-grid { display: grid; grid-template-columns: 220px 1fr; gap: 1.5rem; align-items: start; }
   @media (max-width: 720px) { .app-grid { grid-template-columns: 1fr; } }
   .rail { display: flex; flex-direction: column; gap: 0.15rem; position: sticky; top: 1rem; }
+  .rail-header { display: flex; align-items: center; gap: 0.6rem; padding: 0.2rem 0.6rem 0.9rem;
+                 margin-bottom: 0.4rem; border-bottom: 1px solid var(--border); }
+  .rail-avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; overflow: hidden;
+                 display: grid; place-items: center; background: var(--accent); color: var(--accent-fg);
+                 font-weight: 700; font-size: 0.85rem; }
+  .rail-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .rail-identity { display: flex; flex-direction: column; min-width: 0; }
+  .rail-identity-name { font-weight: 600; font-size: 0.9rem; color: var(--fg); overflow: hidden;
+                         text-overflow: ellipsis; white-space: nowrap; }
+  .rail-identity-handle { font-size: 0.72rem; color: var(--muted); font-family: ui-monospace, monospace;
+                           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rail-item { display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left;
                background: none; color: var(--fg-secondary); border: none; border-radius: 8px;
                padding: 0.55rem 0.6rem; font: inherit; font-size: 0.9rem; cursor: pointer; }
@@ -116,11 +133,16 @@ export function renderPage(ctx: PageContext): string {
                             display: grid; place-items: center; flex: none; font-size: 0.8rem; }
   .rail-item.active .rail-glyph { background: var(--accent); color: var(--accent-fg); }
   .rail-subnav { display: flex; flex-direction: column; gap: 0.1rem; margin: 0.15rem 0 0.4rem 1.5rem; }
-  .rail-subitem { display: block; width: 100%; text-align: left; background: none; color: var(--muted);
+  .rail-subitem { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
+                  width: 100%; text-align: left; background: none; color: var(--muted);
                   border: none; border-radius: 6px; padding: 0.35rem 0.5rem; font: inherit; font-size: 0.8rem;
                   cursor: pointer; }
   .rail-subitem:hover:not(.active) { color: var(--fg-secondary); background: var(--surface-sunken); }
   .rail-subitem.active { color: var(--accent); background: var(--chip-bg); }
+  .rail-subitem-count { flex: none; min-width: 1.3em; padding: 0.05rem 0.35rem; border-radius: 999px;
+                         background: var(--surface-sunken); color: var(--muted); font-size: 0.68rem;
+                         text-align: center; font-variant-numeric: tabular-nums; }
+  .rail-subitem.active .rail-subitem-count { background: var(--accent); color: var(--accent-fg); }
   .rail-main { min-width: 0; }
 
   .quick-stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0 0 1.2rem; }
@@ -190,6 +212,9 @@ export function renderPage(ctx: PageContext): string {
   .config-toolbar { display: flex; gap: 0.6rem; align-items: center; margin: 1rem 0; position: sticky; bottom: 0;
                     background: var(--bg); padding: 0.6rem 0; border-top: 1px solid var(--border); }
   .config-toolbar .muted { flex: 1; }
+  #config-unsaved-note:not(:empty) { flex: 1; padding: 0.3rem 0.65rem; border-radius: 6px;
+                                      background: var(--banner-bg); border: 1px solid var(--banner-border);
+                                      color: var(--banner-fg); font-size: 0.82rem; }
 
   /* ── Audit log tab ── */
   .audit-filters { display: flex; gap: 0.7rem; flex-wrap: wrap; align-items: flex-end; margin-bottom: 1rem; }
@@ -259,6 +284,16 @@ export function renderPage(ctx: PageContext): string {
 
     <div class="app-grid">
     <nav class="rail" aria-label="Panel sections">
+      <div class="rail-header">
+        <span class="rail-avatar">
+          <img id="rail-identity-avatar" alt="" hidden>
+          <span id="rail-identity-avatar-fallback" aria-hidden="true"></span>
+        </span>
+        <span class="rail-identity">
+          <span class="rail-identity-name" id="rail-identity-name">ogmara-bot</span>
+          <span class="rail-identity-handle" id="rail-identity-handle"></span>
+        </span>
+      </div>
       <button class="rail-item active" id="tab-btn-dashboard" data-tab="dashboard">
         <span class="rail-glyph" aria-hidden="true">◔</span><span data-i18n="nav.dashboard">Dashboard</span>
       </button>
@@ -346,7 +381,7 @@ export function renderPage(ctx: PageContext): string {
         "Reset" removes the override and goes back to following the file.
       </p>
       <p id="config-error" class="error"></p>
-      <div id="config-secrets" class="card"></div>
+      <div id="config-secrets" class="card" data-topic="panel"></div>
       <div id="config-sections"></div>
       <div class="config-toolbar">
         <span class="muted" id="config-unsaved-note"></span>
@@ -1209,6 +1244,10 @@ async function refresh() {
   }
 
   renderBotIdentity(status.bot);
+  // Not awaited: the sidebar header is a nice-to-have, not something the
+  // rest of login should wait on. Silent — see refreshProfile()'s own
+  // comment on why a background fetch shouldn't surface an error banner.
+  void refreshProfile({ silent: true });
 
   const registerBtn = document.getElementById('register-btn');
   if (status.registered) {
@@ -1247,6 +1286,13 @@ async function updateProfile() {
     // unsaved edit — the next refreshProfile() (e.g. after switching tabs
     // and back) should feel free to re-sync it from the server again.
     displayNameDirty = false;
+    // The sidebar header shows this same name on every destination, not
+    // just the Account tab — without this it kept showing the OLD name
+    // until the operator happened to leave and re-enter Account, since
+    // renderRailHeader() is only ever called from inside refreshProfile().
+    // Silent: a re-fetch failing here must not stomp the success message
+    // just shown above for a save that, in fact, already went through.
+    void refreshProfile({ silent: true });
   } catch (err) {
     showError(err.message || String(err));
   }
@@ -1276,9 +1322,46 @@ function setAvatarPreviewBlobUrl(url) {
 /** Load the bot's current profile and show it — the display name input was
  *  previously always blank regardless of what was actually set, which read
  *  as "no name configured" even when one genuinely was. */
-async function refreshProfile() {
+/**
+ * Truncate a klv1… address to a "first6…last4" form for a tight sidebar
+ * line — the full address is already shown in full (and copyable) in the
+ * page header above, so this is purely a space-constrained shorthand.
+ */
+function shortenAddress(address) {
+  if (typeof address !== 'string' || address.length <= 14) return address;
+  return address.slice(0, 6) + '…' + address.slice(-4);
+}
+
+/**
+ * The sidebar's persistent identity block — shown regardless of which
+ * destination is active, so it's populated from \`refreshProfile()\` (called
+ * once at login, not only when the Account tab happens to be open) rather
+ * than being tied to that tab's own lifecycle.
+ */
+function renderRailHeader(profile) {
+  const name = (profile && profile.displayName) || 'ogmara-bot';
+  document.getElementById('rail-identity-name').textContent = name;
+  const tagline = document.getElementById('brand-tagline');
+  document.getElementById('rail-identity-handle').textContent = shortenAddress(tagline ? tagline.dataset.bot : '');
+
+  const img = document.getElementById('rail-identity-avatar');
+  const fallback = document.getElementById('rail-identity-avatar-fallback');
+  if (profile && profile.avatarCid) {
+    img.src = profile.nodeUrl + '/api/v1/media/' + encodeURIComponent(profile.avatarCid);
+    img.hidden = false;
+    fallback.hidden = true;
+  } else {
+    img.hidden = true;
+    fallback.hidden = false;
+    fallback.textContent = name.trim().charAt(0).toUpperCase() || '?';
+  }
+}
+
+async function refreshProfile(opts) {
+  const silent = Boolean(opts && opts.silent);
   try {
     const profile = await api('/api/profile', { method: 'GET' });
+    renderRailHeader(profile);
     const nameInput = document.getElementById('display-name');
     // Only prefill while the operator hasn't touched the field this session
     // (tracked explicitly via displayNameDirty, not just "is it empty" —
@@ -1304,7 +1387,12 @@ async function refreshProfile() {
       }
     }
   } catch (err) {
-    showError(err.message || String(err));
+    // Silent for the background call \`refresh()\` makes at login purely to
+    // populate the sidebar header — a transient failure there shouldn't
+    // greet the operator with an error banner before they've done anything.
+    // An operator-triggered visit to the Account tab (the default, no
+    // \`opts\`) still surfaces it exactly as before.
+    if (!silent) showError(err.message || String(err));
   }
 }
 
@@ -1530,7 +1618,22 @@ function renderConfigSubnav() {
     btn.type = 'button';
     btn.className = 'rail-subitem' + (group.id === currentConfigTopic ? ' active' : '');
     btn.dataset.topic = group.id;
-    btn.textContent = group.labelKey ? t(group.labelKey) : humanizeFieldLabel(group.id);
+
+    const label = document.createElement('span');
+    label.textContent = group.labelKey ? t(group.labelKey) : humanizeFieldLabel(group.id);
+    btn.appendChild(label);
+
+    // How many fields actually live under this topic — zero (before
+    // configFields has ever loaded, e.g. at page init) is shown as nothing
+    // rather than a "0" that would read as "this topic is empty."
+    const count = configFields.filter((f) => topicForSection(f.path.split('.')[0]) === group.id).length;
+    if (count > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'rail-subitem-count';
+      badge.textContent = String(count);
+      btn.appendChild(badge);
+    }
+
     btn.addEventListener('click', () => selectConfigTopic(group.id));
     host.appendChild(btn);
   }
@@ -1541,13 +1644,32 @@ function selectConfigTopic(topicId) {
   for (const btn of document.querySelectorAll('#config-subnav .rail-subitem')) {
     btn.classList.toggle('active', btn.dataset.topic === topicId);
   }
-  applyConfigTopicFilter();
+  // A rail sub-item is a full navigation destination, reachable from
+  // anywhere (Dashboard, Account, Audit log) — not just a filter control
+  // that only works once Configuration already happens to be open. Set
+  // BEFORE switching: switchTab('config') triggers refreshConfig(), which
+  // re-renders every section and re-filters using currentConfigTopic, so
+  // the correct topic is showing the instant the page arrives.
+  if (document.getElementById('tab-config').hidden) {
+    switchTab('config');
+  } else {
+    // Already on Configuration with sections already rendered — just
+    // re-filter client-side, instantly, no re-fetch.
+    applyConfigTopicFilter();
+  }
 }
 
 function applyConfigTopicFilter() {
   for (const sectionEl of document.querySelectorAll('#config-sections .config-section')) {
     sectionEl.hidden = sectionEl.dataset.topic !== currentConfigTopic;
   }
+  // Not a config-section (it's env-var presence, not a config.yaml field),
+  // but it's exactly as topic-scoped a concept — showing it under every
+  // single topic buried it in noise and made it look sticky/misplaced.
+  // Parked under Panel & Security, alongside the rest of what this bot
+  // treats as security-sensitive.
+  const secrets = document.getElementById('config-secrets');
+  secrets.hidden = currentConfigTopic !== 'panel';
 }
 
 let configFields = [];
@@ -1625,11 +1747,28 @@ function fieldIsDirty(field) {
 }
 
 function updateConfigToolbar() {
-  const dirtyCount = configFields.filter(fieldIsDirty).length;
+  const dirty = configFields.filter(fieldIsDirty);
+  const dirtyCount = dirty.length;
   document.getElementById('config-save-btn').disabled = dirtyCount === 0;
   document.getElementById('config-discard-btn').hidden = dirtyCount === 0;
   const note = document.getElementById('config-unsaved-note');
-  note.textContent = dirtyCount === 0 ? '' : t('config.unsavedCount', { count: dirtyCount });
+  if (dirtyCount === 0) {
+    note.textContent = '';
+    return;
+  }
+  // Tells the operator what's actually about to happen, not just a bare
+  // count — the whole point of the restart/live badges on each field is
+  // wasted if the summary line at the bottom doesn't carry the same
+  // information forward.
+  const liveCount = dirty.filter((f) => f.restart === false).length;
+  const restartCount = dirtyCount - liveCount;
+  if (restartCount === 0) {
+    note.textContent = t('config.toolbar.allLive', { count: dirtyCount });
+  } else if (liveCount === 0) {
+    note.textContent = t('config.toolbar.allRestart', { count: dirtyCount });
+  } else {
+    note.textContent = t('config.toolbar.mixed', { count: dirtyCount, live: liveCount, restart: restartCount });
+  }
 }
 
 /** Build the editor widget for one field's value; returns the element and a getter for its current value. */

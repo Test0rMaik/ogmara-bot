@@ -5,6 +5,40 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-09-15
+
+Live-tested follow-up to 0.30.0's panel redesign, and a closer visual match
+to the approved sidebar-rail concept.
+
+### Fixed
+
+- **A Configuration sub-nav item did nothing when clicked from anywhere
+  other than the Configuration tab itself** (Dashboard, Account, Audit log,
+  or before Configuration had ever been opened) — `selectConfigTopic` only
+  ever re-filtered already-rendered sections; there was nothing on screen
+  to filter until Configuration had been visited at least once. It now
+  navigates to Configuration first when needed, landing directly on the
+  topic that was clicked.
+- **The Secrets card showed under every single Configuration topic**, not
+  just one — it lived outside the per-topic filtering entirely. Scoped to
+  Panel & Security, the one topic it actually belongs to.
+
+### Added
+
+- **A persistent sidebar identity header** (avatar + display name +
+  shortened wallet address), visible on every destination, not just
+  Account — populated at login, kept in sync after a display-name save.
+- **Per-topic field-count badges** in the Configuration sub-nav.
+- **The sticky bottom save bar now says what will actually happen**, not
+  just a bare count — "N changes — applied instantly, no restart needed,"
+  "N changes need a restart," or a live/restart split when a save mixes
+  both — instead of "{count} unsaved change(s)."
+- Kept the whole rail — including the new header — inside the page's
+  existing centered, max-width container, rather than an edge-to-edge
+  sidebar flush to the browser's left edge: the latter reads as lopsided
+  on a very wide screen, with the rail pinned left and empty space
+  accumulating only on the right.
+
 ## [0.30.0] - 2026-09-15
 
 A rework of the settings panel around a sidebar-rail layout, and — the bigger

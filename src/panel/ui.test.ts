@@ -582,6 +582,20 @@ describe('profile: current display name and avatar', () => {
     expect(extractFunction(script, 'updateProfile')).toContain('displayNameDirty = false;');
   });
 
+  it('refreshes the sidebar header (silently) after a successful display-name save', () => {
+    // REGRESSION GUARD (code audit): renderRailHeader() is only ever called
+    // from inside refreshProfile() — without this, the sidebar kept showing
+    // the OLD name until the operator happened to leave and re-enter the
+    // Account tab, even though the save itself had already succeeded.
+    // Silent, not a plain refreshProfile() call: a re-fetch failing here
+    // must not stomp the success toast just shown for a save that, in
+    // fact, already went through.
+    const fn = extractFunction(script, 'updateProfile');
+    expect(fn).toMatch(/refreshProfile\(\{\s*silent:\s*true\s*\}\)/);
+    // Ordering: after the success toast and the dirty-flag clear, not before.
+    expect(fn.indexOf('showSuccess(')).toBeLessThan(fn.indexOf('refreshProfile('));
+  });
+
   it('builds the avatar preview URL from nodeUrl + the media endpoint, and hides it when there is no avatar', () => {
     const fn = extractFunction(script, 'refreshProfile');
     expect(fn).toContain("'/api/v1/media/'");
@@ -1189,5 +1203,207 @@ describe('optional string fields can be cleared back to unset', () => {
     // way to clear one through the panel except by hand-editing a file.
     const fn = extractFunction(script, 'buildFieldInput');
     expect(fn).toContain("onChange(input.value === '' ? undefined : input.value);");
+  });
+});
+
+describe('selectConfigTopic: a rail sub-item is a full destination, not a filter that only works from inside Configuration', () => {
+  it("navigates to the config tab when it isn't already the active one", () => {
+    // REGRESSION GUARD (live, user-reported): clicking a Configuration
+    // sub-item from Dashboard/Account/Audit log — or before Configuration
+    // had ever been opened at all — silently did nothing, because
+    // selectConfigTopic only ever re-filtered ALREADY-rendered sections. It
+    // never switched the visible tab, so on a page where #tab-config was
+    // still hidden there was nothing on screen to filter.
+    const fn = extractFunction(script, 'selectConfigTopic');
+    expect(fn).toMatch(/if\s*\(\s*document\.getElementById\('tab-config'\)\.hidden\s*\)\s*\{\s*switchTab\('config'\)/);
+  });
+
+  it('does NOT re-navigate (and re-fetch) when already on Configuration — just re-filters client-side', () => {
+    // The opposite failure mode: switching topics while already inside
+    // Configuration must stay instant, not trigger a fresh /api/settings
+    // fetch on every click.
+    const fn = extractFunction(script, 'selectConfigTopic');
+    const elseIdx = fn.indexOf('} else {');
+    expect(elseIdx).toBeGreaterThan(-1);
+    expect(fn.slice(elseIdx)).toContain('applyConfigTopicFilter();');
+  });
+
+  it('sets currentConfigTopic and updates rail-subitem active state BEFORE navigating', () => {
+    // switchTab('config') triggers refreshConfig(), which re-renders every
+    // section and re-filters using currentConfigTopic — so the topic must
+    // already be set by the time that fires, or the newly-loaded page would
+    // show the WRONG (previously selected, or default) topic for one beat.
+    const fn = extractFunction(script, 'selectConfigTopic');
+    const setIdx = fn.indexOf('currentConfigTopic = topicId');
+    const switchIdx = fn.indexOf("switchTab('config')");
+    expect(setIdx).toBeGreaterThan(-1);
+    expect(switchIdx).toBeGreaterThan(-1);
+    expect(setIdx).toBeLessThan(switchIdx);
+  });
+});
+
+describe('applyConfigTopicFilter: the Secrets card is topic-scoped too', () => {
+  it('is not shown on every topic — only Panel & Security', () => {
+    // REGRESSION GUARD (live, user-reported): #config-secrets lived outside
+    // #config-sections entirely, so it was never touched by the per-topic
+    // hide/show sweep and stayed visible under every single rail sub-item —
+    // "sticky", with no topic it actually belonged to.
+    const fn = extractFunction(script, 'applyConfigTopicFilter');
+    expect(fn).toMatch(/getElementById\('config-secrets'\)/);
+    expect(fn).toMatch(/\.hidden\s*=\s*currentConfigTopic\s*!==\s*'panel'/);
+  });
+
+  it('the #config-secrets element itself is tagged for the panel topic in the markup', () => {
+    expect(page).toMatch(/<div id="config-secrets" class="card" data-topic="panel">/);
+  });
+});
+
+describe('shortenAddress: REAL execution', () => {
+  function loadShortenAddress(): (address: unknown) => unknown {
+    const fn = extractFunction(script, 'shortenAddress');
+    return new Function(`${fn}\nreturn shortenAddress;`)() as (address: unknown) => unknown;
+  }
+
+  it('truncates a full klv1… address to first6…last4', () => {
+    const shortenAddress = loadShortenAddress();
+    expect(shortenAddress('klv1vh32t20qcz3u23q7y8v32fce44mkjk4lx6ehn0te76w0ruqvwd0s8sgva0')).toBe('klv1vh…gva0');
+  });
+
+  it('leaves a short string untouched rather than mangling it', () => {
+    const shortenAddress = loadShortenAddress();
+    expect(shortenAddress('short')).toBe('short');
+  });
+
+  it('passes through a non-string value unchanged, rather than throwing', () => {
+    const shortenAddress = loadShortenAddress();
+    expect(shortenAddress(undefined)).toBeUndefined();
+    expect(shortenAddress('')).toBe('');
+  });
+});
+
+describe('updateConfigToolbar: REAL execution — the summary line matches what actually happens', () => {
+  function loadUpdateConfigToolbar(
+    fields: Array<{ path: string; restart: boolean; value: unknown; pending: unknown }>,
+  ): {
+    noteText: string;
+    saveDisabled: boolean;
+    discardHidden: boolean;
+  } {
+    const fieldIsDirtyFn = extractFunction(script, 'fieldIsDirty');
+    const fieldCurrentValueFn = extractFunction(script, 'fieldCurrentValue');
+    const updateConfigToolbarFn = extractFunction(script, 'updateConfigToolbar');
+
+    const elements: Record<string, { disabled: boolean; hidden: boolean; textContent: string }> = {
+      'config-save-btn': { disabled: false, hidden: false, textContent: '' },
+      'config-discard-btn': { disabled: false, hidden: false, textContent: '' },
+      'config-unsaved-note': { disabled: false, hidden: false, textContent: '' },
+    };
+    const document = {
+      getElementById: (id: string) => elements[id],
+    };
+    // `pending` is set to a DIFFERENT value than `value` for every field
+    // passed in below, which is what actually makes fieldIsDirty() true —
+    // the translations themselves are exercised elsewhere (i18n.test.ts);
+    // this only needs the RIGHT KEY and the RIGHT COUNTS to reach t(), so a
+    // passthrough stand-in is enough to see which branch actually fired.
+    const t = (key: string, vars?: Record<string, unknown>): string =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key;
+
+    const sandbox = new Function(
+      'configFields',
+      'configPending',
+      'document',
+      't',
+      `
+      ${fieldCurrentValueFn}
+      ${fieldIsDirtyFn}
+      ${updateConfigToolbarFn}
+      updateConfigToolbar();
+      `,
+    );
+    const configPending: Record<string, unknown> = {};
+    for (const f of fields) configPending[f.path] = f.pending;
+    sandbox(fields, configPending, document, t);
+
+    return {
+      noteText: elements['config-unsaved-note']!.textContent,
+      saveDisabled: elements['config-save-btn']!.disabled,
+      discardHidden: elements['config-discard-btn']!.hidden,
+    };
+  }
+
+  it('clears the note and disables Save when nothing is dirty', () => {
+    const result = loadUpdateConfigToolbar([]);
+    expect(result.noteText).toBe('');
+    expect(result.saveDisabled).toBe(true);
+  });
+
+  it('uses the all-live phrasing when every dirty field is restart: false', () => {
+    const result = loadUpdateConfigToolbar([
+      { path: 'posting.dryRun', restart: false, value: false, pending: true },
+      { path: 'posting.maxPostsPerHour', restart: false, value: 1, pending: 9 },
+    ]);
+    expect(result.noteText).toContain('config.toolbar.allLive');
+    expect(result.noteText).toContain('"count":2');
+    expect(result.saveDisabled).toBe(false);
+  });
+
+  it('uses the all-restart phrasing when every dirty field needs a restart', () => {
+    const result = loadUpdateConfigToolbar([
+      { path: 'node.url', restart: true, value: 'https://old.example', pending: 'https://new.example' },
+    ]);
+    expect(result.noteText).toContain('config.toolbar.allRestart');
+    expect(result.noteText).toContain('"count":1');
+  });
+
+  it('uses the mixed phrasing, with correct live/restart sub-counts, when both are present', () => {
+    const result = loadUpdateConfigToolbar([
+      { path: 'posting.dryRun', restart: false, value: false, pending: true },
+      { path: 'node.url', restart: true, value: 'https://old.example', pending: 'https://new.example' },
+      { path: 'node.network', restart: true, value: 'testnet', pending: 'mainnet' },
+    ]);
+    expect(result.noteText).toContain('config.toolbar.mixed');
+    expect(result.noteText).toContain('"count":3');
+    expect(result.noteText).toContain('"live":1');
+    expect(result.noteText).toContain('"restart":2');
+  });
+});
+
+describe('renderConfigSubnav: per-topic field-count badges', () => {
+  it('computes each badge from the number of loaded fields belonging to that topic', () => {
+    const fn = extractFunction(script, 'renderConfigSubnav');
+    expect(fn).toMatch(/configFields\.filter\(\(f\) => topicForSection\(f\.path\.split\('\.'\)\[0\]\) === group\.id\)\.length/);
+  });
+
+  it('only renders a badge when the count is greater than zero', () => {
+    const fn = extractFunction(script, 'renderConfigSubnav');
+    expect(fn).toMatch(/if\s*\(count > 0\)/);
+  });
+});
+
+describe('sidebar identity header (avatar + name + handle)', () => {
+  it('the markup exists inside the rail, above the primary nav items', () => {
+    expect(page).toContain('<div class="rail-header">');
+    expect(page).toContain('id="rail-identity-avatar"');
+    expect(page).toContain('id="rail-identity-name"');
+    expect(page).toContain('id="rail-identity-handle"');
+  });
+
+  it('falls back to a generic name and an initial-letter avatar when no profile is available', () => {
+    const fn = extractFunction(script, 'renderRailHeader');
+    expect(fn).toMatch(/\|\|\s*'ogmara-bot'/);
+    expect(fn).toContain('fallback.textContent');
+  });
+
+  it('is populated once at login (refresh()), not only when the Account tab is opened', () => {
+    // REGRESSION GUARD: the header is visible on every destination, so it
+    // must not depend on the operator having visited Account first.
+    const fn = extractFunction(script, 'refresh');
+    expect(fn).toMatch(/refreshProfile\(\{\s*silent:\s*true\s*\}\)/);
+  });
+
+  it('a login-time profile-fetch failure does not surface an error banner', () => {
+    const fn = extractFunction(script, 'refreshProfile');
+    expect(fn).toMatch(/if\s*\(!silent\)\s*showError/);
   });
 });
