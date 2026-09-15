@@ -69,6 +69,30 @@ describe('Ledger', () => {
     expect(ledger.has('new')).toBe(true);
   });
 
+  describe('setRetentionDays', () => {
+    it('takes effect on the next prune, without a restart', () => {
+      const ledger = Ledger.load(path, 30);
+      const twentyDaysAgo = Date.now() - 20 * 86_400_000;
+      ledger.record(entry('mid', 'In the middle', twentyDaysAgo));
+      // Still inside the 30-day window as loaded.
+      expect(ledger.has('mid')).toBe(true);
+      // Shrink retention to 10 days, live — the next prune (any record())
+      // must now drop the 20-day-old entry it was keeping a moment ago.
+      ledger.setRetentionDays(10);
+      ledger.record(entry('new', 'Fresh'));
+      expect(ledger.has('mid')).toBe(false);
+      expect(ledger.has('new')).toBe(true);
+    });
+
+    it('a widened retention keeps entries that would otherwise now be pruned', () => {
+      const ledger = Ledger.load(path, 5);
+      const twentyDaysAgo = Date.now() - 20 * 86_400_000;
+      ledger.setRetentionDays(30); // widen BEFORE the entry is ever pruned at 5 days
+      ledger.record(entry('mid', 'In the middle', twentyDaysAgo));
+      expect(ledger.has('mid')).toBe(true);
+    });
+  });
+
   it('refuses to start on a corrupt file rather than silently resetting', () => {
     // Silently starting empty would repost the entire backlog — far worse than
     // refusing to start and letting the operator look.

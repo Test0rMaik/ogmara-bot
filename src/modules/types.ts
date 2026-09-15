@@ -76,6 +76,17 @@ export interface ModuleJob {
   /** The cron expression, already validated by the module's schema. */
   readonly cron: string;
   readonly job: ScheduledJob;
+  /**
+   * The dotted config path whose value is this job's cron expression, if the
+   * module wants it live-reschedulable — e.g. `'sources.rss.schedule'`.
+   *
+   * Absent means restart-required to change this job's schedule (there is
+   * nothing for `index.ts` to wire a `ReconfigureHook` to). Present means
+   * `index.ts` will register a hook that calls `job.reschedule(newValue)` —
+   * so a module setting this promises `job.reschedule` actually retunes the
+   * SAME running job, not merely that a job with this path exists.
+   */
+  readonly configPath?: string;
 }
 
 /** A module's live state, returned by `start`. */
@@ -150,7 +161,14 @@ export interface BotModule {
    * (`bot.rateLimit.perWalletPerMinute`).
    *
    * A field with no entry is still editable — it renders from its schema with a
-   * humanised label and is assumed live-appliable. The map is for the facts the
+   * humanised label — but is assumed RESTART-required, not live. `describeFields`
+   * (panel/settings.ts) defaults a missing `restart` to `true`: "we do not know
+   * whether this applies live" must read as "not applied yet," never the other
+   * way around, or the settings page ends up promising something no code
+   * actually does. Declare `restart: false` explicitly once a real live-apply
+   * path exists for a field — see `settingsDeps.ts`'s `ReconfigureHook` for
+   * fields that need one, or the surrounding code for ones that don't (already
+   * read fresh off `ctx.config` every time). The map is for the facts the
    * schema cannot carry, not a second declaration of every field.
    */
   readonly uiSchema?: Readonly<Record<string, UiField>>;

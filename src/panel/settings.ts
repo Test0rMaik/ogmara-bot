@@ -207,6 +207,66 @@ export function redact(_path: string, value: unknown): unknown {
   }
 }
 
+/** One field a config reload actually changed, ready to hand to `settings.audit`. */
+export interface ConfigChangeRow {
+  readonly path: string;
+  readonly outcome: 'applied' | 'restart-pending';
+  readonly from: unknown;
+  readonly to: unknown;
+}
+
+/**
+ * Diff two config snapshots down to the leaf paths that actually changed,
+ * for a trigger that reapplies the WHOLE config rather than a targeted set
+ * of edits — today, only `configWatcher.ts`'s hand-edit-to-config.yaml
+ * path. A panel save already knows exactly which paths it touched (the
+ * request body); a filesystem reload does not, so this recovers the same
+ * granularity by comparing before and after.
+ *
+ * `before` must be a genuine snapshot (e.g. `structuredClone`'d) taken
+ * BEFORE whatever mutated the live config object — `settingsDeps.ts`
+ * mutates its `effective` object IN PLACE, so a bare reference captured
+ * "before" would already show the new values by the time this runs.
+ *
+ * Same restart-vs-applied rule `describeFields` uses: a path with no live
+ * uiSchema entry is restart-pending by default, never assumed applied.
+ *
+ * Compares by VALUE (`JSON.stringify`), not `!==`: `leafPaths` treats an
+ * array or an empty object as a single leaf (see its own doc comment), so
+ * `from`/`to` for a path like `bot.channels` are two independent array
+ * instances even when every element is identical — `before` came from a
+ * `structuredClone`, `after.effective` from a fresh parse. A reference
+ * comparison would report EVERY array-valued field as "changed" on every
+ * single reload, including a genuine no-op re-read, which would have made
+ * this function worse than not calling it at all.
+ *
+ * Walks the UNION of `before`'s and `after`'s leaf paths, not just
+ * `after`'s: `applyConfigInPlace` (config.ts) genuinely DELETES a key when
+ * an `.optional()` field with no `.default()` (e.g.
+ * `sources.imagedir.contentRating`) goes from set to unset — the key is
+ * absent from `after.effective`, not present-as-`undefined` — so a path
+ * this walk skipped every time `after` didn't have it would silently drop
+ * exactly the kind of change (a hand-edit CLEARING a field) this function
+ * exists to record.
+ */
+export function diffForAudit(before: Config, after: DescribeInput): ConfigChangeRow[] {
+  const rows: ConfigChangeRow[] = [];
+  const beforePaths = leafPaths(before as unknown as Record<string, unknown>);
+  const afterPaths = leafPaths(after.effective as unknown as Record<string, unknown>);
+  for (const path of new Set([...beforePaths, ...afterPaths])) {
+    const from = getPath(before, path);
+    const to = getPath(after.effective, path);
+    if (JSON.stringify(from) === JSON.stringify(to)) continue;
+    rows.push({
+      path,
+      outcome: after.ui[path]?.restart === false ? 'applied' : 'restart-pending',
+      from: redact(path, from),
+      to: redact(path, to),
+    });
+  }
+  return rows;
+}
+
 function sourceOf(path: string, input: DescribeInput): FieldSource {
   if (getPath(input.fromUi, path) !== undefined) return 'ui';
   if (getPath(input.fromFile, path) !== undefined) return 'file';

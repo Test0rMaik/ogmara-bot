@@ -66,6 +66,27 @@ describe('StatsHistory', () => {
     expect(history.all()[0]!.timestamp).toBe(now);
   });
 
+  describe('setRetentionDays', () => {
+    it('takes effect on the next prune, without a restart', () => {
+      const now = Date.now();
+      const history = StatsHistory.load(path, 30);
+      history.append(snapshot({ timestamp: now - 20 * 86_400_000 }));
+      expect(history.size).toBe(1); // inside the 30-day window as loaded
+      history.setRetentionDays(10); // shrink, live
+      history.append(snapshot({ timestamp: now })); // any append re-prunes
+      expect(history.size).toBe(1);
+      expect(history.all()[0]!.timestamp).toBe(now);
+    });
+
+    it('a widened retention keeps snapshots that would otherwise now be pruned', () => {
+      const now = Date.now();
+      const history = StatsHistory.load(path, 5);
+      history.setRetentionDays(30); // widen BEFORE the snapshot is ever pruned at 5 days
+      history.append(snapshot({ timestamp: now - 20 * 86_400_000 }));
+      expect(history.size).toBe(1);
+    });
+  });
+
   it('starts fresh rather than throwing on a corrupt file', () => {
     writeFileSync(path, 'not json{{{');
     const history = StatsHistory.load(path);

@@ -144,14 +144,14 @@ describe('dashboard tab', () => {
     expect(settingsDiv).toContain('hidden');
   });
 
-  it('has exactly one tab button per tab-content div, matching data-tab to id', () => {
-    const buttons = [...page.matchAll(/class="tab-btn[^"]*" id="tab-btn-([a-z]+)"/g)].map((m) => m[1]);
+  it('has exactly one rail button per tab-content div, matching data-tab to id', () => {
+    const buttons = [...page.matchAll(/class="rail-item[^"]*" id="tab-btn-([a-z]+)"/g)].map((m) => m[1]);
     const contents = [...page.matchAll(/<div id="tab-([a-z]+)" class="tab-content"/g)].map((m) => m[1]);
     expect(buttons.sort()).toEqual(contents.sort());
   });
 
-  it('the dashboard tab button starts active, matching the visible content', () => {
-    expect(page).toMatch(/class="tab-btn active" id="tab-btn-dashboard"/);
+  it('the dashboard rail button starts active, matching the visible content', () => {
+    expect(page).toMatch(/class="rail-item active" id="tab-btn-dashboard"/);
   });
 
   it('switchTab toggles both the active class and the hidden state together', () => {
@@ -268,16 +268,16 @@ describe('engagement history chart', () => {
   });
 
   it("the chart's own metric/range buttons don't collide with the dashboard/settings tab switcher", () => {
-    // A shared `.tab-btn` class here would mean the generic
-    // `document.querySelectorAll('.tab-btn')` click handler (wired to
+    // A shared `.rail-item` class here would mean the generic
+    // `document.querySelectorAll('.rail-item')` click handler (wired to
     // switchTab) also fires for these buttons, calling switchTab(undefined)
     // since they carry data-metric/data-range, not data-tab — which would
     // hide every tab-content pane. Distinct classes are load-bearing, not
     // cosmetic.
     const metricButtons = /<button class="([^"]*)"[^>]*data-metric=/.exec(page);
     const rangeButtons = /<button class="([^"]*)"[^>]*data-range=/.exec(page);
-    expect(metricButtons![1]).not.toMatch(/\btab-btn\b/);
-    expect(rangeButtons![1]).not.toMatch(/\btab-btn\b/);
+    expect(metricButtons![1]).not.toMatch(/\brail-item\b/);
+    expect(rangeButtons![1]).not.toMatch(/\brail-item\b/);
   });
 
   it('minMax never uses Math.min(...arr)/Math.max(...arr), which blows the call stack on a large array', () => {

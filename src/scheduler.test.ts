@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { isValidCron, runsPerHour } from './scheduler.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { isValidCron, runsPerHour, schedule } from './scheduler.js';
 
 describe('isValidCron', () => {
   it('accepts a well-formed expression', () => {
@@ -67,5 +67,86 @@ describe('runsPerHour', () => {
 
   it('counts an every-second schedule as the true 3600, not a sampling artifact', () => {
     expect(runsPerHour('* * * * * *', NOON, UTC)).toBe(3600);
+  });
+});
+
+describe('schedule().reschedule', () => {
+  // A fixed "now" so `nextRun()` — which croner computes from the real clock
+  // — is deterministic. UTC throughout for the same reason `runsPerHour`'s
+  // tests use it: an hour-specific expression would otherwise depend on the
+  // machine's local timezone.
+  const UTC = { timezone: 'UTC' };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T12:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('changes what nextRun() reports to the NEW expression, not the original one', () => {
+    const job = schedule('0 6 * * *', async () => {}, UTC); // next: 2026-01-02T06:00Z
+    expect(job.nextRun()?.toISOString()).toBe('2026-01-02T06:00:00.000Z');
+
+    job.reschedule('0 18 * * *'); // next: 2026-01-01T18:00Z — sooner, and a DIFFERENT time
+    expect(job.nextRun()?.toISOString()).toBe('2026-01-01T18:00:00.000Z');
+  });
+
+  it('stop() after a reschedule stops the NEW job, not a stale reference to the old one', () => {
+    const job = schedule('*/5 * * * *', async () => {}, UTC);
+    job.reschedule('*/10 * * * *');
+    job.stop();
+    expect(job.nextRun()).toBeNull();
+  });
+
+  it('the OLD underlying job no longer fires after a reschedule', async () => {
+    // Reschedule to something that would never fire in the test's window,
+    // then advance past where the ORIGINAL schedule would have ticked.
+    let calls = 0;
+    const job = schedule('*/1 * * * *', async () => {
+      calls++;
+    });
+    job.reschedule('0 0 1 1 *'); // once a year — will not fire in this test
+    await vi.advanceTimersByTimeAsync(5 * 60_000); // 5 minutes: the OLD pattern would have ticked 5x
+    expect(calls).toBe(0);
+  });
+
+  it('a job created fresh by reschedule still fires on its new pattern', async () => {
+    let calls = 0;
+    const job = schedule('0 0 1 1 *', async () => {
+      calls++;
+    }); // once a year — would not fire in this test on its own
+    job.reschedule('*/1 * * * *'); // every minute
+    await vi.advanceTimersByTimeAsync(2 * 60_000 + 1000);
+    expect(calls).toBeGreaterThanOrEqual(2);
+  });
+
+  it("the overlap guard survives a reschedule — a run in flight when reschedule() fires still blocks the NEW job's next tick", async () => {
+    // The two `Cron` instances a reschedule produces share one `running`
+    // flag by design (see scheduler.ts) — this is the regression test for
+    // that specific choice, not just for reschedule() existing at all.
+    let resolveTask: (() => void) | undefined;
+    let calls = 0;
+    const job = schedule('*/1 * * * *', async () => {
+      calls++;
+      await new Promise<void>((resolve) => {
+        resolveTask = resolve;
+      });
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000); // first tick fires, task is now in flight
+    expect(calls).toBe(1);
+    expect(resolveTask).toBeDefined();
+
+    job.reschedule('*/1 * * * *'); // same pattern, but a NEW underlying Cron instance
+    await vi.advanceTimersByTimeAsync(60_000); // the new job's next tick arrives
+    // Still in flight — the shared `running` guard must skip this tick.
+    expect(calls).toBe(1);
+
+    resolveTask?.();
+    await vi.advanceTimersByTimeAsync(0); // let the .finally() clear `running`
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toBe(2); // now free to fire again
   });
 });

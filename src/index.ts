@@ -33,6 +33,7 @@ import {
   type Config,
   type Secrets,
 } from './config.js';
+import { watchConfigFile, type ConfigWatcher } from './configWatcher.js';
 import { applyProfile, checkRegistration, fetchProfile, registerWallet, uploadAvatar } from './identity.js';
 import { ChannelKeyService, DeviceIdentityError, loadOrCreateDeviceIdentity } from './channelKeys.js';
 import { KleverError, REGISTRATION_COST_KLV } from './klever.js';
@@ -48,7 +49,8 @@ import {
 import { PanelAuth } from './panel/auth.js';
 import { TrustedProxies } from './panel/clientip.js';
 import { DASHBOARD_POST_LIMIT, fetchPostStats } from './panel/posts.js';
-import { startPanel, type Panel } from './panel/server.js';
+import { MAX_AUDIT_REASON, startPanel, truncate, type Panel } from './panel/server.js';
+import { diffForAudit } from './panel/settings.js';
 import { PostQueue } from './queue.js';
 import { type RunOutcome } from './pipeline.js';
 import { createNewsModule } from './modules/news.js';
@@ -65,7 +67,7 @@ import { aggregateAllPostStats } from './stats.js';
 import { StatsHistory } from './statsHistory.js';
 import { stripControlSequences } from './terminal.js';
 import { WALLET_BACKUP_PATH, acknowledgeBackup, isBackupPending } from './walletBackup.js';
-import { createSettingsDeps } from './settingsDeps.js';
+import { createSettingsDeps, type ReconfigureHook } from './settingsDeps.js';
 import type { SettingsDeps } from './panel/server.js';
 
 interface CliArgs {
@@ -672,6 +674,9 @@ async function run(args: CliArgs): Promise<number> {
   // The panel only makes sense for a long-running instance — `--once` exits
   // immediately, which would start a server nobody could ever reach.
   let panel: Panel | undefined;
+  // Same reasoning: a one-shot run exits long before a hand-edit could ever
+  // land, so there's nothing for a watcher to usefully do.
+  let configWatcher: ConfigWatcher | undefined;
   // Loaded only when the panel is on: it's the only consumer, per
   // config.ts's statsSchema comment.
   let statsHistory: StatsHistory | undefined;
@@ -684,6 +689,41 @@ async function run(args: CliArgs): Promise<number> {
   // no-op'ing, so "trigger a snapshot" always means "wait until one is
   // available," regardless of who else asked for it at the same time.
   let takeStatsSnapshotNow: (() => Promise<void>) | undefined;
+  // Built here, mutable, and handed to `createSettingsDeps` by reference —
+  // NOT as an inline array literal — because `commit()` reads whatever this
+  // array currently holds at commit time, not a frozen snapshot from
+  // construction. That matters because the schedule-reschedule hooks below
+  // can only be built once `startAll()` has produced real `ScheduledJob`
+  // handles to reschedule, and that happens LATER in this function, after
+  // the panel (and therefore `createSettingsDeps`) is already up — a module
+  // needs the panel's `ctx` no more than the panel needs a module's cron
+  // handle, so neither construction order is obviously "right," and
+  // reordering either risks the kind of startup-sequencing regression this
+  // file's existing comments are full of warnings about. A mutable array
+  // sidesteps the ordering question entirely.
+  const reconfigureHooks: ReconfigureHook[] = [
+    // The values below are the ones the uiSchema promises are live
+    // (`restart: false`) specifically BECAUSE something baked them into a
+    // constructor rather than re-reading `ctx.config` — every other
+    // `restart: false` field needs no entry here at all, since fixing the
+    // config-object disconnect alone already makes a plain property read
+    // observe a save immediately.
+    {
+      path: 'posting.maxPostsPerHour',
+      apply: (v) => publisher.setMaxPostsPerHour(v as number),
+    },
+    {
+      path: 'storage.retentionDays',
+      apply: (v) => ledger.setRetentionDays(v as number),
+    },
+    {
+      path: 'stats.retentionDays',
+      // `statsHistory` isn't constructed yet at this exact line (only once
+      // `effective.panel.enabled`, a few lines below) — this closure reads
+      // it lazily, by the time a save could ever actually trigger it.
+      apply: (v) => statsHistory?.setRetentionDays(v as number),
+    },
+  ];
   if (effective.panel.enabled) {
     statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);
     const history = statsHistory;
@@ -698,6 +738,77 @@ async function run(args: CliArgs): Promise<number> {
       }
       return inFlight;
     };
+    // Built here rather than inside the panel: this is the only scope that
+    // has the config layers, every module's uiSchema, and the paths the
+    // overrides and audit log live at.
+    //
+    // ALL modules, not `modules` (the enabled-only list) — a module's
+    // `enabled` flag is itself a field ITS OWN uiSchema describes
+    // (`bot.enabled`), so passing only already-enabled modules meant an
+    // operator could never discover or turn on a disabled module from the
+    // settings page at all: the one uiSchema entry that would have shown
+    // it a proper label/help text was gated behind the module already
+    // being on. `uiSchema` is a static property set at module construction
+    // — it needs no running state — so this changes nothing about which
+    // modules actually START (still `modules`, everywhere else in this
+    // file), only which modules the settings page can describe.
+    const settingsDeps = createSettingsDeps({
+      configPath: args.configPath,
+      layered: { ...layered, config: effective },
+      modules: allModules,
+      secrets,
+      // Re-applied on every commit, not just here: a freshly merged config
+      // would otherwise drop `--dry-run` on the first save, and the panel
+      // would report `dryRun: false` while the bot was genuinely in dry run.
+      applyCliOverrides: (c) =>
+        args.forceDryRun ? { ...c, posting: { ...c.posting, dryRun: true } } : c,
+      // By reference — see the comment where `reconfigureHooks` is
+      // declared. Entries pushed onto it AFTER this call (the schedule
+      // hooks, once modules and the stats job actually exist) still fire,
+      // since `commit()` reads the array fresh on every save rather than
+      // capturing its contents at construction.
+      reconfigureHooks,
+    });
+
+    // A hand-edit to config.yaml over SSH must apply exactly the way a
+    // panel save does — the operator should never need to remember "did I
+    // use the UI or the file" to know whether a restart is needed. `apply`
+    // with no changes re-reads config.yaml, re-merges the UNCHANGED
+    // overrides onto it, and re-applies — the exact same path a save takes,
+    // just triggered by the filesystem instead of a request. A no-op
+    // edit (or a burst of fs events from one logical save) costs nothing:
+    // `writeOverrides` skips writing when the overrides content it would
+    // produce is unchanged, and no reconfigure hook fires unless a value
+    // actually changed.
+    configWatcher = watchConfigFile(args.configPath, () => {
+      // A hand-edit needs the same audit trail a panel save gets — this is
+      // exactly the "posting.dryRun took effect and nobody can tell when or
+      // from where" gap a code-audit flagged for this feature: a trigger
+      // that bypasses `panel/server.ts`'s HTTP handlers (the only other
+      // caller of `settings.audit(...)` today) must not also bypass the
+      // audit log itself just because there's no request to hang it off.
+      const beforeEffective = structuredClone(settingsDeps.describe().effective);
+      const result = settingsDeps.apply({});
+      const actor = 'filesystem';
+      const ip = '-';
+      if (!result.ok) {
+        console.warn(
+          `  warning: config.yaml changed but could not be applied: ${result.issues.join('; ')}`,
+        );
+        settingsDeps.audit({
+          actor,
+          ip,
+          path: '(config.yaml)',
+          outcome: 'rejected',
+          reason: truncate(result.issues.join('; '), MAX_AUDIT_REASON),
+        });
+        return;
+      }
+      for (const row of diffForAudit(beforeEffective, settingsDeps.describe())) {
+        settingsDeps.audit({ actor, ip, ...row });
+      }
+    });
+
     panel = await startControlPanel(
       effective,
       secrets,
@@ -705,31 +816,7 @@ async function run(args: CliArgs): Promise<number> {
       queue,
       statsHistory,
       takeStatsSnapshotNow,
-      // Built here rather than inside the panel: this is the only scope that
-      // has the config layers, every module's uiSchema, and the paths the
-      // overrides and audit log live at.
-      //
-      // ALL modules, not `modules` (the enabled-only list) — a module's
-      // `enabled` flag is itself a field ITS OWN uiSchema describes
-      // (`bot.enabled`), so passing only already-enabled modules meant an
-      // operator could never discover or turn on a disabled module from the
-      // settings page at all: the one uiSchema entry that would have shown
-      // it a proper label/help text was gated behind the module already
-      // being on. `uiSchema` is a static property set at module construction
-      // — it needs no running state — so this changes nothing about which
-      // modules actually START (still `modules`, everywhere else in this
-      // file), only which modules the settings page can describe.
-      createSettingsDeps({
-        configPath: args.configPath,
-        layered: { ...layered, config: effective },
-        modules: allModules,
-        secrets,
-        // Re-applied on every commit, not just here: a freshly merged config
-        // would otherwise drop `--dry-run` on the first save, and the panel
-        // would report `dryRun: false` while the bot was genuinely in dry run.
-        applyCliOverrides: (c) =>
-          args.forceDryRun ? { ...c, posting: { ...c.posting, dryRun: true } } : c,
-      }),
+      settingsDeps,
     );
   }
 
@@ -738,6 +825,23 @@ async function run(args: CliArgs): Promise<number> {
   // racing the ledger.
   const started: StartedModule[] = await startAll(modules, ctx);
   const moduleJobs = started.flatMap((m) => [...m.handle.jobs]);
+  // A module job that declared a `configPath` gets a live-reschedule hook,
+  // pushed onto the SAME array `createSettingsDeps` was handed above (a
+  // no-op if the panel is off — nothing ever reads this array then). The
+  // job's OWN `ScheduledJob` object is the one already stored on its
+  // module's `ModuleHandle.jobs` and iterated at shutdown — `reschedule()`
+  // mutates that object's internal timer in place (see scheduler.ts), so
+  // nothing else holding the same reference needs to know a reschedule ever
+  // happened.
+  for (const job of moduleJobs) {
+    if (job.configPath !== undefined) {
+      const scheduledJob = job.job;
+      reconfigureHooks.push({
+        path: job.configPath,
+        apply: (v) => scheduledJob.reschedule(v as string),
+      });
+    }
+  }
   // CORE crons only — the stats snapshot below. Module crons live on their
   // module handles and are stopped through the registry; keeping the two lists
   // separate is what stops a module's job being stopped twice, or a core job
@@ -768,6 +872,7 @@ async function run(args: CliArgs): Promise<number> {
       }
     });
     coreJobs.push(job);
+    reconfigureHooks.push({ path: 'stats.schedule', apply: (v) => job.reschedule(v as string) });
   }
 
   // A schedule controls WHEN the bot attempts a post; posting.maxPostsPerHour
@@ -811,6 +916,8 @@ async function run(args: CliArgs): Promise<number> {
       if (shuttingDown) return;
       shuttingDown = true;
       console.log('\nStopping…');
+      // Before any of the crons it might otherwise react to mid-shutdown.
+      configWatcher?.close();
       // Core crons first, then every module through the registry — a module may
       // hold more than crons, and one module failing to stop must not leave the
       // others running. A "stopped" bot whose cron survived keeps posting.

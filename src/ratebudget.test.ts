@@ -68,4 +68,49 @@ describe('RateBudget', () => {
     expect(b.msUntilNext(0)).toBeLessThanOrEqual(HOUR);
     expect(b.msUntilNext(HOUR)).toBe(0);
   });
+
+  describe('setMaxPostsPerHour', () => {
+    it('takes effect on the very next refill, without a restart', () => {
+      const b = new RateBudget(1, 0); // 1/hour
+      b.tryConsume(0); // spend the initial token
+      b.setMaxPostsPerHour(4, 0); // now 4/hour = one per 15 min
+      expect(b.tryConsume(5 * 60_000)).toBe(false); // still too soon under the NEW rate
+      expect(b.tryConsume(15 * 60_000)).toBe(true);
+    });
+
+    it('preserves already-accrued fractional credit — a rate change does not reset the balance to zero', () => {
+      const b = new RateBudget(4, 0); // 4/hour: a full token every 15 min
+      b.tryConsume(0); // spend the initial token; balance now 0
+      // 14 of the 15 minutes elapse under the FAST rate: ~0.933 of a token
+      // earned. Then the rate drops steeply, to 1/hour.
+      b.setMaxPostsPerHour(1, 14 * 60_000);
+      // If the drop had wiped the balance, reaching a token under the new
+      // slow (1/hour) rate would take up to another hour. Since the ~0.933
+      // already earned survives the change, 4 more minutes is enough to
+      // cross the threshold (0.933 + 4/60 ≈ 1.0).
+      expect(b.tryConsume(14 * 60_000 + 4 * 60_000)).toBe(true);
+    });
+
+    it('credits elapsed time under the OLD rate up to the switch, not the new rate retroactively', () => {
+      const b = new RateBudget(1, 0); // 1/hour, slow
+      b.tryConsume(0); // spend it; balance now 0
+      // 30 minutes elapse under the SLOW rate (0.5 of a token earned), THEN
+      // the rate rises steeply, to 4/hour.
+      b.setMaxPostsPerHour(4, 30 * 60_000);
+      // If the elapsed 30 minutes had been retroactively credited at the
+      // FAST rate instead of the slow one actually in effect at the time,
+      // the balance at the switch would already be a full token (30/15min
+      // = 2, capped at capacity 1) and this would succeed immediately.
+      // Correct behavior: only 0.5 was earned under the old rate, so an
+      // immediate consume right at the switch still fails.
+      expect(b.tryConsume(30 * 60_000)).toBe(false);
+    });
+
+    it('still denies genuine over-rate bursts under the new rate', () => {
+      const b = new RateBudget(1, 0);
+      b.tryConsume(0);
+      b.setMaxPostsPerHour(4, 0);
+      expect(b.tryConsume(1000)).toBe(false);
+    });
+  });
 });

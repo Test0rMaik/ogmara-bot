@@ -5,6 +5,96 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-09-15
+
+A rework of the settings panel around a sidebar-rail layout, and — the bigger
+piece — a real hot-reload engine, so most settings apply without an SSH
+restart. Motivated by the invite-poll interval (`bot.autoJoin.schedule`)
+being restart-only: changing it meant logging in over SSH just to shorten a
+timer.
+
+### Added
+
+- **Sidebar-rail navigation, replacing the flat top tab bar, across all four
+  panel destinations** (Dashboard, Account, Configuration, Audit log) —
+  Configuration's ~50 fields are grouped into 8 topics (Node & Network,
+  Posting & Limits, AI & Content, News Sources, Bot & Commands, Profile,
+  Storage & Data, Panel & Security) shown as a rail sub-nav, down from 11
+  flat sections on one long page. Every field now carries an honest "live"
+  or "restart required" badge. Dark-default theme, dirty-tracking, confirm
+  dialogs, reset, restart banner, audit log, chart, avatar upload,
+  registration flow, and all 7 locales carried over unchanged.
+- **A genuinely working hot-reload engine**, covering both a settings-panel
+  save AND a hand-edit to `config.yaml` over SSH — the two now go through
+  the exact same apply path, so an operator never has to remember which one
+  needs a restart:
+  - Fixed the root cause that made EVERY "live" field false advertising: the
+    settings API held its own separate copy of the running config and
+    reassigned its own local variable on save, never touching the object
+    `ctx.config`/`OgmaraPublisher`/every module actually reads from. Now a
+    save mutates that shared object in place (`applyConfigInPlace`), so
+    anything already reading `ctx.config` fresh observes a save immediately
+    — no code change needed for most of the fields below.
+  - New setter methods make three values that WERE baked into a constructor
+    at startup live too: `posting.maxPostsPerHour` (rate budget),
+    `storage.retentionDays` (ledger), `stats.retentionDays` (chart history)
+    — each via a small "reconfigure hook" fired only when a save actually
+    changes that path.
+  - **Cron schedules reschedule live**: `bot.autoJoin.schedule`,
+    `sources.rss/topics/imagedir.schedule`, and `stats.schedule` now
+    retune the running cron job's interval on save — the field that started
+    this whole effort. `scheduler.ts`'s `ScheduledJob` gained a
+    `reschedule()` method (stop the old timer, start a new one on the new
+    pattern, same task); every existing holder of the job object is
+    unaffected, and the overlap guard survives a reschedule mid-run.
+  - **A `config.yaml` hand-edit now applies without a restart too**, via a
+    directory-watching file watcher (survives an editor's rename-based
+    atomic save, unlike watching the file path directly), debounced and
+    routed through the identical `commit()` path a panel save uses.
+  - 14 fields relabeled from "restart required" to "live," now that they
+    actually are: `posting.dryRun/contentRating/disclosureTag/alwaysTags/
+    includeSourceLink`, `ai.targetContentChars/maxTags/
+    maxSourceTitleChars/maxSourceSummaryChars`, `sources.rss.fetchImages/
+    maxImageBytes/imageTimeoutMs`, `sources.imagedir.maxBytes/
+    contentRating` — each traced to an actual per-call read off the shared
+    config object, not assumed.
+  - `panel.*`/`settings.*` and everything that re-initializes a network
+    client, a module's handlers, or a rate limiter (`node.*`,
+    `ai.provider/baseUrl`, `bot.enabled/handle/channels/commands/
+    rateLimit.*`, `queue.*`) correctly stay restart-required — unchanged,
+    by design.
+  - Hand-edits now write to the audit log too (`actor: "filesystem"`),
+    closing a gap where a save that bypassed the HTTP handler left zero
+    trace of what changed or when.
+
+### Fixed
+
+- A stale doc comment on `BotModule.uiSchema` claimed a field with no
+  metadata entry was "assumed live-appliable" — the opposite of what the
+  code actually does (`restart: true` by default) and the opposite of what
+  a contributor should assume when adding a module.
+- The dashboard's engagement chart used three hardcoded hex colors that
+  never changed with the theme toggle; now reads the active theme's CSS
+  custom properties and repaints on a theme switch.
+
+### Security
+
+- `applyConfigInPlace` (the new in-place config mutator) gained an explicit
+  `__proto__`/`constructor`/`prototype` guard, matching this codebase's
+  existing doctrine of stripping those at every layer independently rather
+  than relying on one earlier check.
+- A reconfigure hook that throws no longer aborts the rest of the hooks or
+  turns an already-persisted save into a reported failure — logged and
+  skipped instead.
+- Fixed a real bug found mid-implementation: `applyConfigInPlace` only ever
+  copied keys present in the NEW config, so a field cleared back to
+  "unset" (an `.optional()` field with no default, e.g.
+  `sources.imagedir.contentRating`) never actually cleared in the running
+  process — it kept reporting the stale value indefinitely. Now walks the
+  union of old/new keys and deletes what's genuinely gone. The same
+  fix was needed a second time in the new audit-trail diffing logic,
+  which had the identical gap.
+
 ## [0.29.1] - 2026-09-15
 
 ### Fixed

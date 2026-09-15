@@ -15,6 +15,21 @@ export interface ScheduledJob {
   stop(): void;
   /** Next scheduled run, or null if there is none. */
   nextRun(): Date | null;
+  /**
+   * Replace this job's cron pattern, live, keeping the same task and options.
+   *
+   * `croner`'s `Cron` has no in-place pattern-mutation API, so this stops the
+   * current underlying job and starts a fresh one — but every existing holder
+   * of THIS `ScheduledJob` object keeps working unchanged: `stop`/`nextRun`/
+   * `reschedule` all act on whichever underlying job is current, since they
+   * close over the same mutable reference this function updates. Nothing
+   * that stored the returned object (a module's `ModuleJob.job`, `index.ts`'s
+   * `coreJobs`) needs to know a reschedule ever happened.
+   *
+   * Caller's responsibility to have validated `newExpression` first — same
+   * trust boundary `schedule()` itself already relies on today.
+   */
+  reschedule(newExpression: string): void;
 }
 
 /** Whether a cron expression is valid. */
@@ -85,36 +100,47 @@ export function schedule(
   task: () => Promise<void>,
   options: ScheduleOptions = {},
 ): ScheduledJob {
+  // Shared across every underlying `Cron` instance a `reschedule()` ever
+  // creates — overlap protection has to survive a reschedule the same way a
+  // still-in-flight run does, and there is exactly one logical job here
+  // regardless of how many `Cron` instances back it over time.
   let running = false;
 
-  const job = new Cron(
-    expression,
-    { ...(options.timezone !== undefined ? { timezone: options.timezone } : {}) },
-    () => {
-      if (running) {
-        console.warn('  previous run still in progress — skipping this tick');
-        return;
-      }
-      running = true;
-      // Promise.resolve().then(task) rather than task(): a synchronous throw
-      // from task() would escape before .finally attached and leave `running`
-      // stuck true forever — a silent permanent stop. Latent today (the caller
-      // is async) but a whole class of bug removed for free.
-      void Promise.resolve()
-        .then(task)
-        .catch((err: unknown) => {
-          console.error('  scheduled run failed:', err instanceof Error ? err.message : err);
-        })
-        .finally(() => {
-          running = false;
-        });
-    },
-  );
+  const makeCron = (expr: string): Cron =>
+    new Cron(
+      expr,
+      { ...(options.timezone !== undefined ? { timezone: options.timezone } : {}) },
+      () => {
+        if (running) {
+          console.warn('  previous run still in progress — skipping this tick');
+          return;
+        }
+        running = true;
+        // Promise.resolve().then(task) rather than task(): a synchronous throw
+        // from task() would escape before .finally attached and leave `running`
+        // stuck true forever — a silent permanent stop. Latent today (the caller
+        // is async) but a whole class of bug removed for free.
+        void Promise.resolve()
+          .then(task)
+          .catch((err: unknown) => {
+            console.error('  scheduled run failed:', err instanceof Error ? err.message : err);
+          })
+          .finally(() => {
+            running = false;
+          });
+      },
+    );
+
+  let job = makeCron(expression);
 
   return {
     stop: (): void => {
       job.stop();
     },
     nextRun: (): Date | null => job.nextRun(),
+    reschedule: (newExpression: string): void => {
+      job.stop();
+      job = makeCron(newExpression);
+    },
   };
 }

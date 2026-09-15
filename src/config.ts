@@ -20,7 +20,7 @@ import { describeAddressProblem, validateAddress } from './address.js';
 import { TrustedProxies } from './panel/clientip.js';
 import { isValidCron } from './scheduler.js';
 import { botSchema } from './modules/commands/schema.js';
-import { loadOverrides, mergeOverrides } from './settings.js';
+import { DANGEROUS_KEYS, loadOverrides, mergeOverrides } from './settings.js';
 
 /**
  * The node's per-wallet news limits, as of l2-node 0.122.0.
@@ -789,6 +789,64 @@ export function validateConfig(candidate: unknown): { ok: true; config: Config }
     ok: false,
     issues: result.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`),
   };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Copy every field of a freshly-validated config ONTO an existing config
+ * object, in place, recursing into nested sections rather than replacing
+ * `target` itself.
+ *
+ * This is the one thing that makes hot-reload possible at all: every module
+ * that was constructed with a `Config` reference (`ctx.config`, a
+ * publisher's own `#config`) keeps that exact object — nothing re-points it
+ * — so mutating its fields is the only way a save can become visible to
+ * code that already holds the reference. Reassigning a local variable to a
+ * new object (the bug this replaces) only ever updated the variable doing
+ * the reassigning, never anyone else's copy of the pointer.
+ *
+ * Both arguments are always the output of `validateConfig`. That does NOT
+ * mean both are fully-shaped the same way, though: an `.optional()` field
+ * with no `.default()` (e.g. `sources.imagedir.contentRating`) is OMITTED
+ * from Zod's parsed output entirely when the input never set it — not
+ * present as `undefined`, genuinely absent from `Object.keys(...)`. A save
+ * that clears such a field back to "unset" must still delete it from
+ * `target`, or the live object keeps reporting the old value forever while
+ * `describe()`'s own re-read of the file would correctly show it unset —
+ * exactly the "settings page and the running process disagree" bug this
+ * whole function exists to close, reintroduced for the one shape of field
+ * that isn't a plain overwrite. So this walks the UNION of both objects'
+ * keys, not just `source`'s.
+ */
+export function applyConfigInPlace(target: Config, source: Config): void {
+  const t = target as unknown as Record<string, unknown>;
+  const s = source as unknown as Record<string, unknown>;
+  for (const key of new Set([...Object.keys(t), ...Object.keys(s)])) {
+    if (!(key in s)) {
+      delete t[key]; // present in target, absent from source: genuinely unset now
+      continue;
+    }
+    // Unreachable today — `source` is always the output of `validateConfig`,
+    // and every config schema is a plain `z.object(...)` with no
+    // `.passthrough()`/`.catchall()`, so Zod already strips an unknown key
+    // like `__proto__` before it could ever reach here. Guarded anyway: this
+    // is a new, generically-reusable recursive object-mutator, and
+    // `settings.ts`'s own doctrine for this exact key list is "stripped at
+    // every layer... so no single forgotten check restores the hole" — a
+    // future caller with a less-trusted `source` should not have to
+    // remember that this function alone was the exception.
+    if (DANGEROUS_KEYS.includes(key)) continue;
+    const sVal = s[key];
+    const tVal = t[key];
+    if (isPlainObject(sVal) && isPlainObject(tVal)) {
+      applyConfigInPlace(tVal as Config, sVal as Config);
+    } else {
+      t[key] = sVal;
+    }
+  }
 }
 
 /**

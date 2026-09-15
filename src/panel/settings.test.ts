@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { Config } from '../config.js';
-import { FILE_ONLY_SECTIONS, describeFields, redact, rejectFileOnlyPaths } from './settings.js';
+import {
+  FILE_ONLY_SECTIONS,
+  describeFields,
+  diffForAudit,
+  redact,
+  rejectFileOnlyPaths,
+} from './settings.js';
 
 const effective = {
   node: { url: 'https://node.example', network: 'testnet' },
@@ -170,5 +176,87 @@ describe('describeFields', () => {
     const paths = describeFields(input).map((f) => f.path);
     expect(paths).toContain('panel.adminWallets');
     expect(paths.some((p) => p.startsWith('panel.adminWallets.'))).toBe(false);
+  });
+});
+
+describe('diffForAudit', () => {
+  // `before` is a plain snapshot of `effective` BEFORE whatever reload ran —
+  // never the live object itself, since settingsDeps.ts mutates that one in
+  // place (see the doc comment on diffForAudit).
+  const before = structuredClone(effective);
+
+  it('reports only paths that actually changed', () => {
+    const after = { ...input, effective: { ...effective, posting: { ...effective.posting, maxPostsPerHour: 9 } } };
+    const rows = diffForAudit(before, after);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ path: 'posting.maxPostsPerHour', from: 1, to: 9 });
+  });
+
+  it('reports nothing when nothing changed', () => {
+    expect(diffForAudit(before, input)).toEqual([]);
+  });
+
+  it('marks a live (restart: false) path "applied"', () => {
+    const after = { ...input, effective: { ...effective, posting: { ...effective.posting, dryRun: false } } };
+    const row = diffForAudit(before, after).find((r) => r.path === 'posting.dryRun');
+    expect(row?.outcome).toBe('applied');
+  });
+
+  it('marks a restart-required path "restart-pending", and an UNCLAIMED path the same way — never "applied" by default', () => {
+    const after = {
+      ...input,
+      effective: {
+        ...effective,
+        node: { ...effective.node, url: 'https://changed.example' },
+        posting: { ...effective.posting, maxPostsPerHour: 9 }, // unclaimed in this fixture's `ui`
+      },
+    };
+    const rows = diffForAudit(before, after);
+    expect(rows.find((r) => r.path === 'node.url')?.outcome).toBe('restart-pending');
+    expect(rows.find((r) => r.path === 'posting.maxPostsPerHour')?.outcome).toBe('restart-pending');
+  });
+
+  it('redacts credentials in the from/to it produces, the same as describeFields', () => {
+    const after = {
+      ...input,
+      effective: {
+        ...effective,
+        node: { ...effective.node, url: 'https://user:s3cret@node.example' },
+      },
+    };
+    const row = diffForAudit(before, after).find((r) => r.path === 'node.url');
+    expect(JSON.stringify(row)).not.toContain('s3cret');
+  });
+
+  it('does not mutate `before`, so a caller can keep using its snapshot for later paths', () => {
+    const beforeCopy = structuredClone(before);
+    diffForAudit(before, input);
+    expect(before).toEqual(beforeCopy);
+  });
+
+  it('reports a field DELETED between before and after — not just changed values', () => {
+    // REGRESSION GUARD. `applyConfigInPlace` genuinely deletes the key for an
+    // `.optional()` field with no `.default()` when a hand-edit clears it
+    // (e.g. `sources.imagedir.contentRating`) — the key is absent from
+    // `after.effective`, not present as `undefined`. An earlier version of
+    // this function walked only `after`'s leaf paths and silently dropped
+    // exactly this case: a hand-edit that CLEARS a field produced no audit
+    // row at all.
+    const beforeWithRating = {
+      ...effective,
+      sources: { imagedir: { enabled: true, contentRating: 'mature' } },
+    } as unknown as Config;
+    const afterWithoutRating = {
+      ...input,
+      effective: {
+        ...effective,
+        sources: { imagedir: { enabled: true } },
+      } as unknown as Config,
+    };
+    const rows = diffForAudit(beforeWithRating, afterWithoutRating);
+    const row = rows.find((r) => r.path === 'sources.imagedir.contentRating');
+    expect(row).toBeDefined();
+    expect(row?.from).toBe('mature');
+    expect(row?.to).toBeUndefined();
   });
 });

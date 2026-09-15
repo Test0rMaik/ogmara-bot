@@ -1086,9 +1086,9 @@ const MAX_PATHS_PER_WRITE = 100;
  * can produce kilobytes of issues, and replaying that per path turned a small
  * request into hundreds of kilobytes of log.
  */
-const MAX_AUDIT_REASON = 400;
+export const MAX_AUDIT_REASON = 400;
 
-const truncate = (text: string, max: number): string =>
+export const truncate = (text: string, max: number): string =>
   text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 
 /**

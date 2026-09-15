@@ -12,6 +12,7 @@
 
 import { appendAudit, readAudit, type AuditEvent } from './audit.js';
 import {
+  applyConfigInPlace,
   readConfigFileRaw,
   validateConfig,
   type Config,
@@ -24,10 +25,26 @@ import type { SettingsDeps } from './panel/server.js';
 import type { DescribeInput } from './panel/settings.js';
 import {
   deletePath,
+  getPath,
   mergeOverrides,
   writeOverrides,
   type Overrides,
 } from './settings.js';
+
+/**
+ * A live-apply callback for one config path. Registered by whichever piece
+ * of `index.ts` owns the runtime state that path controls (a rate budget, a
+ * ledger's retention, a cron job's schedule) — `settingsDeps.ts` itself
+ * knows nothing about what any of these values DO, only that a commit
+ * changing this path should call `apply` with the new value.
+ *
+ * Only fires when the value actually changed — a save that touches other
+ * fields, or that reasserts the same value, does not re-trigger it.
+ */
+export interface ReconfigureHook {
+  readonly path: string;
+  readonly apply: (value: unknown, config: Config) => void;
+}
 
 export interface SettingsDepsInput {
   readonly configPath: string;
@@ -53,6 +70,8 @@ export interface SettingsDepsInput {
    * contradicting the thing it administers.
    */
   readonly applyCliOverrides?: (config: Config) => Config;
+  /** Live-apply callbacks for paths that don't need a restart. See `ReconfigureHook`. */
+  readonly reconfigureHooks?: readonly ReconfigureHook[];
 }
 
 /**
@@ -146,7 +165,12 @@ function auditOptionsFor(config: Config): { path: string; maxBytes: number; keep
 export function createSettingsDeps(input: SettingsDepsInput): SettingsDeps {
   // The only mutable state: what has been written to the overrides file.
   let overrides: Overrides = structuredClone(input.layered.fromUi) as Overrides;
-  let effective: Config = input.layered.config;
+  // NEVER reassigned — see `commit()`. `index.ts` hands this exact object to
+  // `ctx.config`, `OgmaraPublisher`, and everything else built at startup;
+  // a save has to mutate its fields in place, or every one of those holds a
+  // stale copy forever, observing nothing a save ever does.
+  const effective: Config = input.layered.config;
+  const reconfigureHooks = input.reconfigureHooks ?? [];
   const ui = collectUiSchema(input.modules);
   const force = input.applyCliOverrides ?? ((c: Config): Config => c);
   let lastGoodFile: Record<string, unknown> = input.layered.fromFile;
@@ -191,6 +215,12 @@ export function createSettingsDeps(input: SettingsDepsInput): SettingsDeps {
     if (!merged.ok) return { ok: false, issues: merged.issues };
     const forced = force(merged.config);
 
+    // Snapshot the paths any hook cares about BEFORE mutating `effective` —
+    // once `applyConfigInPlace` runs, `effective` IS the new state, so this
+    // is the only point where "before" and "after" are actually different
+    // objects to compare.
+    const before = reconfigureHooks.map((hook) => getPath(effective, hook.path));
+
     // Paths come from the MERGED result, not from boot. Everything else here
     // re-reads config.yaml, so freezing these two meant a hand-edited
     // `auditPath` showed on the settings page while the log kept being written
@@ -198,8 +228,28 @@ export function createSettingsDeps(input: SettingsDepsInput): SettingsDeps {
     // the same field.
     writeOverrides(forced.settings.path, next);
     overrides = next;
-    effective = forced;
-    auditOpts = auditOptionsFor(forced);
+    applyConfigInPlace(effective, forced);
+    auditOpts = auditOptionsFor(effective);
+
+    // The write and the in-memory mutation above already succeeded — from
+    // here on this is a best-effort NOTIFICATION, not a step the save can
+    // still fail on. A throwing hook must not stop the REST of the hooks
+    // from running, and must not turn an already-persisted save into a
+    // request that reports failure to the operator (the save genuinely
+    // went through; only the live-apply side of one field did not).
+    reconfigureHooks.forEach((hook, i) => {
+      const after = getPath(effective, hook.path);
+      if (after === before[i]) return;
+      try {
+        hook.apply(after, effective);
+      } catch (err) {
+        console.error(
+          `  warning: live-apply for "${hook.path}" failed (the save itself succeeded): ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    });
+
     return { ok: true };
   };
 

@@ -131,6 +131,20 @@ export class RateBudget {
   }
 
   /**
+   * Change the posting rate a running budget refills at, without resetting
+   * its current token balance — a rate change mid-hour should not also grant
+   * or revoke whatever the bot had already earned toward its next post.
+   *
+   * Refills first, under the OLD rate, up to `now` — otherwise the elapsed
+   * time since the last refill would be credited at the NEW rate, letting a
+   * rate drop retroactively hand out tokens that were never actually earned.
+   */
+  setMaxPostsPerHour(postsPerHour: number, now: number = Date.now()): void {
+    this.#refill(now);
+    this.#refillPerMs = postsPerHour / 3_600_000;
+  }
+
+  /**
    * Consume a token if available. Returns false (without consuming) if not.
    *
    * Callers should pass the time the *run* began rather than the moment
@@ -313,6 +327,11 @@ export class OgmaraPublisher {
   /** Tell the publisher the wallet's on-chain tier. */
   setRegistered(registered: boolean): void {
     this.#registered = registered;
+  }
+
+  /** Live-apply a new `posting.maxPostsPerHour` without restarting. */
+  setMaxPostsPerHour(postsPerHour: number): void {
+    this.#budget.setMaxPostsPerHour(postsPerHour);
   }
 
   /** Whether the wallet is currently believed to be registered on-chain. */

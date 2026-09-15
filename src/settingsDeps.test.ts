@@ -303,3 +303,163 @@ describe('secrets', () => {
     expect(JSON.stringify(present)).not.toContain('sk-test');
   });
 });
+
+describe('config object identity (the hot-reload disconnect fix)', () => {
+  it('a save mutates the SAME config object index.ts was handed, rather than replacing it', () => {
+    // This is the regression this whole feature exists to fix: `index.ts`
+    // threads ONE config object into `ctx.config`, `OgmaraPublisher`, etc.
+    // If `commit()` ever goes back to reassigning its own local variable
+    // instead of mutating that object's fields, every one of those holders
+    // freezes at boot-time values again and every "live" badge in the panel
+    // goes back to being false advertising.
+    writeFileSync(
+      configPath,
+      CONFIG_YAML().replace('OVERRIDES', overridesPath).replace('AUDIT', join(dir, 'audit.log')),
+      'utf8',
+    );
+    const layered = loadLayeredConfig(configPath, overridesPath, () => {});
+    const configRef = layered.config;
+    const deps = createSettingsDeps({ configPath, layered, modules: [], secrets });
+
+    expect(deps.apply({ posting: { maxPostsPerHour: 9 } })).toEqual({ ok: true });
+
+    // The object `index.ts` is still holding a reference to must show the
+    // new value directly — not just what `describe()` reports.
+    expect(configRef.posting.maxPostsPerHour).toBe(9);
+    expect(configRef).toBe(deps.describe().effective);
+  });
+
+  it('mutates nested section objects in place too, not just the top-level config', () => {
+    // A module that captured `ctx.config.posting` itself (not `ctx.config`)
+    // must also observe the write — `applyConfigInPlace` has to recurse,
+    // not just replace `effective.posting` with a new object.
+    writeFileSync(
+      configPath,
+      CONFIG_YAML().replace('OVERRIDES', overridesPath).replace('AUDIT', join(dir, 'audit.log')),
+      'utf8',
+    );
+    const layered = loadLayeredConfig(configPath, overridesPath, () => {});
+    const postingRef = layered.config.posting;
+    const deps = createSettingsDeps({ configPath, layered, modules: [], secrets });
+
+    deps.apply({ posting: { maxPostsPerHour: 11 } });
+    expect(postingRef.maxPostsPerHour).toBe(11);
+  });
+});
+
+describe('clearing an optional field with no default (the applyConfigInPlace omitted-key bug)', () => {
+  it('sources.imagedir.contentRating actually disappears from `effective` after a reset, not just from the file', () => {
+    // `contentRating` is `z.optional()` with NO `.default()` — Zod omits it
+    // from the parsed config entirely when unset, it is not merely
+    // `undefined`. `applyConfigInPlace` (config.ts) has to delete it from
+    // the live object on a clearing save, or `effective` keeps reporting
+    // the stale value forever while a restart (or `describe()`'s own
+    // separate re-read of the file for provenance) would correctly show it
+    // unset — the exact "settings page and the process disagree" bug this
+    // whole feature exists to close, for the one field shape that isn't a
+    // plain overwrite.
+    const deps = makeDeps();
+    expect(deps.apply({ sources: { imagedir: { contentRating: 'mature' } } })).toEqual({ ok: true });
+    expect(deps.describe().effective.sources.imagedir.contentRating).toBe('mature');
+
+    expect(deps.reset('sources.imagedir.contentRating')).toEqual({ ok: true });
+    expect(deps.describe().effective.sources.imagedir.contentRating).toBeUndefined();
+  });
+});
+
+describe('reconfigureHooks', () => {
+  function makeDepsWithHooks(
+    hooks: import('./settingsDeps.js').ReconfigureHook[],
+  ): ReturnType<typeof createSettingsDeps> {
+    writeFileSync(
+      configPath,
+      CONFIG_YAML().replace('OVERRIDES', overridesPath).replace('AUDIT', join(dir, 'audit.log')),
+      'utf8',
+    );
+    const layered = loadLayeredConfig(configPath, overridesPath, () => {});
+    return createSettingsDeps({ configPath, layered, modules: [], secrets, reconfigureHooks: hooks });
+  }
+
+  it('fires when its path actually changes', () => {
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+    ]);
+    deps.apply({ posting: { maxPostsPerHour: 9 } });
+    expect(calls).toEqual([9]);
+  });
+
+  it('does NOT fire when an unrelated field changes', () => {
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+    ]);
+    deps.apply({ posting: { dryRun: false } });
+    expect(calls).toEqual([]);
+  });
+
+  it('does NOT fire when the save reasserts the value already in effect', () => {
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+    ]);
+    deps.apply({ posting: { maxPostsPerHour: 3 } }); // config.yaml already says 3
+    expect(calls).toEqual([]);
+  });
+
+  it('does NOT fire on a rejected (invalid) save', () => {
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+    ]);
+    const result = deps.apply({ posting: { maxPostsPerHour: -1 } });
+    expect(result.ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('fires each independently-changed hook exactly once, ignores untouched ones', () => {
+    const changed: string[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'posting.maxPostsPerHour', apply: () => changed.push('rate') },
+      { path: 'posting.dryRun', apply: () => changed.push('dryRun') },
+      { path: 'storage.retentionDays', apply: () => changed.push('retention') },
+    ]);
+    deps.apply({ posting: { maxPostsPerHour: 9, dryRun: false } });
+    expect(changed.sort()).toEqual(['dryRun', 'rate']);
+  });
+
+  it('a throwing hook does not fail the save or block later hooks from running', () => {
+    // The write and the in-memory mutation already succeeded by the time
+    // hooks run — a hook is a best-effort notification, not a step the
+    // save can still fail on.
+    const ran: string[] = [];
+    const deps = makeDepsWithHooks([
+      {
+        path: 'posting.maxPostsPerHour',
+        apply: () => {
+          throw new Error('boom');
+        },
+      },
+      { path: 'posting.dryRun', apply: () => ran.push('dryRun') },
+    ]);
+    const result = deps.apply({ posting: { maxPostsPerHour: 9, dryRun: false } });
+    expect(result).toEqual({ ok: true });
+    expect(ran).toEqual(['dryRun']);
+    // The save itself is unaffected by the throw.
+    expect(deps.describe().effective.posting.maxPostsPerHour).toBe(9);
+  });
+
+  it('receives the up-to-date effective config as its second argument', () => {
+    let seenRate: number | undefined;
+    const deps = makeDepsWithHooks([
+      {
+        path: 'posting.maxPostsPerHour',
+        apply: (_v, config) => {
+          seenRate = config.posting.maxPostsPerHour;
+        },
+      },
+    ]);
+    deps.apply({ posting: { maxPostsPerHour: 9 } });
+    expect(seenRate).toBe(9);
+  });
+});

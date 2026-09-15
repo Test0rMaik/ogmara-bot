@@ -59,7 +59,7 @@ export type Overrides = Record<string, unknown>;
  * merge, and the path writer each refuse them independently, so no single
  * forgotten check restores the hole.
  */
-const DANGEROUS_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
+export const DANGEROUS_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
 
 /**
  * Config sections the overrides layer may never carry.

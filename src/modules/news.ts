@@ -138,29 +138,61 @@ export function createNewsModule(deps: NewsDeps): BotModule {
     schemas: { sources: sourcesSchema as ZodTypeAny },
 
     // Cron schedules and the source list are read once, at `start()`, and
-    // registered as jobs — there is no live-apply path, so a change is
-    // restart-required across the board.
+    // registered as jobs/baked into a Source object — there is no live-apply
+    // path for those, so a change is restart-required. The exceptions are
+    // the handful of fields pipeline.ts reads fresh out of `config.sources.*`
+    // on every run instead (fetchImages, the two image-size/timeout caps,
+    // and imagedir's contentRating) — those are marked live below.
     uiSchema: {
       'sources.rss.enabled': { label: 'field.sources.rss.enabled.label', restart: true },
-      'sources.rss.schedule': { label: 'field.sources.rss.schedule.label', restart: true },
+      // Live only in the sense that matters: if this source is already
+      // running (`enabled` was true at the last restart), index.ts
+      // reschedules its actual cron job. If it's currently disabled there is
+      // no job to reschedule — but there's also nothing this value could be
+      // wrong ABOUT until `enabled` (still restart: true) turns it on, at
+      // which point the restart that flips `enabled` picks up whatever
+      // `schedule` value is current anyway.
+      'sources.rss.schedule': { label: 'field.sources.rss.schedule.label', restart: false },
       'sources.rss.feeds': {
         label: 'field.sources.rss.feeds.label',
         help: 'field.sources.rss.feeds.help',
         restart: true,
       },
+      'sources.rss.fetchImages': {
+        label: 'field.sources.rss.fetchImages.label',
+        restart: false, // read live: pipeline.ts
+      },
+      'sources.rss.maxImageBytes': {
+        label: 'field.sources.rss.maxImageBytes.label',
+        restart: false, // read live: pipeline.ts
+      },
+      'sources.rss.imageTimeoutMs': {
+        label: 'field.sources.rss.imageTimeoutMs.label',
+        restart: false, // read live: pipeline.ts
+      },
       'sources.topics.enabled': { label: 'field.sources.topics.enabled.label', restart: true },
-      'sources.topics.schedule': { label: 'field.sources.topics.schedule.label', restart: true },
+      // See the comment on sources.rss.schedule above — same caveat.
+      'sources.topics.schedule': { label: 'field.sources.topics.schedule.label', restart: false },
       'sources.topics.topics': {
         label: 'field.sources.topics.topics.label',
         help: 'field.sources.topics.topics.help',
         restart: true,
       },
       'sources.imagedir.enabled': { label: 'field.sources.imagedir.enabled.label', restart: true },
-      'sources.imagedir.schedule': { label: 'field.sources.imagedir.schedule.label', restart: true },
+      // See the comment on sources.rss.schedule above — same caveat.
+      'sources.imagedir.schedule': { label: 'field.sources.imagedir.schedule.label', restart: false },
       'sources.imagedir.directories': {
         label: 'field.sources.imagedir.directories.label',
         help: 'field.sources.imagedir.directories.help',
         restart: true,
+      },
+      'sources.imagedir.maxBytes': {
+        label: 'field.sources.imagedir.maxBytes.label',
+        restart: false, // read live: pipeline.ts
+      },
+      'sources.imagedir.contentRating': {
+        label: 'field.sources.imagedir.contentRating.label',
+        restart: false, // read live: pipeline.ts
       },
     },
 
@@ -247,7 +279,7 @@ export function createNewsModule(deps: NewsDeps): BotModule {
           ctx.log(`\n[${new Date().toISOString()}] ${name} run`);
           deps.report(await runPipelineOnce(pipelineDeps(ctx)));
         });
-        jobs.push({ name, cron, job });
+        jobs.push({ name, cron, job, configPath: `sources.${name}.schedule` });
         ctx.log(`Schedule: ${name} "${cron}" — next ${job.nextRun()?.toISOString() ?? 'never'}`);
       }
 

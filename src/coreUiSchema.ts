@@ -29,12 +29,20 @@ export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
   'posting.dryRun': {
     label: 'field.posting.dryRun.label',
     help: 'field.posting.dryRun.help',
-    // A confirmation step in EITHER direction: turning it off points a live
-    // wallet at a live network under the operator's identity, and turning it
-    // on is how someone stops a bot that is posting — exactly when a wrong
-    // answer about whether it took effect does the most damage.
-    restart: true,
+    // Read fresh from `ctx.config` on every publish attempt (ogmara.ts,
+    // modules/commands/index.ts, pipeline.ts) — genuinely live once the
+    // config-object disconnect is fixed (see `applyConfigInPlace`), no
+    // setter needed. Still `confirm: true` regardless of restart status:
+    // turning it off points a live wallet at a live network under the
+    // operator's identity, and turning it on is how someone stops a bot
+    // that is posting — exactly when a wrong answer about whether it took
+    // effect does the most damage, restart or not.
+    restart: false,
     confirm: true,
+  },
+  'posting.contentRating': {
+    label: 'field.posting.contentRating.label',
+    restart: false, // read live: ogmara.ts's publish() call
   },
   'posting.maxPostsPerHour': {
     label: 'field.posting.maxPostsPerHour.label',
@@ -45,6 +53,18 @@ export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
   'posting.nodeBurstRegistered': { label: 'field.posting.nodeBurstRegistered.label', restart: false },
   'posting.nodeDailyUnverified': { label: 'field.posting.nodeDailyUnverified.label', restart: false },
   'posting.nodeDailyRegistered': { label: 'field.posting.nodeDailyRegistered.label', restart: false },
+  'posting.disclosureTag': {
+    label: 'field.posting.disclosureTag.label',
+    restart: false, // read live: pipeline.ts's requiredTags()
+  },
+  'posting.alwaysTags': {
+    label: 'field.posting.alwaysTags.label',
+    restart: false, // read live: pipeline.ts's requiredTags()
+  },
+  'posting.includeSourceLink': {
+    label: 'field.posting.includeSourceLink.label',
+    restart: false, // read live: pipeline.ts's withAttribution()
+  },
 
   'ai.provider': {
     label: 'field.ai.provider.label',
@@ -57,6 +77,13 @@ export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
   'ai.effort': { label: 'field.ai.effort.label', restart: true },
   'ai.maxTokens': { label: 'field.ai.maxTokens.label', restart: true },
   'ai.promptPath': { label: 'field.ai.promptPath.label', restart: true },
+  // The four below are read live, fresh per pipeline run, straight from
+  // `config.ai.*` inside pipeline.ts — unlike `model`/`provider`/`baseUrl`
+  // above, nothing bakes them into the AI client at construction.
+  'ai.targetContentChars': { label: 'field.ai.targetContentChars.label', restart: false },
+  'ai.maxTags': { label: 'field.ai.maxTags.label', restart: false },
+  'ai.maxSourceTitleChars': { label: 'field.ai.maxSourceTitleChars.label', restart: false },
+  'ai.maxSourceSummaryChars': { label: 'field.ai.maxSourceSummaryChars.label', restart: false },
 
   'profile.displayName': {
     label: 'field.profile.displayName.label',
@@ -72,7 +99,7 @@ export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
   'storage.retentionDays': { label: 'field.storage.retentionDays.label', restart: false },
 
   'stats.enabled': { label: 'field.stats.enabled.label', restart: true },
-  'stats.schedule': { label: 'field.stats.schedule.label', restart: true },
+  'stats.schedule': { label: 'field.stats.schedule.label', restart: false }, // live: index.ts reschedules the cron job
   'stats.retentionDays': { label: 'field.stats.retentionDays.label', restart: false },
 
   // File-only — labels for DISPLAY only; the API refuses any write here

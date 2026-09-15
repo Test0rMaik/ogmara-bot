@@ -101,12 +101,27 @@ export function renderPage(ctx: PageContext): string {
   .header-controls { display: flex; gap: 0.6rem; align-items: center; }
   .header-controls select { width: auto; padding: 0.3rem 0.5rem; font-size: 0.85rem; }
 
-  .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
-  .tabs { display: flex; gap: 0.5rem; border-bottom: 1px solid var(--border); margin-bottom: 1rem; flex-wrap: wrap; }
-  .tab-btn { background: none; color: var(--muted); border: none; border-bottom: 2px solid transparent;
-             border-radius: 0; padding: 0.5rem 0.25rem; margin-bottom: -1px; }
-  .tab-btn.active { color: var(--fg); border-bottom-color: var(--accent); }
-  .tab-btn:hover:not(.active) { color: var(--fg-secondary); }
+  .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem; }
+
+  /* ── Sidebar rail (primary nav) ── */
+  .app-grid { display: grid; grid-template-columns: 210px 1fr; gap: 1.5rem; align-items: start; }
+  @media (max-width: 720px) { .app-grid { grid-template-columns: 1fr; } }
+  .rail { display: flex; flex-direction: column; gap: 0.15rem; position: sticky; top: 1rem; }
+  .rail-item { display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left;
+               background: none; color: var(--fg-secondary); border: none; border-radius: 8px;
+               padding: 0.55rem 0.6rem; font: inherit; font-size: 0.9rem; cursor: pointer; }
+  .rail-item:hover:not(.active) { background: var(--surface-sunken); color: var(--fg); }
+  .rail-item.active { background: var(--chip-bg); color: var(--accent); font-weight: 600; }
+  .rail-item .rail-glyph { width: 22px; height: 22px; border-radius: 6px; background: var(--surface-sunken);
+                            display: grid; place-items: center; flex: none; font-size: 0.8rem; }
+  .rail-item.active .rail-glyph { background: var(--accent); color: var(--accent-fg); }
+  .rail-subnav { display: flex; flex-direction: column; gap: 0.1rem; margin: 0.15rem 0 0.4rem 1.5rem; }
+  .rail-subitem { display: block; width: 100%; text-align: left; background: none; color: var(--muted);
+                  border: none; border-radius: 6px; padding: 0.35rem 0.5rem; font: inherit; font-size: 0.8rem;
+                  cursor: pointer; }
+  .rail-subitem:hover:not(.active) { color: var(--fg-secondary); background: var(--surface-sunken); }
+  .rail-subitem.active { color: var(--accent); background: var(--chip-bg); }
+  .rail-main { min-width: 0; }
 
   .quick-stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0 0 1.2rem; }
   .quick-stats div { min-width: 6rem; }
@@ -163,6 +178,7 @@ export function renderPage(ctx: PageContext): string {
           border-radius: 999px; padding: 0.05rem 0.55rem; font-size: 0.72rem; white-space: nowrap; }
   .chip.chip-ui { color: var(--accent); border-color: var(--accent); }
   .chip.chip-restart { color: var(--banner-fg); border-color: var(--banner-border); }
+  .chip.chip-live { color: var(--success); border-color: var(--success); }
   .reset-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 6px;
                padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; font-family: inherit; }
   .reset-btn:hover:not(:disabled) { color: var(--fg); border-color: var(--accent); }
@@ -241,13 +257,24 @@ export function renderPage(ctx: PageContext): string {
       <button id="logout-btn" data-i18n="header.logout">Log out</button>
     </div>
 
-    <nav class="tabs">
-      <button class="tab-btn active" id="tab-btn-dashboard" data-tab="dashboard" data-i18n="nav.dashboard">Dashboard</button>
-      <button class="tab-btn" id="tab-btn-settings" data-tab="settings" data-i18n="nav.account">Account</button>
-      <button class="tab-btn" id="tab-btn-config" data-tab="config" data-i18n="nav.config">Configuration</button>
-      <button class="tab-btn" id="tab-btn-audit" data-tab="audit" data-i18n="nav.audit">Audit log</button>
+    <div class="app-grid">
+    <nav class="rail" aria-label="Panel sections">
+      <button class="rail-item active" id="tab-btn-dashboard" data-tab="dashboard">
+        <span class="rail-glyph" aria-hidden="true">◔</span><span data-i18n="nav.dashboard">Dashboard</span>
+      </button>
+      <button class="rail-item" id="tab-btn-settings" data-tab="settings">
+        <span class="rail-glyph" aria-hidden="true">◐</span><span data-i18n="nav.account">Account</span>
+      </button>
+      <button class="rail-item" id="tab-btn-config" data-tab="config">
+        <span class="rail-glyph" aria-hidden="true">▤</span><span data-i18n="nav.config">Configuration</span>
+      </button>
+      <div class="rail-subnav" id="config-subnav" hidden></div>
+      <button class="rail-item" id="tab-btn-audit" data-tab="audit">
+        <span class="rail-glyph" aria-hidden="true">▾</span><span data-i18n="nav.audit">Audit log</span>
+      </button>
     </nav>
 
+    <main class="rail-main">
     <div id="tab-dashboard" class="tab-content">
       <div class="dashboard-toolbar">
         <button id="refresh-dashboard-btn" class="secondary-btn" data-i18n="dashboard.refresh">Refresh</button>
@@ -366,6 +393,8 @@ export function renderPage(ctx: PageContext): string {
           <tbody id="audit-tbody"></tbody>
         </table>
       </div>
+    </div>
+    </main>
     </div>
   </div>
 
@@ -512,6 +541,11 @@ themeSelect.addEventListener('change', () => {
   } catch {
     /* private browsing, storage disabled — the choice just won't persist */
   }
+  // The chart's line/label colors are resolved once at render time (SVG
+  // presentation attributes, not live CSS), so a theme flip needs an
+  // explicit repaint — otherwise it stays the OLD theme's colors until the
+  // next unrelated refresh. Repaints from cached data, no network fetch.
+  if (chartHistory) renderChart();
 });
 
 // Applied immediately, before login even resolves, so the login screen itself
@@ -684,12 +718,13 @@ function renderBotIdentity(bot) {
 }
 
 function switchTab(name) {
-  for (const btn of document.querySelectorAll('.tab-btn')) {
+  for (const btn of document.querySelectorAll('.rail-item')) {
     btn.classList.toggle('active', btn.dataset.tab === name);
   }
   for (const content of document.querySelectorAll('.tab-content')) {
     content.hidden = content.id !== 'tab-' + name;
   }
+  document.getElementById('config-subnav').hidden = name !== 'config';
   // Otherwise the dashboard only ever reflects whatever was true at page
   // load — "Queued" in particular is the one genuinely live number here
   // (the retry queue actually drains over time), so leaving it frozen is
@@ -952,6 +987,15 @@ function selectChartRange(range) {
   renderChart();
 }
 
+// SVG presentation attributes don't resolve var(--token) the way CSS
+// properties do in every browser this panel has to support, so the chart
+// reads the CURRENTLY active theme's resolved value instead of hardcoding
+// the dark-default palette — otherwise the chart stayed dark-themed even
+// after switching the picker to light.
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
 function renderChart() {
   const svg = document.getElementById('chart-svg');
   const emptyEl = document.getElementById('chart-empty');
@@ -1028,14 +1072,14 @@ function renderChart() {
   const polyline = document.createElementNS(ns, 'polyline');
   polyline.setAttribute('points', coords);
   polyline.setAttribute('fill', 'none');
-  polyline.setAttribute('stroke', '#3a6ff7');
+  polyline.setAttribute('stroke', cssVar('--accent'));
   polyline.setAttribute('stroke-width', '2');
   svg.appendChild(polyline);
 
   const startLabel = document.createElementNS(ns, 'text');
   startLabel.setAttribute('x', String(pad));
   startLabel.setAttribute('y', String(height - 8));
-  startLabel.setAttribute('fill', '#9aa0a8');
+  startLabel.setAttribute('fill', cssVar('--muted'));
   startLabel.setAttribute('font-size', '10');
   startLabel.textContent = formatChartDate(minX, granularity);
   svg.appendChild(startLabel);
@@ -1043,7 +1087,7 @@ function renderChart() {
   const endLabel = document.createElementNS(ns, 'text');
   endLabel.setAttribute('x', String(width - pad));
   endLabel.setAttribute('y', String(height - 8));
-  endLabel.setAttribute('fill', '#9aa0a8');
+  endLabel.setAttribute('fill', cssVar('--muted'));
   endLabel.setAttribute('font-size', '10');
   endLabel.setAttribute('text-anchor', 'end');
   endLabel.textContent = formatChartDate(maxX, granularity);
@@ -1052,7 +1096,7 @@ function renderChart() {
   const latestLabel = document.createElementNS(ns, 'text');
   latestLabel.setAttribute('x', String(width - pad));
   latestLabel.setAttribute('y', String(pad - 10));
-  latestLabel.setAttribute('fill', '#e6e6e6');
+  latestLabel.setAttribute('fill', cssVar('--fg'));
   latestLabel.setAttribute('font-size', '12');
   latestLabel.setAttribute('text-anchor', 'end');
   // The last bucket in a delta series is always the CURRENT, still-in-
@@ -1440,6 +1484,72 @@ const CONFIG_SECTION_ORDER = [
   'queue', 'storage', 'stats', 'panel', 'settings',
 ];
 
+// The rail's Configuration sub-nav groups the flat sections above into
+// fewer topics. A section not listed here falls back to its own name as
+// its own one-section group, so a future module's top-level section still
+// shows up somewhere rather than vanishing from the topic filter.
+const CONFIG_TOPIC_GROUPS = [
+  { id: 'node', labelKey: 'config.topic.node', sections: ['node'] },
+  { id: 'posting', labelKey: 'config.topic.posting', sections: ['posting'] },
+  { id: 'ai', labelKey: 'config.topic.ai', sections: ['ai'] },
+  { id: 'sources', labelKey: 'config.topic.sources', sections: ['sources'] },
+  { id: 'bot', labelKey: 'config.topic.bot', sections: ['bot'] },
+  { id: 'profile', labelKey: 'config.topic.profile', sections: ['profile'] },
+  { id: 'storage', labelKey: 'config.topic.storage', sections: ['queue', 'storage', 'stats'] },
+  { id: 'panel', labelKey: 'config.topic.panel', sections: ['panel', 'settings'] },
+];
+
+function topicForSection(section) {
+  const group = CONFIG_TOPIC_GROUPS.find((g) => g.sections.includes(section));
+  return group ? group.id : section;
+}
+
+let currentConfigTopic = CONFIG_TOPIC_GROUPS[0].id;
+
+function renderConfigSubnav() {
+  const host = document.getElementById('config-subnav');
+  host.textContent = '';
+
+  // A section from a module CONFIG_TOPIC_GROUPS doesn't know about (see the
+  // comment above that constant) still needs a way to be selected — every
+  // section \`applyConfigTopicFilter()\` can hide must have a button that can
+  // un-hide it, or it renders into the DOM and then stays invisible forever
+  // with no path back. Mirrors the fallback \`renderConfigSections()\` already
+  // uses for an unlabeled section heading: humanize the raw id.
+  const knownSections = new Set(CONFIG_TOPIC_GROUPS.flatMap((g) => g.sections));
+  const extraSections = [...new Set(configFields.map((f) => f.path.split('.')[0]))]
+    .filter((s) => !knownSections.has(s))
+    .sort();
+  const groups = [
+    ...CONFIG_TOPIC_GROUPS,
+    ...extraSections.map((s) => ({ id: s, labelKey: null })),
+  ];
+
+  for (const group of groups) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rail-subitem' + (group.id === currentConfigTopic ? ' active' : '');
+    btn.dataset.topic = group.id;
+    btn.textContent = group.labelKey ? t(group.labelKey) : humanizeFieldLabel(group.id);
+    btn.addEventListener('click', () => selectConfigTopic(group.id));
+    host.appendChild(btn);
+  }
+}
+
+function selectConfigTopic(topicId) {
+  currentConfigTopic = topicId;
+  for (const btn of document.querySelectorAll('#config-subnav .rail-subitem')) {
+    btn.classList.toggle('active', btn.dataset.topic === topicId);
+  }
+  applyConfigTopicFilter();
+}
+
+function applyConfigTopicFilter() {
+  for (const sectionEl of document.querySelectorAll('#config-sections .config-section')) {
+    sectionEl.hidden = sectionEl.dataset.topic !== currentConfigTopic;
+  }
+}
+
 let configFields = [];
 let configSecrets = {};
 // path -> new value, for every field the operator has actually touched this
@@ -1815,6 +1925,15 @@ function buildFieldRow(field) {
     restartChip.className = 'chip chip-restart';
     restartChip.textContent = t('config.restart.badge');
     actions.appendChild(restartChip);
+  } else {
+    // restart === false: the schema already promises this field applies
+    // without a restart. Shown honestly either way — Phase A only renders
+    // what the schema already says; whether that promise is actually kept
+    // by the running process is a backend concern, not this UI's.
+    const liveChip = document.createElement('span');
+    liveChip.className = 'chip chip-live';
+    liveChip.textContent = t('config.live.badge');
+    actions.appendChild(liveChip);
   }
 
   if (!field.fileOnly) {
@@ -1895,6 +2014,7 @@ function renderConfigSections() {
     if (!fields || fields.length === 0) continue;
     const sectionEl = document.createElement('div');
     sectionEl.className = 'config-section';
+    sectionEl.dataset.topic = topicForSection(section);
     const heading = document.createElement('h3');
     heading.textContent = t('config.section.' + section) === 'config.section.' + section
       ? humanizeFieldLabel(section)
@@ -1903,6 +2023,11 @@ function renderConfigSections() {
     for (const field of fields) sectionEl.appendChild(buildFieldRow(field));
     host.appendChild(sectionEl);
   }
+  // Rebuilt every time, not just at init/locale-switch: a section this
+  // subnav doesn't have a static group for only exists once \`configFields\`
+  // has actually loaded, so this is the one call site that can always see it.
+  renderConfigSubnav();
+  applyConfigTopicFilter();
 }
 
 async function refreshConfig() {
@@ -2118,6 +2243,7 @@ async function refreshAudit() {
  */
 function refreshLocalizedViews() {
   applyStaticI18n();
+  renderConfigSubnav();
   // null specifically means "never fetched" — re-rendering it would show a
   // wrong "not enabled" state on an Account tab nobody has opened yet.
   if (lastBotIdentity !== null) renderBotIdentity(lastBotIdentity);
@@ -2168,9 +2294,10 @@ document.getElementById('audit-filter-clear').addEventListener('click', () => {
   document.getElementById('audit-filter-outcome').value = '';
   renderAuditTable();
 });
-for (const btn of document.querySelectorAll('.tab-btn')) {
+for (const btn of document.querySelectorAll('.rail-item')) {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 }
+renderConfigSubnav();
 for (const btn of document.querySelectorAll('.chart-metric-btn')) {
   btn.addEventListener('click', () => selectChartMetric(btn.dataset.metric));
 }

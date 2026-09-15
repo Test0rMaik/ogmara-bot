@@ -62,7 +62,7 @@ export const NEAR_DUPLICATE_WINDOW = 200;
 /** Tracks posted items and prevents re-posting them. */
 export class Ledger {
   readonly #path: string;
-  readonly #retentionMs: number;
+  #retentionMs: number;
   #entries: LedgerEntry[];
   #keys: Set<string>;
   #failures: Map<string, number>;
@@ -78,6 +78,15 @@ export class Ledger {
     this.#keys = new Set(entries.map((e) => e.key));
     this.#retentionMs = retentionDays * 86_400_000;
     this.#failures = new Map(Object.entries(failures));
+  }
+
+  /**
+   * Live-apply a new `storage.retentionDays` without restarting. Takes
+   * effect on the next prune (save), same as it always has — this only
+   * changes what that prune computes, not when it runs.
+   */
+  setRetentionDays(days: number): void {
+    this.#retentionMs = days * 86_400_000;
   }
 
   /**

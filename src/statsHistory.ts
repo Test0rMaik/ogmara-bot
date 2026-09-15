@@ -74,7 +74,7 @@ export const MAX_SNAPSHOTS = 5000;
 /** Tracks periodic engagement snapshots for the dashboard chart. */
 export class StatsHistory {
   readonly #path: string;
-  readonly #retentionMs: number;
+  #retentionMs: number;
   #snapshots: StatsSnapshot[];
   /** True when the on-disk file couldn't be read for an unknown reason — see the module comment. */
   readonly #readOnly: boolean;
@@ -89,6 +89,15 @@ export class StatsHistory {
     this.#snapshots = snapshots;
     this.#retentionMs = retentionDays * 86_400_000;
     this.#readOnly = readOnly;
+  }
+
+  /**
+   * Live-apply a new `stats.retentionDays` without restarting. Takes effect
+   * on the next prune, same as it always has — this only changes what that
+   * prune computes, not when it runs.
+   */
+  setRetentionDays(days: number): void {
+    this.#retentionMs = days * 86_400_000;
   }
 
   /**

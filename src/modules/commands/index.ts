@@ -286,7 +286,11 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       'bot.autoJoin.schedule': {
         label: 'field.bot.autoJoin.schedule.label',
         help: 'field.bot.autoJoin.schedule.help',
-        restart: true,
+        // Live: index.ts reschedules the actual cron job (see
+        // `ModuleJob.configPath`). Unlike the news module's per-source
+        // schedules, this job always exists whenever `bot.enabled` is true —
+        // there's no separate autoJoin sub-flag that could leave it unset.
+        restart: false,
       },
       'bot.autoJoin.statePath': {
         label: 'field.bot.autoJoin.statePath.label',
@@ -586,7 +590,12 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
           `${autoJoinJob.nextRun()?.toISOString() ?? 'never'}`,
       );
       const jobs: ModuleJob[] = [
-        { name: 'commands-autojoin', cron: cfg.autoJoin.schedule, job: autoJoinJob },
+        {
+          name: 'commands-autojoin',
+          cron: cfg.autoJoin.schedule,
+          job: autoJoinJob,
+          configPath: 'bot.autoJoin.schedule',
+        },
       ];
 
       return {
