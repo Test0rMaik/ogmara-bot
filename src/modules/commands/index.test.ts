@@ -8,6 +8,7 @@ import type { Config } from '../../config.js';
 import type { BotContext } from '../types.js';
 import { botSchema, type BotConfig } from './schema.js';
 import { createCommandsModule, type ChannelFacts, type CommandsDeps } from './index.js';
+import { saveAutoJoinState } from './autojoin.js';
 import { capFor } from './rateLimit.js';
 import type { CommandHandler } from './handlers.js';
 
@@ -47,6 +48,10 @@ function depsWith(over: Partial<CommandsDeps> = {}): CommandsDeps {
     publishDescriptor: vi.fn(async () => {}),
     joinChannel: vi.fn(async (_channelId: number) => {}),
     getNotifications: vi.fn(async (_since?: number) => []),
+    decryptChannelText: vi.fn(
+      async (_channelId: number, _encContent: Uint8Array, _encNonce: Uint8Array, _keyEpoch: number) =>
+        'waiting' as const,
+    ),
     ...over,
   };
 }
@@ -136,17 +141,20 @@ describe('commands module preflight', () => {
     expect(failure!.message).toContain('channel 7');
   });
 
-  it('refuses an ENCRYPTED channel instead of posting plaintext into it', async () => {
-    // In an encrypted channel the bot reads ciphertext it has no key for, so it
-    // answers nothing — and a plaintext reply would downgrade a channel whose
-    // policy is encrypt-on-send. Not only private channels: new PUBLIC channels
-    // are created with encryption forced on, which is what makes a
-    // private-only check wave through most modern channels.
+  it('accepts an ENCRYPTED channel in bot.channels rather than refusing to start', async () => {
+    // REGRESSION GUARD (spec-compliance finding, 2026-09-15): this build can
+    // now decrypt/reply once a member's client serves it a key
+    // (channelKeys.ts) — a hard preflight refusal here would make the ENTIRE
+    // decrypt/reply feature unreachable for every statically-configured
+    // channel, since new Public/ReadPublic/Private channels are all created
+    // with encryption forced on by default (spec §3.6). An encrypted
+    // `bot.channels` entry must start successfully and let `handleMessage`'s
+    // decrypt-and-retry logic sort out whether it ever becomes usable.
     const deps = depsWith({
       describeChannel: vi.fn(async () => ({ name: 'secret', encrypted: true, canPost: true })),
     });
     const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
-    expect(failure!.message).toContain('encrypted');
+    expect(failure).toBeNull();
   });
 
   it('strips control characters from the channel name in a preflight failure message', async () => {
@@ -158,8 +166,8 @@ describe('commands module preflight', () => {
     const deps = depsWith({
       describeChannel: vi.fn(async () => ({
         name: 'evil\x1b[31mFAKE\x1b[0m',
-        encrypted: true,
-        canPost: true,
+        encrypted: false,
+        canPost: false,
       })),
     });
     const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
@@ -675,7 +683,14 @@ describe('commands module auto-join', () => {
     await second.stop();
   });
 
-  it('removes a channel from the auto-answer set once it turns encrypted', async () => {
+  it('keeps the auto-answer grant when a channel transitions to encrypted, rather than revoking on sight', async () => {
+    // REGRESSION GUARD (spec-compliance finding, 2026-09-15): 0.27.0-era
+    // behavior revoked a grant the instant a channel's metadata turned
+    // encrypted, because that build could never decrypt anything there,
+    // ever. This build can, once a member's client serves it a key — so the
+    // transition alone must not cost the slot; the channel is treated like
+    // any other that hasn't yet proven it can decrypt (see
+    // `maxUnservedEncryptedHours`), not revoked on sight.
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '99',
@@ -686,18 +701,81 @@ describe('commands module auto-join', () => {
     const first = await startAndCapture(depsWith({ getNotifications }), ctxWith(configWith(cfgWithAutoJoin())));
     await first.stop();
 
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
       id === 99 ? { name: 'now secret', encrypted: true, canPost: true } : publicChannel,
     );
     const noNewInvites = vi.fn(async (_since?: number) => []);
     const second = await startAndCapture(
-      depsWith({ reply, describeChannel, getNotifications: noNewInvites }),
+      depsWith({ describeChannel, getNotifications: noNewInvites }),
       ctxWith(configWith(cfgWithAutoJoin())),
     );
-    second.deliver(msg('/about', { channel: 99, mentions: ['klv1bot'] }));
     await settle();
+
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
+    await second.stop();
+  });
+
+  it('reaps a slot whose channel never decrypts, even though its OWN metadata still says unencrypted', async () => {
+    // REGRESSION GUARD (security-audit finding, 2026-09-15). A channel's
+    // metadata declaring itself unencrypted is NOT proof its traffic is
+    // readable — a Public/ReadPublic channel legitimately stays
+    // `encrypted: false` forever while every message it carries fabricated
+    // enc_content/enc_nonce/key_epoch fields that never decrypt (no real
+    // key was ever wrapped for it). The two existing checks above (gone /
+    // now-genuinely-encrypted) never fire for this case, so without this
+    // check a cheap, permanently-empty channel could squat a slot forever
+    // for the price of one invite.
+    const encryptedPayload = Array.from(
+      encode({
+        content: '',
+        mentions: ['klv1bot'],
+        enc_content: new Uint8Array([1, 2, 3]),
+        enc_nonce: new Uint8Array(24).fill(9),
+        key_epoch: 1,
+      }),
+    );
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const decryptChannelText = vi.fn<CommandsDeps['decryptChannelText']>(async () => 'waiting');
+    const first = await startAndCapture(
+      depsWith({ getNotifications, decryptChannelText }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    first.deliver({ ...msg('', { channel: 99, mentions: ['klv1bot'] }), payload: encryptedPayload } as Envelope);
+    await settle();
+    await first.stop();
+
+    // The channel has sat unserved for well past the (default 24h) grace
+    // period — simulated by backdating the recorded first-unserved
+    // timestamp directly in the state file, rather than needing fake timers.
+    const midState = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(midState.encryptedSince).toHaveProperty('99'); // sanity: tracking actually started
+    saveAutoJoinState(statePath, {
+      lastHandledTs: midState.lastHandledTs,
+      answerChannelIds: midState.answerChannelIds,
+      encryptedSince: { 99: Date.now() - 25 * 3_600_000 },
+    });
+
+    // Second run: metadata STILL says unencrypted (the attack's whole
+    // point), and it never decrypts anything this run either.
+    const reply = vi.fn(async () => {});
+    const noNewInvites = vi.fn(async (_since?: number) => []);
+    const second = await startAndCapture(
+      depsWith({ reply, getNotifications: noNewInvites, decryptChannelText }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+    second.deliver({ ...msg('', { channel: 99, mentions: ['klv1bot'] }), payload: encryptedPayload } as Envelope);
+    await settle();
+
     expect(reply).not.toHaveBeenCalled();
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).not.toContain(99); // the slot was freed
     await second.stop();
   });
 
@@ -751,15 +829,13 @@ describe('commands module auto-join', () => {
     expect(joinChannel).toHaveBeenCalledTimes(1);
   });
 
-  it('JOINS an invite to an ENCRYPTED channel — membership only, still cannot answer there', async () => {
+  it('JOINS an invite to an ENCRYPTED channel', async () => {
     // A private channel is currently the ONLY channel type the client UI can
     // even invite to, so refusing to join an encrypted invite would make
     // invite-driven auto-join a no-op in every real-world case that exists
     // today. There is no confirmation step on this wallet's side anywhere in
     // the pipeline (an explicit design choice — the bot owner never approves
-    // invites one by one), and joining costs nothing: this build still
-    // cannot decrypt or answer there, and `bot.channels` (unaffected by
-    // this) remains the only thing that makes it answer anywhere.
+    // invites one by one).
     const joinChannel = vi.fn(async (_id: number) => {});
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
       id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
@@ -779,10 +855,15 @@ describe('commands module auto-join', () => {
     expect(joinChannel).toHaveBeenCalledWith(99);
   });
 
-  it('does NOT add an encrypted invited channel to answering either', async () => {
-    // Same boundary as the plaintext case: membership must never expand
-    // bot.channels, encrypted or not.
-    const subscribeChannels = vi.fn(async (_channels: number[]) => () => {});
+  it('ALSO grants an encrypted invited channel an answer slot, same as a plaintext one', async () => {
+    // REGRESSION GUARD (spec-compliance finding, 2026-09-15): this build can
+    // now decrypt/reply once a member's client serves it a key
+    // (channelKeys.ts), so an encrypted invite must be granted an answer
+    // slot exactly like a plaintext one, subject to the same cap — treating
+    // it as membership-only forever (the 0.27.0-era behavior) would make
+    // this feature permanently unreachable through the invite path, since
+    // new Public/ReadPublic/Private channels are all created encrypted by
+    // default (spec §3.6).
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
       id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
     );
@@ -794,7 +875,30 @@ describe('commands module auto-join', () => {
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
     const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7] })));
-    const mod = createCommandsModule(depsWith({ subscribeChannels, describeChannel, getNotifications }));
+    const mod = createCommandsModule(depsWith({ describeChannel, getNotifications }));
+    await mod.preflight!(ctx);
+    await (await mod.start(ctx)).stop();
+
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
+  });
+
+  it('never expands the WebSocket subscription list with an auto-answered channel', async () => {
+    // `subscribeChannels` takes only the statically-configured `cfg.channels`
+    // — an invite-granted channel joins `autoAnsweredChannels` (a live JS-side
+    // set `handleMessage` checks directly) rather than causing a
+    // re-subscription, since the node broadcasts every public-channel
+    // message to every connected client regardless of what it subscribed to.
+    const subscribeChannels = vi.fn(async (_channels: number[]) => () => {});
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const ctx = ctxWith(configWith(cfgWithAutoJoin({ channels: [7] })));
+    const mod = createCommandsModule(depsWith({ subscribeChannels, getNotifications }));
     await mod.preflight!(ctx);
     await (await mod.start(ctx)).stop();
 
@@ -942,14 +1046,130 @@ describe('commands module auto-join', () => {
     expect(saved.lastHandledTs).toBe(2000);
   });
 
-  it('revokes an auto-answer grant on the first genuinely undecodable (encrypted) message', async () => {
-    // REGRESSION GUARD for a live finding (2026-09-14): a channel's
-    // encryption_enabled metadata was wrong/absent even though its
-    // messages were genuinely v2-encrypted, so the channel got auto-
-    // answer-granted despite the bot being unable to ever read anything
-    // there. Rather than keep insisting on a metadata check that proved
-    // wrong, the bot must self-correct on real evidence: the FIRST message
-    // it actually receives there that carries enc_content.
+  /** Build a real encrypted-message wire payload, as `buildEncryptedChannelMessage` would. */
+  function encryptedPayload(mentions: string[]): number[] {
+    return Array.from(
+      encode({
+        content: '',
+        mentions,
+        enc_content: new Uint8Array([1, 2, 3]),
+        enc_nonce: new Uint8Array(24).fill(9),
+        key_epoch: 1,
+      }),
+    );
+  }
+
+  it('keeps the auto-answer grant and does not reply while still waiting for a channel key', async () => {
+    // Real channel-key handling (2026-09-15) replaced the 0.27.0 stop-gap,
+    // which revoked the grant on the FIRST encrypted message because that
+    // build could never decrypt anything, ever. A build that CAN decrypt
+    // must instead keep the grant and keep retrying — the only reason to
+    // still be unable to read a message is that no other member's client
+    // has yet wrapped the current epoch key to this device (spec §8.1.1),
+    // which resolves itself once one comes online.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const decryptChannelText = vi.fn<CommandsDeps['decryptChannelText']>(async () => 'waiting');
+    const reply = vi.fn(async () => {});
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ getNotifications, decryptChannelText, reply }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+
+    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
+    deliver({ ...encryptedMsg, payload: encryptedPayload(['klv1bot']) } as Envelope);
+    await settle();
+
+    expect(decryptChannelText).toHaveBeenCalled();
+    expect(reply).not.toHaveBeenCalled();
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
+
+    // Not just "the persisted file still says 99" — the IN-MEMORY grant must
+    // still be live too, or this channel's traffic would be silently dropped
+    // by the `cfg.channels`/`autoAnsweredChannels` gate on every later
+    // message even though nothing ever rewrote the file. Prove it by
+    // delivering a second message, now with a key available, and checking it
+    // actually gets answered.
+    decryptChannelText.mockResolvedValueOnce({ text: '/about' });
+    deliver({
+      ...msg('', { channel: 99, mentions: ['klv1bot'] }),
+      payload: encryptedPayload(['klv1bot']),
+    } as Envelope);
+    await settle();
+    expect(reply).toHaveBeenCalled();
+
+    await stop();
+  });
+
+  it('keeps the auto-answer grant when a message fails to decrypt with the key this bot has', async () => {
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const decryptChannelText = vi.fn(async () => 'error' as const);
+    const reply = vi.fn(async () => {});
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ getNotifications, decryptChannelText, reply }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+
+    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
+    deliver({ ...encryptedMsg, payload: encryptedPayload(['klv1bot']) } as Envelope);
+    await settle();
+
+    expect(reply).not.toHaveBeenCalled();
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
+    await stop();
+  });
+
+  it('starts the unserved-encrypted clock even when decryptChannelText REJECTS outright', async () => {
+    // REGRESSION GUARD (re-audit finding, 2026-09-15). `decryptChannelText`'s
+    // real implementation rethrows anything it can't recognize as a clean
+    // 404 (a transient node 5xx, a network timeout) rather than resolving
+    // 'error' — and `key_epoch` on an incoming message is fully attacker-
+    // controlled, so a crafted value that makes the node answer with
+    // something other than a 404 would otherwise dodge `markUnservedEncrypted`
+    // and let the channel squat its slot forever, exactly the hole
+    // `maxUnservedEncryptedHours` exists to close. A rejection MUST be
+    // treated the same as an 'error' outcome, not silently swallowed.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const decryptChannelText = vi.fn<CommandsDeps['decryptChannelText']>(async () => {
+      throw new Error('API error (500): node hiccup');
+    });
+    const reply = vi.fn(async () => {});
+    const { deliver, stop } = await startAndCapture(
+      depsWith({ getNotifications, decryptChannelText, reply }),
+      ctxWith(configWith(cfgWithAutoJoin())),
+    );
+
+    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
+    deliver({ ...encryptedMsg, payload: encryptedPayload(['klv1bot']) } as Envelope);
+    await settle();
+
+    expect(reply).not.toHaveBeenCalled();
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99); // still a member/grant, just tracked as unserved
+    expect(saved.encryptedSince).toHaveProperty('99'); // the reap clock DID start
+    await stop();
+  });
+
+  it('starts the unserved-encrypted clock for a malformed encrypted message too', async () => {
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '99',
@@ -962,19 +1182,100 @@ describe('commands module auto-join', () => {
       ctxWith(configWith(cfgWithAutoJoin())),
     );
 
-    // A real encrypted envelope: content is an EMPTY STRING (present, not
-    // null) alongside enc_content — matching the live raw payload this
-    // guard was built from, and specifically NOT the shape a naive
-    // `content === null` check would have caught.
-    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
-    const payloadWithEncContent = Array.from(
-      encode({ content: '', mentions: ['klv1bot'], enc_content: [1, 2, 3], enc_nonce: [4, 5, 6] }),
+    // enc_content present (genuinely `encrypted`) but enc_nonce is the wrong
+    // length — decodeChatPayload yields encNonce: null, which handleMessage
+    // must treat as unserved rather than silently ignoring.
+    const malformed = Array.from(
+      encode({
+        content: '',
+        mentions: ['klv1bot'],
+        enc_content: new Uint8Array([1, 2, 3]),
+        enc_nonce: new Uint8Array(10), // wrong length — not 24 bytes
+        key_epoch: 1,
+      }),
     );
-    deliver({ ...encryptedMsg, payload: payloadWithEncContent } as Envelope);
+    deliver({ ...msg('', { channel: 99, mentions: ['klv1bot'] }), payload: malformed } as Envelope);
     await settle();
 
     const saved = JSON.parse(readFileSync(statePath, 'utf8'));
-    expect(saved.answerChannelIds).not.toContain(99);
+    expect(saved.encryptedSince).toHaveProperty('99');
+    await stop();
+  });
+
+  it('answers a command decrypted out of a genuinely encrypted channel', async () => {
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const decryptChannelText = vi.fn(async () => ({ text: '/about' }));
+    const reply = vi.fn(async () => {});
+    const { deliver, stop } = await startAndCapture(
+      depsWith({
+        getNotifications,
+        decryptChannelText,
+        reply,
+        handlersOverride: () =>
+          new Map([['about', { cost: 1, run: async () => 'hi' }]]),
+      }),
+      ctxWith(configWith(cfgWithAutoJoin({ commands: [{ name: 'about', description: 'who I am' }] }))),
+    );
+
+    // The decoded content is irrelevant here — `decryptChannelText` is mocked
+    // to return the real command text regardless of ciphertext — only the
+    // envelope shape (genuinely `encrypted`) matters for reaching that call.
+    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
+    deliver({ ...encryptedMsg, payload: encryptedPayload(['klv1bot']) } as Envelope);
+    await settle();
+
+    expect(decryptChannelText).toHaveBeenCalledWith(99, expect.any(Uint8Array), expect.any(Uint8Array), 1);
+    expect(reply).toHaveBeenCalledWith(99, 'hi', ['klv1user']);
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99); // never revoked
+    await stop();
+  });
+
+  it('answers in a channel correctly flagged encrypted by its own metadata — the real-world case', async () => {
+    // REGRESSION GUARD (spec-compliance finding, 2026-09-15): every other
+    // decrypt/reply test in this file uses `describeChannel` returning
+    // `encrypted: false` (the metadata-mismatch case `maxUnservedEncryptedHours`
+    // guards against), which meant NONE of them actually exercised the real-
+    // world path — a channel truthfully reporting `encrypted: true` — because
+    // the preflight/invite-loop/revalidation gates removed in this same
+    // change used to make that path unreachable outright. This is the one
+    // that proves the feature works for the case it was built for.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '99',
+      from: 'klv1owner',
+      timestamp: 1000,
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
+      id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
+    );
+    const decryptChannelText = vi.fn(async () => ({ text: '/about' }));
+    const reply = vi.fn(async () => {});
+    const { deliver, stop } = await startAndCapture(
+      depsWith({
+        getNotifications,
+        describeChannel,
+        decryptChannelText,
+        reply,
+        handlersOverride: () => new Map([['about', { cost: 1, run: async () => 'hi' }]]),
+      }),
+      ctxWith(configWith(cfgWithAutoJoin({ commands: [{ name: 'about', description: 'who I am' }] }))),
+    );
+
+    const encryptedMsg = msg('', { channel: 99, mentions: ['klv1bot'] });
+    deliver({ ...encryptedMsg, payload: encryptedPayload(['klv1bot']) } as Envelope);
+    await settle();
+
+    expect(reply).toHaveBeenCalledWith(99, 'hi', ['klv1user']);
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(saved.answerChannelIds).toContain(99);
     await stop();
   });
 

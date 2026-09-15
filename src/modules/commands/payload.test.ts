@@ -8,7 +8,14 @@ const wire = (obj: unknown): number[] => Array.from(encode(obj));
 describe('decodeChatPayload', () => {
   it('reads content and mentions out of a real msgpack payload', () => {
     const p = wire({ content: '/about', mentions: ['klv1bot'] });
-    expect(decodeChatPayload(p)).toEqual({ content: '/about', mentions: ['klv1bot'], encrypted: false });
+    expect(decodeChatPayload(p)).toEqual({
+      content: '/about',
+      mentions: ['klv1bot'],
+      encrypted: false,
+      encContent: null,
+      encNonce: null,
+      keyEpoch: null,
+    });
   });
 
   it('accepts a Uint8Array as well as a number array', () => {
@@ -20,6 +27,9 @@ describe('decodeChatPayload', () => {
       content: '/help',
       mentions: [],
       encrypted: false,
+      encContent: null,
+      encNonce: null,
+      keyEpoch: null,
     });
   });
 
@@ -54,6 +64,80 @@ describe('decodeChatPayload', () => {
     it('treats an explicit null enc_content the same as absent', () => {
       const p = wire({ content: '', mentions: [], enc_content: null });
       expect(decodeChatPayload(p).encrypted).toBe(false);
+    });
+  });
+
+  describe('encrypted fields', () => {
+    it('extracts encContent/encNonce/keyEpoch from a well-formed encrypted payload', () => {
+      const encContent = new Uint8Array([1, 2, 3, 4]);
+      const encNonce = new Uint8Array(24).fill(9);
+      const p = wire({
+        content: '',
+        mentions: [],
+        enc_content: encContent,
+        enc_nonce: encNonce,
+        key_epoch: 3,
+      });
+      const out = decodeChatPayload(p);
+      expect(out.encrypted).toBe(true);
+      expect(out.encContent).toEqual(encContent);
+      expect(out.encNonce).toEqual(encNonce);
+      expect(out.keyEpoch).toBe(3);
+    });
+
+    it('drops encNonce that is not exactly 24 bytes', () => {
+      const p = wire({
+        content: '',
+        mentions: [],
+        enc_content: new Uint8Array([1]),
+        enc_nonce: new Uint8Array(23),
+        key_epoch: 1,
+      });
+      const out = decodeChatPayload(p);
+      expect(out.encrypted).toBe(true); // still a real encrypted message…
+      expect(out.encNonce).toBeNull(); // …but this field can't be trusted
+    });
+
+    it('drops enc_content larger than the node\'s real MAX_CHAT_CIPHERTEXT cap (8192 bytes)', () => {
+      // REGRESSION GUARD (spec-compliance finding, 2026-09-15): an earlier
+      // version of this cap was derived from the PLAINTEXT content limit
+      // (4096 + 256 = 4352), which silently rejected legitimate, node-
+      // accepted encrypted messages between ~4.3KB and the real 8KB cap —
+      // enc_content is a separate, independently-capped, MessagePack-framed
+      // AEAD blob, not a byte-for-byte seal of the plaintext cap.
+      const p = wire({
+        content: '',
+        mentions: [],
+        enc_content: new Uint8Array(8192 + 1),
+        enc_nonce: new Uint8Array(24),
+        key_epoch: 1,
+      });
+      expect(decodeChatPayload(p).encContent).toBeNull();
+    });
+
+    it('accepts enc_content right up to the 8192-byte cap', () => {
+      const p = wire({
+        content: '',
+        mentions: [],
+        enc_content: new Uint8Array(8192),
+        enc_nonce: new Uint8Array(24),
+        key_epoch: 1,
+      });
+      expect(decodeChatPayload(p).encContent).not.toBeNull();
+    });
+
+    it('drops a non-positive or non-integer key_epoch', () => {
+      const base = { content: '', mentions: [], enc_content: new Uint8Array([1]), enc_nonce: new Uint8Array(24) };
+      expect(decodeChatPayload(wire({ ...base, key_epoch: 0 })).keyEpoch).toBeNull();
+      expect(decodeChatPayload(wire({ ...base, key_epoch: -1 })).keyEpoch).toBeNull();
+      expect(decodeChatPayload(wire({ ...base, key_epoch: 1.5 })).keyEpoch).toBeNull();
+    });
+
+    it('never populates the encrypted fields for a plaintext message', () => {
+      const out = decodeChatPayload(wire({ content: '/about', mentions: [] }));
+      expect(out.encContent).toBeNull();
+      expect(out.encNonce).toBeNull();
+      expect(out.keyEpoch).toBeNull();
     });
   });
 

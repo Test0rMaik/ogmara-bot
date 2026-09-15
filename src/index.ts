@@ -34,6 +34,7 @@ import {
   type Secrets,
 } from './config.js';
 import { applyProfile, checkRegistration, fetchProfile, registerWallet, uploadAvatar } from './identity.js';
+import { ChannelKeyService, DeviceIdentityError, loadOrCreateDeviceIdentity } from './channelKeys.js';
 import { KleverError, REGISTRATION_COST_KLV } from './klever.js';
 import { Ledger } from './ledger.js';
 import { LockError, acquireDataLock } from './lock.js';
@@ -488,6 +489,22 @@ async function run(args: CliArgs): Promise<number> {
     );
   }
 
+  // Device encryption identity — required for ANY other client to wrap a
+  // channel key to this bot (spec §2.4). Load/create is allowed to throw
+  // (DeviceIdentityError, caught below) rather than silently mint a fresh
+  // identity over a corrupt one: that would orphan every key already
+  // wrapped to the old device.
+  const deviceIdentity = loadOrCreateDeviceIdentity(effective.storage.deviceEncPath);
+  const channelKeys = new ChannelKeyService(publisher.client, publisher.signer, deviceIdentity, (m) =>
+    console.warn(m),
+  );
+  // Both best-effort — a hiccup here must not stop the bot starting, since
+  // posting/news work regardless. It only means this run cannot receive new
+  // channel keys (binding) or recover previously-known ones (vault) yet.
+  await channelKeys.ensureBinding(publisher.address, effective.node.network);
+  await channelKeys.restoreFromVault();
+  console.log(`DeviceEnc: bound (device ${deviceIdentity.deviceId.slice(0, 12)}…) for encrypted channels`);
+
   const ledger = Ledger.load(effective.storage.ledgerPath, effective.storage.retentionDays);
   console.log(`Ledger:  ${effective.storage.ledgerPath} (${ledger.size} entries)`);
 
@@ -543,8 +560,19 @@ async function run(args: CliArgs): Promise<number> {
     }),
     createCommandsModule({
       reply: async (channelId, text, mentions) => {
+        // Encrypted first: a channel this bot has ever gotten a key for
+        // always replies encrypted — silently plaintext-replying into a
+        // channel it knows is encrypted would leak the reply to the node
+        // (and to anyone who can read public traffic) in cleartext.
+        const envelope = await channelKeys.encryptedReplyEnvelope(channelId, text, mentions);
+        if (envelope !== null) {
+          await publisher.client.sendMessageEnvelope(envelope);
+          return;
+        }
         await publisher.client.sendMessage(channelId, text, { mentions });
       },
+      decryptChannelText: (channelId, encContent, encNonce, keyEpoch) =>
+        channelKeys.decryptChannelMessage(channelId, encContent, encNonce, keyEpoch),
       subscribeChannels: async (channels, onMessage) => {
         const sub = subscribe({
           nodeUrl: effective.node.url,
@@ -1039,7 +1067,8 @@ async function main(): Promise<void> {
       err instanceof AiConfigError ||
       err instanceof LockError ||
       err instanceof KleverError ||
-      err instanceof NetworkMismatchError
+      err instanceof NetworkMismatchError ||
+      err instanceof DeviceIdentityError
     ) {
       console.error(`\n${err.name}: ${err.message}`);
       process.exitCode = 2;

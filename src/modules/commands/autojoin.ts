@@ -78,15 +78,27 @@ export interface AutoJoinState {
    * arrives, not re-derived from scratch each time.
    */
   readonly answerChannelIds: readonly number[];
+  /**
+   * Channel id → unix milliseconds this channel first showed encrypted-
+   * shaped traffic (`enc_content` present) it has never once successfully
+   * decrypted, since the last time it DID successfully decrypt something
+   * (or since being granted, if never). Cleared the moment a channel
+   * answers a command. Past `maxUnservedEncryptedHours`, the channel's slot
+   * is freed — see the schema doc comment for why this can't be inferred
+   * from the channel's own metadata.
+   */
+  readonly encryptedSince: Readonly<Record<number, number>>;
 }
 
-const EMPTY_STATE: AutoJoinState = { lastHandledTs: 0, answerChannelIds: [] };
+const EMPTY_STATE: AutoJoinState = { lastHandledTs: 0, answerChannelIds: [], encryptedSince: {} };
 
 interface StoredAutoJoinState {
   version: 1;
   lastHandledTs: number;
   /** Absent in a file written before this field existed — treated as empty. */
   answerChannelIds?: unknown;
+  /** Absent in a file written before this field existed — treated as empty. */
+  encryptedSince?: unknown;
 }
 
 /**
@@ -115,7 +127,14 @@ export function loadAutoJoinState(path: string, warn: (message: string) => void)
     const answerChannelIds = Array.isArray(parsed.answerChannelIds)
       ? parsed.answerChannelIds.filter((id): id is number => typeof id === 'number')
       : [];
-    return { lastHandledTs: parsed.lastHandledTs, answerChannelIds };
+    const encryptedSince: Record<number, number> = {};
+    if (parsed.encryptedSince !== null && typeof parsed.encryptedSince === 'object') {
+      for (const [k, v] of Object.entries(parsed.encryptedSince as Record<string, unknown>)) {
+        const id = Number(k);
+        if (Number.isInteger(id) && typeof v === 'number') encryptedSince[id] = v;
+      }
+    }
+    return { lastHandledTs: parsed.lastHandledTs, answerChannelIds, encryptedSince };
   } catch (err) {
     warn(
       `  warning: auto-join state at "${path}" is corrupt (${err instanceof Error ? err.message : String(err)}) ` +
@@ -137,6 +156,7 @@ export function saveAutoJoinState(path: string, state: AutoJoinState): void {
     version: 1,
     lastHandledTs: state.lastHandledTs,
     answerChannelIds: [...state.answerChannelIds],
+    encryptedSince: { ...state.encryptedSince },
   };
   const tmp = join(dir, `.${Date.now()}-${process.pid}.tmp`);
   writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });

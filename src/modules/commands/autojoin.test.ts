@@ -82,25 +82,48 @@ describe('auto-join state persistence', () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   it('a missing file starts empty, silently — the normal first-run case', () => {
-    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 0, answerChannelIds: [] });
-    expect(warnings).toEqual([]);
-  });
-
-  it('round-trips a saved state, cursor and answer-channel list together', () => {
-    saveAutoJoinState(path, { lastHandledTs: 123456789, answerChannelIds: [17, 42] });
     expect(loadAutoJoinState(path, warn)).toEqual({
-      lastHandledTs: 123456789,
-      answerChannelIds: [17, 42],
+      lastHandledTs: 0,
+      answerChannelIds: [],
+      encryptedSince: {},
     });
     expect(warnings).toEqual([]);
   });
 
-  it('reads a file written before answerChannelIds existed as an empty list, not a crash', () => {
-    // A live bot already has a state file written by the version of this
-    // module that only ever persisted lastHandledTs — that file must keep
-    // loading correctly, not lose its cursor or throw, once this field is read.
+  it('round-trips a saved state, cursor and answer-channel list together', () => {
+    saveAutoJoinState(path, { lastHandledTs: 123456789, answerChannelIds: [17, 42], encryptedSince: {} });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 123456789,
+      answerChannelIds: [17, 42],
+      encryptedSince: {},
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  it('round-trips encryptedSince alongside the rest of the state', () => {
+    saveAutoJoinState(path, {
+      lastHandledTs: 5,
+      answerChannelIds: [17],
+      encryptedSince: { 17: 1_700_000_000_000 },
+    });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 5,
+      answerChannelIds: [17],
+      encryptedSince: { 17: 1_700_000_000_000 },
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  it('reads a file written before answerChannelIds/encryptedSince existed as empty, not a crash', () => {
+    // A live bot already has a state file written by an earlier version of
+    // this module — that file must keep loading correctly, not lose its
+    // cursor or throw, once a newer field is read from it.
     writeFileSync(path, JSON.stringify({ version: 1, lastHandledTs: 999 }), 'utf8');
-    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 999, answerChannelIds: [] });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 999,
+      answerChannelIds: [],
+      encryptedSince: {},
+    });
     expect(warnings).toEqual([]);
   });
 
@@ -111,14 +134,22 @@ describe('auto-join state persistence', () => {
     // and re-granting answer slots it already earned — both idempotent/
     // harmless to redo — so the safe default is to keep going.
     writeFileSync(path, 'not json at all', 'utf8');
-    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 0, answerChannelIds: [] });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 0,
+      answerChannelIds: [],
+      encryptedSince: {},
+    });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('corrupt');
   });
 
   it('a wrong-shaped file (e.g. a future version) resets to empty WITH a warning', () => {
     writeFileSync(path, JSON.stringify({ version: 2, somethingElse: true }), 'utf8');
-    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 0, answerChannelIds: [] });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 0,
+      answerChannelIds: [],
+      encryptedSince: {},
+    });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('unexpected shape');
   });
@@ -129,17 +160,43 @@ describe('auto-join state persistence', () => {
       JSON.stringify({ version: 1, lastHandledTs: 5, answerChannelIds: [1, 'two', null, 3] }),
       'utf8',
     );
-    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 5, answerChannelIds: [1, 3] });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 5,
+      answerChannelIds: [1, 3],
+      encryptedSince: {},
+    });
+  });
+
+  it('drops malformed entries from a tampered encryptedSince map', () => {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 1,
+        lastHandledTs: 5,
+        answerChannelIds: [7],
+        encryptedSince: { '7': 1000, notanumber: 2000, '9': 'nope' },
+      }),
+      'utf8',
+    );
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 5,
+      answerChannelIds: [7],
+      encryptedSince: { 7: 1000 },
+    });
   });
 
   it('survives a crash mid-write: the previous good file is untouched until rename', () => {
-    saveAutoJoinState(path, { lastHandledTs: 111, answerChannelIds: [1] });
+    saveAutoJoinState(path, { lastHandledTs: 111, answerChannelIds: [1], encryptedSince: {} });
     // saveAutoJoinState writes a temp file then renames over the target —
     // there is no way to observe a partially-written target file from the
     // outside, so the property under test is simply that a second save
     // fully replaces the first rather than corrupting it.
-    saveAutoJoinState(path, { lastHandledTs: 222, answerChannelIds: [1, 2] });
-    expect(loadAutoJoinState(path, warn)).toEqual({ lastHandledTs: 222, answerChannelIds: [1, 2] });
+    saveAutoJoinState(path, { lastHandledTs: 222, answerChannelIds: [1, 2], encryptedSince: {} });
+    expect(loadAutoJoinState(path, warn)).toEqual({
+      lastHandledTs: 222,
+      answerChannelIds: [1, 2],
+      encryptedSince: {},
+    });
     expect(warnings).toEqual([]);
   });
 });

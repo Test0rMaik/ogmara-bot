@@ -77,6 +77,20 @@ export interface CommandsDeps {
     type?: Notification['type'],
   ) => Promise<readonly Notification[]>;
   /**
+   * Decrypt one encrypted channel message's ciphertext, resolving the
+   * channel key (cache-first, else fetched and unwrapped from the node) as
+   * needed. `'waiting'` means no key has been delivered to this wallet's
+   * device yet — the only recovery is another member's client serving one
+   * (spec §8.1.1); `'error'` means a key exists but decryption failed
+   * (wrong/rotated epoch, or a corrupt frame).
+   */
+  readonly decryptChannelText: (
+    channelId: number,
+    encContent: Uint8Array,
+    encNonce: Uint8Array,
+    keyEpoch: number,
+  ) => Promise<{ text: string } | 'waiting' | 'error'>;
+  /**
    * Override the handler table. Tests only.
    *
    * Exists because every built-in handler costs 1, which makes the cost gates in
@@ -175,6 +189,14 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
    */
   let autoAnsweredChannels = new Set<number>();
   /**
+   * Channel id → when it first showed encrypted-shaped traffic it has never
+   * successfully decrypted, since granted or since it last DID decrypt
+   * something. Drives the `maxUnservedEncryptedHours` slot-reap in
+   * `pollForInvites` — see that check's comment and the schema doc comment
+   * on why a channel's own metadata can't be trusted to signal this.
+   */
+  let encryptedSince = new Map<number, number>();
+  /**
    * Message ids already answered, newest last.
    *
    * The WebSocket can re-deliver — a reconnect replays, and the node fans the
@@ -188,6 +210,14 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
   const MAX_ANSWERED = 2048;
   /** When the reply budget last blocked, so the log says it once, not per message. */
   let budgetWarnedAt = 0;
+  /**
+   * Channel id → when this module last logged "still waiting for a channel
+   * key"/"could not decrypt" there, so a busy encrypted channel with no key
+   * yet gets one line per window rather than one per incoming message.
+   */
+  const keyWaitWarnedAt = new Map<number, number>();
+  /** Bound on `keyWaitWarnedAt`; oldest entries are evicted first (insertion order). */
+  const MAX_KEY_WAIT_WARNED = 2048;
 
   return {
     name: 'commands',
@@ -370,19 +400,6 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
               'wallet cannot see.\nCheck the id, and that the bot has joined the channel.',
           };
         }
-        if (facts.encrypted) {
-          // Refused rather than attempted. In an encrypted channel the bot reads
-          // ciphertext it has no key for, so it would answer nothing at all —
-          // and a plaintext reply would downgrade a channel whose policy is
-          // encrypt-on-send. Note this is NOT only private channels: new public
-          // channels are created with encryption forced on.
-          return {
-            message:
-              `\nbot.channels lists channel ${id} ("${forLog(facts.name)}"), which is end-to-end ` +
-              'encrypted.\nThis build reads and replies in plaintext only, so it would answer ' +
-              'nothing there. Remove it from bot.channels.',
-          };
-        }
         if (!facts.canPost) {
           return {
             message:
@@ -416,18 +433,28 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       // file itself is left untouched either way — flipping the flag back
       // on resumes every previously-earned grant without needing fresh
       // invites, which is what "pause", not "wipe", should mean.
-      const persistedAnswerIds = loadAutoJoinState(cfg.autoJoin.statePath, ctx.warn).answerChannelIds;
+      const restoredState = loadAutoJoinState(cfg.autoJoin.statePath, ctx.warn);
       autoAnsweredChannels = cfg.autoJoin.answerInvitedChannels
-        ? new Set(persistedAnswerIds.slice(0, cfg.autoJoin.maxAutoAnsweredChannels))
+        ? new Set(restoredState.answerChannelIds.slice(0, cfg.autoJoin.maxAutoAnsweredChannels))
         : new Set();
+      // Only carried forward for channels still actually granted above — a
+      // channel dropped from the set (cap lowered, flag off) has no slot
+      // left to reap and starting it fresh if re-granted later is correct.
+      encryptedSince = new Map(
+        Object.entries(restoredState.encryptedSince)
+          .map(([id, ts]): [number, number] => [Number(id), ts])
+          .filter(([id]) => autoAnsweredChannels.has(id)),
+      );
 
       // Join every configured channel, UNCONDITIONALLY on every start, the
       // same way the descriptor is republished below — no local "already a
       // member" check, relying on the join being idempotent server-side.
-      // Preflight already refused any of these that are encrypted or
-      // unpostable, so this is a direct attempt, not a recheck. Best-effort
-      // per channel: one failure must not stop the module from starting and
-      // answering in the channels that DID work.
+      // Preflight already refused any of these that are unpostable or not
+      // visible to this wallet, so this is a direct attempt, not a recheck —
+      // an encrypted entry is NOT refused (this build can decrypt/reply
+      // once a member's client serves it a key) and reaches here like any
+      // other. Best-effort per channel: one failure must not stop the
+      // module from starting and answering in the channels that DID work.
       for (const channelId of cfg.channels) {
         if (ctx.config.posting.dryRun) {
           ctx.log(`  [dry run] would join channel ${channelId}`);
@@ -632,18 +659,37 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       if (facts === 'unreachable') continue;
       if (facts === null) {
         autoAnsweredChannels.delete(channelId);
+        encryptedSince.delete(channelId);
         grantsChanged = true;
         ctx.warn(
           `  warning: channel ${channelId} is no longer visible — removed from the auto-answer ` +
             'set, freeing its slot',
         );
-      } else if (facts.encrypted) {
-        autoAnsweredChannels.delete(channelId);
-        grantsChanged = true;
-        ctx.warn(
-          `  warning: channel ${channelId} ("${forLog(facts.name)}") is now end-to-end encrypted — ` +
-            'removed from the auto-answer set, freeing its slot',
-        );
+      } else {
+        // Whether `facts.encrypted` is true (a genuinely encrypted channel,
+        // waiting on a member to serve this bot a key — spec §8.1.1) or
+        // false (a channel whose OWN metadata is not proof its traffic is
+        // actually readable — see the schema doc comment on
+        // `maxUnservedEncryptedHours`), both cases are handled identically:
+        // give the channel time to prove it can decrypt at least once, via
+        // `markUnservedEncrypted`/the success-clears-it path in
+        // `handleMessage`, and reap the slot only if it never does within
+        // the grace period. Neither an encrypted flag flip nor a metadata
+        // mismatch is treated as an immediate revoke — 0.27.0's "give up on
+        // first sight of encryption" logic no longer applies now that this
+        // build can actually decrypt once a key arrives.
+        const since = encryptedSince.get(channelId);
+        const graceMs = cfg.autoJoin.maxUnservedEncryptedHours * 3_600_000;
+        if (since !== undefined && Date.now() - since > graceMs) {
+          autoAnsweredChannels.delete(channelId);
+          encryptedSince.delete(channelId);
+          grantsChanged = true;
+          ctx.warn(
+            `  warning: channel ${channelId} ("${forLog(facts.name)}") has carried undecryptable ` +
+              `encrypted-shaped traffic for over ${cfg.autoJoin.maxUnservedEncryptedHours}h without ever ` +
+              'answering a single command — removed from the auto-answer set, freeing its slot',
+          );
+        }
       }
     }
 
@@ -700,21 +746,16 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         continue;
       }
       const name = forLog(facts.name);
-      // Membership only — deliberately NOT added to cfg.channels/answering.
-      // canPost is irrelevant here: even a read-public channel this wallet
-      // cannot post in is a legitimate one to just be a member of.
-      //
-      // Joined EVEN IF encrypted, unlike the static bot.channels preflight
-      // check (which refuses one outright, since answering there would be
-      // pointless). An explicit invite is a channel owner asking for this
-      // wallet specifically, with no confirmation step on this wallet's
-      // side at any point in the pipeline — a private channel is currently
-      // the ONLY channel type the client UI can even invite to, so refusing
-      // to join it would make invite-driven auto-join a no-op in practice.
-      // This build still cannot decrypt or answer there; only membership
-      // (visible in the member list and to `get_channel_bots`) results.
-      // `bot.channels` remains the one and only thing that makes it answer
-      // anywhere, and its own preflight check is unaffected by this.
+      // Joined regardless of `facts.encrypted` — an explicit invite is a
+      // channel owner asking for this wallet specifically, with no
+      // confirmation step on this wallet's side anywhere in the pipeline.
+      // Whether it's ALSO granted an answer slot below no longer depends on
+      // that flag either: this build can decrypt/reply once a member's
+      // client serves it a key (channelKeys.ts), so an encrypted invite is
+      // treated exactly like a plaintext one — granted the same as any
+      // other, subject to the same cap, and left to `handleMessage`'s
+      // decrypt-and-retry / `maxUnservedEncryptedHours` reap to sort out
+      // whether it ever actually becomes usable.
       if (ctx.config.posting.dryRun) {
         ctx.log(`  [dry run] would join channel ${invite.channelId} ("${name}"), invited by ${invitedBy}`);
         continue;
@@ -728,13 +769,6 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         continue;
       }
 
-      if (facts.encrypted) {
-        ctx.log(
-          `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}. ` +
-            'It is end-to-end encrypted, so this build cannot read or answer there — membership only.',
-        );
-        continue;
-      }
       if (!cfg.autoJoin.answerInvitedChannels) {
         ctx.log(
           `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}. ` +
@@ -758,7 +792,11 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       autoAnsweredChannels.add(invite.channelId);
       ctx.log(
         `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}, and ` +
-          'will now answer commands there too.',
+          'will now answer commands there too.' +
+          (facts.encrypted
+            ? ' It is end-to-end encrypted — answering there starts once a member\'s client serves ' +
+              'this bot the current channel key (spec §8.1.1); until then it will wait.'
+            : ''),
       );
     }
     // Saved when EITHER the cursor advanced OR cleanup freed a slot — a
@@ -768,11 +806,26 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     // only ever advances to `newestTs`; when there is nothing new to advance
     // to, the existing `since` is kept rather than reset.
     if (newestTs !== null || grantsChanged) {
-      saveAutoJoinState(statePath, {
-        lastHandledTs: newestTs ?? since,
-        answerChannelIds: [...autoAnsweredChannels],
-      });
+      persistGrants(ctx, cfg, newestTs ?? since);
     }
+  }
+
+  /**
+   * Persist `autoAnsweredChannels`/`encryptedSince`, preserving whatever
+   * cursor value is given (or the currently-persisted one, if the caller has
+   * no fresher value) — the single write path both `pollForInvites` and
+   * `handleMessage`'s encrypted-tracking transitions go through, so the
+   * cursor is never accidentally clobbered by a save that has nothing new to
+   * say about it.
+   */
+  function persistGrants(ctx: BotContext, cfg: BotConfig, cursorTs?: number): void {
+    const statePath = cfg.autoJoin.statePath;
+    const lastHandledTs = cursorTs ?? loadAutoJoinState(statePath, ctx.warn).lastHandledTs;
+    saveAutoJoinState(statePath, {
+      lastHandledTs,
+      answerChannelIds: [...autoAnsweredChannels],
+      encryptedSince: Object.fromEntries(encryptedSince),
+    });
   }
 
   async function handleMessage(
@@ -818,7 +871,12 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     //
     // `cfg.channels` is what the operator wrote down by hand, uncapped;
     // `autoAnsweredChannels` is what an invite earned, capped at
-    // `maxAutoAnsweredChannels` — see the module doc comment.
+    // `maxAutoAnsweredChannels` — see the module doc comment. Checked once,
+    // not re-checked after the decrypt `await` below: `pollForInvites`'s
+    // revalidation could in principle free this exact channel's slot while
+    // this call is mid-flight, letting one reply through for a channel
+    // whose grant was just revoked. Accepted — no key exposure, no
+    // cross-boundary write, and it costs at most one message.
     if (!cfg.channels.includes(channelId) && !autoAnsweredChannels.has(channelId)) return;
 
     // Re-delivery is normal — a reconnect replays, and the same frame reaches
@@ -831,36 +889,67 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     // live inside `payload` as msgpack bytes, which is why the SDK's
     // `parseCommand` takes a decoded object rather than an envelope. Decoding is
     // a trust boundary — see payload.ts.
-    const { content, mentions, encrypted } = decodeChatPayload(envelope.payload);
-    if (encrypted) {
-      // This build has no channel-key support at all, so it can NEVER read
-      // an actually-encrypted message, no matter what the channel's own
-      // metadata claimed when it was granted auto-answer. Found live: a
-      // channel's `encryption_enabled` flag can be wrong/absent even
-      // though its messages are genuinely v2-encrypted (human clients
-      // decrypt fine via the per-message key, entirely independent of that
-      // channel-level flag) — a real encrypted message decodes
-      // successfully as msgpack with `content` as an empty STRING, not
-      // `null`, which is exactly why this checks `enc_content`'s presence
-      // rather than trying to infer encryption from empty content. Rather
-      // than keep insisting a metadata check that just proved wrong,
-      // self-correct: one message with `enc_content` from an auto-GRANTED
-      // channel (never `cfg.channels` — the operator's own written-down
-      // list, not second-guessed here) is a strong enough signal, since a
-      // genuinely encrypted channel carries it on literally every message,
-      // not intermittently.
-      if (autoAnsweredChannels.delete(channelId)) {
-        saveAutoJoinState(cfg.autoJoin.statePath, {
-          lastHandledTs: loadAutoJoinState(cfg.autoJoin.statePath, ctx.warn).lastHandledTs,
-          answerChannelIds: [...autoAnsweredChannels],
-        });
-        ctx.warn(
-          `  warning: channel ${channelId} is end-to-end encrypted — this build cannot read or ` +
-            'answer there. Revoked its auto-answer grant (it remains a member); the channel\'s own ' +
-            'metadata said otherwise when it was granted.',
-        );
+    const decoded = decodeChatPayload(envelope.payload);
+    const mentions = decoded.mentions;
+    let content: string | null = decoded.content;
+
+    if (decoded.encrypted) {
+      // A genuinely v2-encrypted message — decrypt it rather than give up.
+      // (0.27.0 gave up permanently here, self-revoking the auto-answer
+      // grant, because that build had no channel-key support at all and
+      // could never recover. This build can: the only reason to still be
+      // unable to read a message is that no other member's client has yet
+      // wrapped the current epoch key to this device (spec §8.1.1) — which
+      // resolves itself the moment one comes online, so the grant must stay
+      // intact and this must keep trying on every subsequent message.)
+      if (decoded.encContent === null || decoded.encNonce === null || decoded.keyEpoch === null) {
+        // Malformed enc fields (wrong type/size) — never a case a real,
+        // node-accepted message produces, so this is not worth a decrypt
+        // round trip.
+        markUnservedEncrypted(ctx, cfg, channelId);
+        warnKeyWait(ctx, channelId, 'a malformed encrypted message');
+        return;
       }
-      return;
+      // A throw (a non-404 node error, a network timeout, anything the
+      // implementation didn't normalize into 'error') must be treated the
+      // same as a genuine decrypt failure, not silently skip
+      // `markUnservedEncrypted`. `key_epoch` on the incoming message is
+      // fully attacker-controlled (see payload.ts), so a crafted value that
+      // makes the node answer with something other than a clean 404 would
+      // otherwise let a channel dodge the unserved-encrypted reap forever —
+      // exactly the slot-squat `maxUnservedEncryptedHours` exists to close.
+      let outcome: { text: string } | 'waiting' | 'error';
+      try {
+        outcome = await deps.decryptChannelText(
+          channelId,
+          decoded.encContent,
+          decoded.encNonce,
+          decoded.keyEpoch,
+        );
+      } catch (err) {
+        markUnservedEncrypted(ctx, cfg, channelId);
+        warnKeyWait(
+          ctx,
+          channelId,
+          `a decrypt attempt that failed outright (${err instanceof Error ? err.message : String(err)})`,
+        );
+        return;
+      }
+      if (outcome === 'waiting') {
+        markUnservedEncrypted(ctx, cfg, channelId);
+        warnKeyWait(ctx, channelId, 'no channel key delivered to this bot yet');
+        return;
+      }
+      if (outcome === 'error') {
+        markUnservedEncrypted(ctx, cfg, channelId);
+        warnKeyWait(ctx, channelId, 'a message that failed to decrypt with the key this bot has');
+        return;
+      }
+      // Proven readable — a channel that answers even once is exempt from
+      // the unserved-encrypted reap regardless of how long it then goes
+      // quiet (see the schema doc comment on `maxUnservedEncryptedHours`).
+      if (encryptedSince.delete(channelId)) persistGrants(ctx, cfg);
+      content = outcome.text;
     }
     if (content === null) return;
 
@@ -938,6 +1027,43 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       if (!oldest.done) answered.delete(oldest.value);
     }
     answered.add(msgId);
+  }
+
+  /**
+   * Record the first time an auto-answer-granted channel shows encrypted-
+   * shaped traffic it cannot read, starting the `maxUnservedEncryptedHours`
+   * grace period `pollForInvites` reaps against. A no-op — deliberately not
+   * a per-message timestamp bump — for `cfg.channels` (the operator's own
+   * uncapped list, never subject to reaping) and for a channel that already
+   * has an earlier unserved timestamp recorded (only the FIRST occurrence
+   * starts the clock; a later one must not keep pushing it back forever).
+   */
+  function markUnservedEncrypted(ctx: BotContext, cfg: BotConfig, channelId: number): void {
+    if (!autoAnsweredChannels.has(channelId)) return;
+    if (encryptedSince.has(channelId)) return;
+    encryptedSince.set(channelId, Date.now());
+    persistGrants(ctx, cfg);
+  }
+
+  /**
+   * Say once per channel per window — not per message — that this channel's
+   * encrypted traffic could not be read. A busy encrypted channel with no
+   * key yet would otherwise log on every single message it receives.
+   */
+  function warnKeyWait(ctx: BotContext, channelId: number, reason: string): void {
+    const now = Date.now();
+    const last = keyWaitWarnedAt.get(channelId) ?? 0;
+    if (now - last < 10 * 60_000) return;
+    if (keyWaitWarnedAt.size >= MAX_KEY_WAIT_WARNED && !keyWaitWarnedAt.has(channelId)) {
+      const oldest = keyWaitWarnedAt.keys().next();
+      if (!oldest.done) keyWaitWarnedAt.delete(oldest.value);
+    }
+    keyWaitWarnedAt.set(channelId, now);
+    ctx.warn(
+      `  warning: channel ${channelId} is end-to-end encrypted and this bot could not answer — ${reason}. ` +
+        'It remains a member and will keep trying on every new message; this resolves itself once ' +
+        'another member\'s client is online there and serves the current channel key.',
+    );
   }
 
   /**

@@ -298,6 +298,14 @@ const storageSchema = z.object({
   ledgerPath: z.string().min(1).default('data/ledger.json'),
   /** Entries older than this are pruned. */
   retentionDays: z.int().min(1).max(3650).default(90),
+  /**
+   * Where this wallet's device encryption identity (device id + X25519
+   * private key) is persisted. The ONE local secret channel-key handling
+   * needs — channel/DM content keys themselves live only in memory and the
+   * network-stored, wallet-encrypted key vault, never on disk here (see
+   * `channelKeys.ts`).
+   */
+  deviceEncPath: z.string().min(1).default('data/device-enc.json'),
 });
 
 /**

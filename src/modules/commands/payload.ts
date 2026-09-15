@@ -48,22 +48,50 @@ const MAX_CONTENT_BYTES = 4096;
  */
 const MAX_MENTION_CHARS = 128;
 
+/**
+ * Longest ciphertext this will hand on.
+ *
+ * NOT derived from `MAX_CONTENT_BYTES` — `enc_content` is a separate,
+ * larger, independently-capped field (l2-node `MAX_CHAT_CIPHERTEXT`,
+ * `messages/validation.rs`): it is a MessagePack-framed, AEAD-sealed blob
+ * (`{text, reply_preview?}` plus the 16-byte Poly1305 tag), not a byte-for-
+ * byte ciphertext of the plaintext cap. An earlier version of this constant
+ * used `MAX_CONTENT_BYTES + 256`, which silently rejected legitimate,
+ * node-accepted encrypted messages between roughly 4.3KB and this real cap.
+ */
+const MAX_ENC_CONTENT_BYTES = 8192;
+
+/** XChaCha20-Poly1305 nonce length (bytes) — fixed by the AEAD primitive. */
+const ENC_NONCE_BYTES = 24;
+
 /** What a command invocation needs out of a chat payload. */
 export interface ChatPayload {
   readonly content: string | null;
   readonly mentions: string[];
   /**
    * True when the decoded payload carries `enc_content` — a genuinely v2
-   * encrypted message this build has no channel key for, distinct from an
-   * ordinary empty/blank message. A real encrypted message decodes
-   * successfully as msgpack (it is a normal envelope shape) with `content`
-   * as an empty STRING, not absent — so this can NOT be inferred from
-   * `content === null`; it needs its own signal.
+   * encrypted message. A real encrypted message decodes successfully as
+   * msgpack (it is a normal envelope shape) with `content` as an empty
+   * STRING, not absent — so this can NOT be inferred from `content ===
+   * null`; it needs its own signal.
    */
   readonly encrypted: boolean;
+  /** Ciphertext, present only when `encrypted` and well-formed. */
+  readonly encContent: Uint8Array | null;
+  /** 24-byte AEAD nonce, present only when `encrypted` and well-formed. */
+  readonly encNonce: Uint8Array | null;
+  /** The epoch the channel key must be at, present only when `encrypted` and well-formed. */
+  readonly keyEpoch: number | null;
 }
 
-const EMPTY: ChatPayload = { content: null, mentions: [], encrypted: false };
+const EMPTY: ChatPayload = {
+  content: null,
+  mentions: [],
+  encrypted: false,
+  encContent: null,
+  encNonce: null,
+  keyEpoch: null,
+};
 
 /**
  * Decode a chat envelope payload, defensively.
@@ -110,11 +138,32 @@ export function decodeChatPayload(payload: unknown): ChatPayload {
         )
       : [];
 
-    // Presence, not content — this build never attempts to decrypt, so the
-    // actual bytes are irrelevant, only whether they're there at all.
     const encrypted = obj['enc_content'] !== undefined && obj['enc_content'] !== null;
 
-    return { content, mentions, encrypted };
+    // Only extracted when well-formed. A present-but-malformed `enc_content`/
+    // `enc_nonce` (wrong type, oversized, wrong nonce length) still counts as
+    // `encrypted` — it IS an encrypted message — but yields no usable bytes;
+    // `handleMessage` (index.ts) treats a null here as undecryptable rather
+    // than ever handing raw, unvalidated bytes on to the decrypt call.
+    const rawEncContent = obj['enc_content'];
+    const encContent =
+      encrypted && rawEncContent instanceof Uint8Array && rawEncContent.length <= MAX_ENC_CONTENT_BYTES
+        ? rawEncContent
+        : null;
+
+    const rawEncNonce = obj['enc_nonce'];
+    const encNonce =
+      encrypted && rawEncNonce instanceof Uint8Array && rawEncNonce.length === ENC_NONCE_BYTES
+        ? rawEncNonce
+        : null;
+
+    const rawKeyEpoch = obj['key_epoch'];
+    const keyEpoch =
+      encrypted && typeof rawKeyEpoch === 'number' && Number.isInteger(rawKeyEpoch) && rawKeyEpoch > 0
+        ? rawKeyEpoch
+        : null;
+
+    return { content, mentions, encrypted, encContent, encNonce, keyEpoch };
   } catch {
     return EMPTY;
   }

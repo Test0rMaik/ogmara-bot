@@ -212,6 +212,22 @@ export const botSchema = z.object({
        * a channel to `channels` themselves.
        */
       maxAutoAnsweredChannels: z.int().min(0).max(500).default(20),
+      /**
+       * Hours an invite-granted channel may sit in the answering set without
+       * EVER successfully decrypting a single message before its slot is
+       * freed. Exists because a channel's own metadata is not proof its
+       * traffic is genuinely readable: a channel can legally declare itself
+       * unencrypted while every message it sends still carries fabricated
+       * `enc_content`/`enc_nonce`/`key_epoch` fields that will never
+       * decrypt (no real key was ever wrapped for it) — that traffic never
+       * flips the channel's own metadata to "encrypted", so the existing
+       * "free the slot once it turns encrypted" cleanup never triggers, and
+       * a cheap, permanently-empty channel could otherwise squat a slot
+       * forever for the price of one invite. A channel that HAS answered at
+       * least once is exempt regardless of how long it then goes quiet —
+       * this only reaps a slot that has never once proven useful.
+       */
+      maxUnservedEncryptedHours: z.int().min(1).max(24 * 30).default(24),
     })
     .prefault({}),
 });

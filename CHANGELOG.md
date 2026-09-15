@@ -5,6 +5,110 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-09-15
+
+Real channel-key handling, replacing 0.27.0's stop-gap. This wallet now has
+its own E2E device encryption identity, can receive channel keys other
+members' clients wrap to it, decrypts incoming commands, and encrypts its
+replies — protocol §2.4/§2.5/§8, ported from desktop's proven
+`deviceEnc.ts`/`channelCrypto.ts` but simplified to single-account, since a
+bot is always exactly one wallet. No new dependencies: everything comes from
+`@ogmara/sdk` (already `^0.59.0`), which already exported the full crypto
+toolkit.
+
+This is a **pure key CONSUMER**: it never establishes a channel's first
+epoch, never rotates one, and never "covers" a newly-joined member — those
+stay creator/mod-only operations. It can only receive a key once some other
+already-a-member client observes its join and wraps the current epoch key to
+it (spec §8.1.1's only defined delivery path) — there is no self-serve
+route, so a channel with no other online member may sit "waiting" for a
+while. That wait is now observable (a throttled log) and self-healing (it
+starts working the moment a key arrives), never silent or permanent.
+
+### Added
+
+- **`src/channelKeys.ts`**: device identity (random 32-byte device id + X25519
+  keypair, the ONE new local secret — persisted like `autojoin.ts`'s state
+  file, 0600 + atomic write), `DeviceEncBinding` publishing (idempotent,
+  checked against the node's registry), channel-key fetch/cache/decrypt,
+  encrypted-reply construction, and network key-vault backup/restore (§2.5)
+  so keys survive a redeploy without waiting on a member again. Bound-memory
+  cache: only the latest known epoch per channel is kept, others pruned.
+- `storage.deviceEncPath` config (default `data/device-enc.json`).
+- `bot.autoJoin.maxUnservedEncryptedHours` config (default 24) — see Security.
+
+### Changed
+
+- **Auto-answered channels no longer lose their grant on the first encrypted
+  message.** 0.27.0 revoked on sight because that build could never decrypt
+  anything, ever; this build can, so it now waits and retries on every
+  subsequent message instead, logging a throttled warning while it does.
+- **An encrypted channel is no longer refused or membership-only.** Three
+  gates left over from the zero-capability era — `preflight`'s hard refusal
+  of an encrypted `bot.channels` entry, the invite path granting membership
+  but never an answer slot for an encrypted invite, and the revalidation
+  loop's immediate revoke the instant a channel's metadata flipped to
+  encrypted — are gone. Found by a spec-compliance pass that pointed out
+  every new Public/ReadPublic/Private channel is created encrypted by
+  default (§3.6), which meant these three gates made the entire new
+  capability unreachable through any real path. An encrypted channel is now
+  treated exactly like a plaintext one everywhere, and left to the same
+  decrypt-and-retry / unserved-encrypted-reap logic to sort out whether it
+  actually becomes usable.
+
+### Security
+
+- **Replies now refuse to send under a stale epoch.** §8.1.2's
+  `key_epoch_floor` is fetched fresh (never cached) before every encrypted
+  reply and checked against the cached key's epoch; a kick/ban raises the
+  floor, and a removed member still holds every key below it, so sending
+  under a below-floor epoch would hand new content to someone just removed.
+  Found in security audit — the first version of `encryptedReplyEnvelope`
+  had no floor check at all.
+- **Key-envelope fetch attempts are throttled per channel (15s cooldown),
+  independent of the requested epoch.** `key_epoch` on an incoming message is
+  fully attacker-controlled; without this, a burst of messages each claiming
+  a different, never-real epoch forced one network round trip per message,
+  for every channel this wallet listens to, ahead of any of this module's
+  own rate limiting. Found in security audit.
+- **`bot.autoJoin.maxUnservedEncryptedHours` (default 24h) reaps an
+  auto-answer slot that has carried encrypted-shaped traffic it has never
+  once successfully decrypted, even when the channel's OWN metadata still
+  says unencrypted.** Without this, the existing "free the slot once it
+  turns encrypted" cleanup never triggers for a channel that legitimately,
+  permanently declares itself unencrypted while every message on it carries
+  fabricated `enc_content`/`enc_nonce`/`key_epoch` that will never decrypt —
+  a cheap, empty channel could squat a slot forever for the price of one
+  invite. A channel that answers even once is exempt regardless of how long
+  it then goes quiet. Found in security audit; the tracking state
+  (`encryptedSince`) persists across restarts so a redeploy can't reset an
+  attacker's clock.
+- **A `decryptChannelText` rejection (not just its documented `'error'`
+  outcome) now also starts the unserved-encrypted clock.** The real
+  implementation rethrows anything it can't recognize as a clean 404 (a
+  transient 5xx, a network timeout) — left unguarded, that silently skipped
+  `markUnservedEncrypted` and reopened the same slot-squat window the check
+  above exists to close. Found in a re-audit of this same session's fixes,
+  per the standing rule to re-audit the fixed tree, not just the original.
+- **`enc_content`'s size cap corrected from 4352 to the node's real 8192-byte
+  `MAX_CHAT_CIPHERTEXT`.** The previous cap was derived from the plaintext
+  content limit, which doesn't apply — `enc_content` is a separate,
+  independently-capped, MessagePack-framed AEAD blob — and silently rejected
+  legitimate, node-accepted encrypted messages between roughly 4.3KB and the
+  real cap. Found in spec compliance.
+- Fixed `docs/specs/01-protocol.md` §2.4's `DeviceEncBinding` canonical claim
+  string, which omitted the `{network}` segment both sdk-js and l2-node
+  actually require — the bot's own binding is unaffected (it delegates to
+  the SDK, which was already correct), but the spec text disagreed with the
+  real, verified wire format.
+- **Known, deferred, protocol-wide limitation** (not introduced here, not
+  bot-specific): neither `getKeyEnvelope` nor `getKeyVault` responses carry
+  any proof the original key was wrapped by a genuine channel member rather
+  than fabricated by a dishonest home node — desktop's `channelCrypto.ts`
+  has the identical trust assumption. Fixing this needs a protocol-level
+  change (e.g. the wrapping member co-signing the wrap), not something this
+  bot can add unilaterally.
+
 ## [0.27.0] - 2026-09-14
 
 Live-tested 0.26.0: the bot joined an invited channel, logged "will now
