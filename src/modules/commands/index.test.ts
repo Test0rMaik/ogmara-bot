@@ -1131,6 +1131,39 @@ describe('commands module auto-join', () => {
     expect(federateChannel).not.toHaveBeenCalled();
   });
 
+  it('does not crash on a channel_name: null invite — the real live bug, 2026-09-15', async () => {
+    // REGRESSION GUARD. l2-node's notification JSON serializes an absent
+    // channel display name as JSON `null` (a spliced-in `Option<String>`),
+    // never an omitted key — and that's the NORMAL case for exactly the
+    // scenario this whole feature exists for: a brand-new channel this
+    // bot's own node has no local record for yet, so no name to look up.
+    // `channel_name: null` reached `forLog()` and threw ("Cannot read
+    // properties of null (reading 'split')"), silently killing the poll
+    // before it ever federated or joined — live symptom was "checked for
+    // channel invites — 1 notification(s), 1 invite(s)" and then nothing.
+    const notification: Notification = {
+      type: 'channel_invite',
+      channel_id: '397276220293295',
+      channel_name: null,
+      from: 'klv1owner',
+      timestamp: 1000,
+      anchor_node: 'https://host.example',
+    };
+    const getNotifications = vi.fn(async (_since?: number) => [notification]);
+    const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {});
+    const describeChannel = vi.fn(async (id: number) =>
+      id === 397276220293295 ? null : publicChannel,
+    );
+    const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+    const mod = createCommandsModule(
+      depsWith({ getNotifications, federateChannel, describeChannel }),
+    );
+    await mod.preflight!(ctx);
+    await expect((await mod.start(ctx)).stop()).resolves.toBeUndefined();
+
+    expect(federateChannel).toHaveBeenCalledWith(397276220293295, 'https://host.example');
+  });
+
   it('skips an invite whose federate attempt fails, without aborting the rest of the poll', async () => {
     const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {
       throw new Error('host unreachable');

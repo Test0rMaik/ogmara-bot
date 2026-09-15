@@ -5,6 +5,28 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.1] - 2026-09-15
+
+### Fixed
+
+- **A brand-new cross-node private-channel invite silently killed the whole
+  poll instead of federating and joining.** Live-tested 0.29.0 immediately
+  after redeploying l2-node 0.130.0: the invite reached the bot's node
+  ("checked for channel invites — 1 notification(s), 1 invite(s)") and then
+  nothing else happened — no federate attempt, no warning, no join. Root
+  cause: l2-node's notification JSON splices `Option<String>` straight into
+  `serde_json::json!`, which serializes an absent value as JSON `null`, not
+  an omitted key — and a channel this bot's own node has never federated
+  has no local channel record, so `channel_name` comes back `null`. That's
+  the norm for exactly the invites this feature exists to handle, not an
+  edge case. Downstream code checked `channelName !== undefined`, which a
+  real `null` slips past, then handed it to `forLog()`, which threw
+  (`Cannot read properties of null (reading 'split')`) and aborted the poll
+  before it ever reached the federate/join step. Fixed by normalizing both
+  `channel_name` and `anchor_node` to `undefined` at extraction time,
+  rather than trusting the wire type's `?:` to mean "never `null`" —
+  `sdk-js` 0.60.1 widens `Notification`'s type to match.
+
 ## [0.29.0] - 2026-09-15
 
 Cross-node private-channel invite delivery, the client half of l2-node

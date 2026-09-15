@@ -112,6 +112,34 @@ describe('extractChannelInvites', () => {
     ];
     expect(extractChannelInvites(notifications).invites[0]?.anchorNode).toBeUndefined();
   });
+
+  it('normalizes a wire channel_name: null to undefined, not a crash (live bug, 2026-09-15)', () => {
+    // REGRESSION GUARD. l2-node's notification JSON splices Option<String>
+    // straight into serde_json::json!, which serializes None as JSON null,
+    // not an omitted key — so channel_name arrives as a REAL null, not
+    // absent, for exactly the case this whole feature exists for: a
+    // brand-new channel the invitee's own node has never federated (no
+    // local channel record yet, so no name to look up). Downstream code
+    // checks `channelName !== undefined`, which null slips past, and then
+    // hands it to forLog(), which throws
+    // ("Cannot read properties of null (reading 'split')") — silently
+    // killing the whole invite before it ever reaches federate/join. Caught
+    // live: the exact symptom was "checked for channel invites — 1
+    // notification(s), 1 invite(s)" followed by nothing else at all.
+    const notifications: RawNotification[] = [
+      { type: 'channel_invite', channel_id: '397276220293295', from: 'klv1owner', timestamp: 1000, channel_name: null },
+    ];
+    const { invites } = extractChannelInvites(notifications);
+    expect(invites).toHaveLength(1);
+    expect(invites[0]?.channelName).toBeUndefined();
+  });
+
+  it('normalizes a wire anchor_node: null to undefined too', () => {
+    const notifications: RawNotification[] = [
+      { type: 'channel_invite', channel_id: '12', from: 'klv1owner', timestamp: 1000, anchor_node: null },
+    ];
+    expect(extractChannelInvites(notifications).invites[0]?.anchorNode).toBeUndefined();
+  });
 });
 
 describe('auto-join state persistence', () => {

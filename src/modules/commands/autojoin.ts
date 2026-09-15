@@ -36,12 +36,22 @@ export interface ChannelInviteNotice {
   readonly anchorNode: string | undefined;
 }
 
-/** The shape `getNotifications` returns one entry as, narrowed to what this module reads. */
+/**
+ * The shape `getNotifications` returns one entry as, narrowed to what this
+ * module reads.
+ *
+ * `channel_name`/`anchor_node` are typed `| null` alongside the usual `?:`
+ * (optional) because they genuinely can BE `null`, not just absent:
+ * l2-node's notification JSON splices an `Option<String>` straight into
+ * `serde_json::json!`, which serializes `None` as JSON `null`, not an
+ * omitted key. Code reading these MUST check for both — `!== undefined`
+ * alone lets a real wire `null` straight through.
+ */
 export interface RawNotification {
   readonly type: string;
   readonly channel_id?: string;
-  readonly channel_name?: string;
-  readonly anchor_node?: string;
+  readonly channel_name?: string | null;
+  readonly anchor_node?: string | null;
   readonly from: string;
   readonly timestamp: number;
 }
@@ -74,9 +84,22 @@ export function extractChannelInvites(
       n.anchor_node.length <= MAX_ANCHOR_NODE_CHARS
         ? n.anchor_node
         : undefined;
+    // l2-node's notification JSON is hand-built via `serde_json::json!` with
+    // an `Option<String>` field spliced straight in — that serializes a
+    // `None` as JSON `null`, not an omitted key. `RawNotification`'s `?:
+    // string` type only promises "may be absent", so a wire `null` reaches
+    // here as a real `null` value despite the type. This is exactly the
+    // channel this bot has never federated (the node's own local channel
+    // record — and with it the display name — doesn't exist yet), so it is
+    // NOT a rare edge case for a brand-new cross-node invite: it is the
+    // norm. `channelName !== undefined` downstream doesn't catch `null`,
+    // and passing `null` to `forLog()` throws ("Cannot read properties of
+    // null (reading 'split')") — silently aborting the whole invite before
+    // it ever reaches federate/join. Normalize here, once.
+    const channelName = typeof n.channel_name === 'string' ? n.channel_name : undefined;
     invites.push({
       channelId,
-      channelName: n.channel_name,
+      channelName,
       invitedBy: n.from,
       timestamp: n.timestamp,
       anchorNode,
