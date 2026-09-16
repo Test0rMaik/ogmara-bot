@@ -269,7 +269,11 @@ export class NetworkMismatchError extends Error {
 
 /** Publishes composed posts to an Ogmara node. */
 export class OgmaraPublisher {
-  readonly #client: OgmaraClient;
+  // No longer readonly — see rebuildClient(). Every other read of this
+  // field goes through the `client` getter or an internal `this.#client.*`
+  // call resolved fresh at call time, so swapping the reference is enough;
+  // nothing here caches a client instance across an `await`.
+  #client: OgmaraClient;
   readonly #signer: WalletSigner;
   readonly #config: Config;
   readonly #budget: RateBudget;
@@ -289,13 +293,35 @@ export class OgmaraPublisher {
     this.#budget = new RateBudget(config.posting.maxPostsPerHour);
   }
 
-  /** Build a publisher, deriving the bot's wallet address from its key. */
-  static async create(config: Config, secrets: Secrets): Promise<OgmaraPublisher> {
-    const signer = await WalletSigner.fromHex(secrets.walletKeyHex);
+  /**
+   * Build a fresh `OgmaraClient` from the given config/signer — the SDK's
+   * client has no in-place reconfigure API (`nodeUrl`/`timeout`/`signer`
+   * are all private, only `.withSigner()` and the `onPow*` callbacks are
+   * public mutators), so a `node.url`/`network`/`timeoutMs` change means
+   * building a whole new client, never patching the old one. Shared by
+   * `create()` (startup) and `rebuildClient()` (live-apply) so the two
+   * paths can never drift — the PoW callback wiring in particular is easy
+   * to forget on a second call site.
+   */
+  private static buildClient(config: Config, signer: WalletSigner): OgmaraClient {
     const client = new OgmaraClient({
       nodeUrl: config.node.url,
       timeout: config.node.timeoutMs,
     }).withSigner(signer);
+
+    // `.withSigner()` repoints `signer.networkProvider` at THIS client, but
+    // the SDK's own `resolveNetwork()` caches into `signer.network` and
+    // never consults `networkProvider` again once that cache is set — which
+    // happens on the very first signed envelope. Without this, rebuilding
+    // the client on a live `node.network`/`node.url` change would silently
+    // do nothing for signing: every post after the first would keep
+    // embedding whichever network was resolved at first use, no matter how
+    // many times the config changes afterward — exactly the cross-network
+    // replay `node.network`'s `confirm: true` exists to prevent. Clearing
+    // it here forces the NEXT signed envelope to re-resolve through the
+    // freshly-repointed `networkProvider`. Harmless at initial construction
+    // too: a brand-new signer's `network` is already unset.
+    delete signer.network;
 
     // Surface the one-time PoW solve rather than letting the bot look hung —
     // it takes a couple of seconds and happens on the very first post.
@@ -306,7 +332,34 @@ export class OgmaraPublisher {
       console.log(`  proof-of-work solved in ${ms} ms`);
     };
 
+    return client;
+  }
+
+  /** Build a publisher, deriving the bot's wallet address from its key. */
+  static async create(config: Config, secrets: Secrets): Promise<OgmaraPublisher> {
+    const signer = await WalletSigner.fromHex(secrets.walletKeyHex);
+    const client = OgmaraPublisher.buildClient(config, signer);
     return new OgmaraPublisher(client, signer, config);
+  }
+
+  /**
+   * Live-apply a `node.url`/`node.network`/`node.timeoutMs` change: build a
+   * fresh SDK client from the CURRENT config (already updated in place by
+   * the time this runs — see `applyConfigInPlace`) and swap it in.
+   *
+   * `.withSigner()` re-attaches the SAME shared `WalletSigner`, repointing
+   * its `networkProvider` resolution at the new client — this is the
+   * intended mechanism ("every signature adopts whatever the node
+   * reports"), not a leftover reference to the old client.
+   *
+   * Swap-safe for in-flight calls: every method below reads `this.#client`
+   * exactly once, immediately consumed by an `await` — an in-flight
+   * `publish()`/`health()` keeps running against whichever client it
+   * already started with; only calls issued AFTER this returns see the
+   * new one.
+   */
+  rebuildClient(): void {
+    this.#client = OgmaraPublisher.buildClient(this.#config, this.#signer);
   }
 
   /**
@@ -367,13 +420,22 @@ export class OgmaraPublisher {
    * chain is irreversible and attributed to the operator's real identity.
    */
   async health(): Promise<NodeHealth> {
+    // Snapshotted BEFORE the await, not read fresh after it: `#config` is
+    // the same shared object a settings save mutates in place, and
+    // `node.url`/`node.network` are now live-appliable (see
+    // `rebuildClient()`). Reading them again after `await` would compare
+    // the OLD node's response against a NEW expected value if a save
+    // raced this call — a pre-existing hazard that live-reload makes
+    // meaningfully more likely to matter in practice.
+    const expectedUrl = this.#config.node.url;
+    const expectedNetwork = this.#config.node.network;
     const raw = await this.#client.health();
     const network = raw.network ?? '';
 
-    if (network.length > 0 && network !== this.#config.node.network) {
+    if (network.length > 0 && network !== expectedNetwork) {
       throw new NetworkMismatchError(
-        `Node at ${this.#config.node.url} serves "${network}", but your config says ` +
-          `node.network: ${this.#config.node.network}.\n` +
+        `Node at ${expectedUrl} serves "${network}", but your config says ` +
+          `node.network: ${expectedNetwork}.\n` +
           'Every signature adopts the NODE\'s network, so continuing would publish to ' +
           `"${network}" — irreversibly, under your wallet. Fix whichever is wrong.`,
       );
@@ -416,6 +478,12 @@ export class OgmaraPublisher {
       return { status: 'throttled-locally', retryAfterMs: this.#budget.msUntilNext(runStartedAt) };
     }
 
+    // Snapshotted ONCE, before either await below — not read fresh a second
+    // time after `buildNewsPost` — so a `rebuildClient()` landing mid-call
+    // (a `node.url` save racing an in-flight publish) can't sign against
+    // one client's identity and send through a different one. Matches
+    // `health()`'s own single-read discipline. (Code audit, this session.)
+    const client = this.#client;
     try {
       // Built explicitly rather than via `client.postNews`, whose options
       // accept only `{tags, attachments}` — it hardcodes the rating to
@@ -432,7 +500,7 @@ export class OgmaraPublisher {
           ? { attachments: post.attachments }
           : {}),
       });
-      const { msg_id } = await this.#client.sendMessageEnvelope(envelope);
+      const { msg_id } = await client.sendMessageEnvelope(envelope);
       return { status: 'published', msgId: msg_id };
     } catch (err) {
       if (httpStatusFromError(err) === 429) {

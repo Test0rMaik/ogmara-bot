@@ -21,7 +21,7 @@ function auth(overrides: Partial<ConstructorParameters<typeof PanelAuth>[0]> = {
   return new PanelAuth({
     adminWallets: [operator.address],
     botAddress: BOT,
-    network: 'testnet',
+    network: () => 'testnet',
     sessionTtlHours: 24,
     ...overrides,
   });
@@ -88,6 +88,25 @@ describe('PanelAuth challenges', () => {
     const a = auth();
     const challenge = a.createChallenge()!;
     expect(a.consumeChallenge(challenge.nonce)).toBe(challenge.message);
+  });
+
+  it('is immune to node.network changing while a login is in flight — binds to whatever was current at MINT time, not at verify time', () => {
+    // `network` is a live-read function (node.network is now
+    // live-appliable), but the challenge must stay bound to whatever the
+    // operator's wallet actually signed — rebuilding the expected message
+    // with a value that changed AFTER minting would reject a genuinely
+    // valid signature for a reason the operator has no way to diagnose.
+    let currentNetwork = 'testnet';
+    const a = auth({ network: () => currentNetwork });
+    const challenge = a.createChallenge()!;
+    expect(challenge.message).toContain('Network: testnet');
+
+    currentNetwork = 'mainnet'; // simulates a settings save landing mid-login
+
+    const rebuilt = a.consumeChallenge(challenge.nonce);
+    expect(rebuilt).toBe(challenge.message);
+    expect(rebuilt).toContain('Network: testnet');
+    expect(rebuilt).not.toContain('Network: mainnet');
   });
 
   it('consumes a nonce exactly once', () => {

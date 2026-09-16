@@ -17,14 +17,23 @@
 import type { UiField } from './modules/types.js';
 
 export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
-  'node.url': { label: 'field.node.url.label', help: 'field.node.url.help', restart: true },
+  // Live: OgmaraPublisher.rebuildClient() (index.ts's node.* reconfigure
+  // hooks) builds a fresh SDK client and propagates it to every other
+  // holder of the old one (ChannelKeyService, the panel's own client/
+  // network/nodeUrl reads, PanelAuth's login-challenge binding, the
+  // commands module's channel-listening WS stream).
+  'node.url': { label: 'field.node.url.label', help: 'field.node.url.help', restart: false },
   'node.network': {
     label: 'field.node.network.label',
     help: 'field.node.network.help',
-    restart: true,
+    // Still confirm: true even though it's live now — a wrong value here
+    // is exactly as expensive as it was under a restart-required label:
+    // every signature adopts whatever network the NODE reports, so a
+    // typo publishes under this wallet's real identity to the wrong chain.
+    restart: false,
     confirm: true,
   },
-  'node.timeoutMs': { label: 'field.node.timeoutMs.label', restart: true },
+  'node.timeoutMs': { label: 'field.node.timeoutMs.label', restart: false },
 
   'posting.dryRun': {
     label: 'field.posting.dryRun.label',

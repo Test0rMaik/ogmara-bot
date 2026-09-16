@@ -548,6 +548,16 @@ async function run(args: CliArgs): Promise<number> {
     warn: (m) => console.warn(m),
   };
 
+  // Set only while the commands module's channel-listening WS stream is
+  // actually connected (between subscribeChannels() and its returned
+  // close()). `subscribe()`'s connection is bound to whichever `node.url`
+  // was current at CALL time — the SDK has no live URL-change API (same
+  // as `OgmaraClient` itself) — so a live `node.url` change needs this to
+  // tear down and reconnect, or the listener silently keeps talking to
+  // the OLD node forever even though publishing correctly moved to the
+  // new one via `publisher.rebuildClient()`.
+  let reconnectChannelSubscription: (() => void) | undefined;
+
   const allModules: BotModule[] = [
     createNewsModule({
       ledger,
@@ -576,18 +586,30 @@ async function run(args: CliArgs): Promise<number> {
       decryptChannelText: (channelId, encContent, encNonce, keyEpoch) =>
         channelKeys.decryptChannelMessage(channelId, encContent, encNonce, keyEpoch),
       subscribeChannels: async (channels, onMessage) => {
-        const sub = subscribe({
-          nodeUrl: effective.node.url,
-          channels: channels.map((id) => String(id)),
-          signer: publisher.signer,
-          onEvent: (event) => {
-            if (event.type === 'message') onMessage(event.envelope);
-          },
-          onError: (err) => {
-            console.warn(`  warning: command listener could not connect (${err.message})`);
-          },
-        });
-        return () => sub.close();
+        const connect = (): ReturnType<typeof subscribe> =>
+          subscribe({
+            // Read fresh on every (re)connect, not captured once — this is
+            // what makes a live node.url change actually take effect the
+            // moment reconnectChannelSubscription() is called below.
+            nodeUrl: effective.node.url,
+            channels: channels.map((id) => String(id)),
+            signer: publisher.signer,
+            onEvent: (event) => {
+              if (event.type === 'message') onMessage(event.envelope);
+            },
+            onError: (err) => {
+              console.warn(`  warning: command listener could not connect (${err.message})`);
+            },
+          });
+        let sub = connect();
+        reconnectChannelSubscription = () => {
+          sub.close();
+          sub = connect();
+        };
+        return () => {
+          reconnectChannelSubscription = undefined;
+          sub.close();
+        };
       },
       describeChannel: async (channelId) => {
         try {
@@ -701,6 +723,21 @@ async function run(args: CliArgs): Promise<number> {
   // reordering either risks the kind of startup-sequencing regression this
   // file's existing comments are full of warnings about. A mutable array
   // sidesteps the ordering question entirely.
+  /**
+   * Live-apply a `node.url`/`node.network`/`node.timeoutMs` change: rebuild
+   * the SDK client from the current config (already updated in place by
+   * the time this runs) and propagate it to every OTHER place that held
+   * its own separate reference to the old one — `OgmaraClient` itself has
+   * no in-place reconfigure API, so a whole new client is the only option.
+   */
+  function rebuildNodeConnections(): void {
+    publisher.rebuildClient();
+    channelKeys.setClient(publisher.client);
+    // Undefined if the commands module isn't enabled, or its subscription
+    // isn't currently connected — nothing to reconnect in that case.
+    reconnectChannelSubscription?.();
+  }
+
   const reconfigureHooks: ReconfigureHook[] = [
     // The values below are the ones the uiSchema promises are live
     // (`restart: false`) specifically BECAUSE something baked them into a
@@ -731,6 +768,16 @@ async function run(args: CliArgs): Promise<number> {
       path: 'queue.maxAgeHours',
       apply: (v) => queue.setMaxAgeHours(v as number),
     },
+    // `node.url`/`node.network`/`node.timeoutMs` all three trigger the SAME
+    // rebuild — the SDK client has no partial-update API, so there is no
+    // cheaper path for changing just one of them, and rebuilding twice in
+    // one save (if two of the three changed together) would only redo
+    // identical, cheap work. `rebuildNodeConnections` reads the current
+    // `effective.node.*` fresh each time it runs, so it does not matter
+    // which of the three paths actually triggered it.
+    { path: 'node.url', apply: () => rebuildNodeConnections() },
+    { path: 'node.network', apply: () => rebuildNodeConnections() },
+    { path: 'node.timeoutMs', apply: () => rebuildNodeConnections() },
   ];
   if (effective.panel.enabled) {
     statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);
@@ -992,15 +1039,15 @@ async function startControlPanel(
   const auth = new PanelAuth({
     adminWallets: config.panel.adminWallets,
     botAddress: publisher.address,
-    network: config.node.network,
+    network: () => config.node.network,
     sessionTtlHours: config.panel.sessionTtlHours,
   });
 
   const panel = await startPanel(config.panel.bind, config.panel.port, {
     auth,
     trustedProxies,
-    network: config.node.network,
-    client: publisher.client,
+    network: () => config.node.network,
+    client: () => publisher.client,
     signer: publisher.signer,
     botAddress: publisher.address,
     walletKeyHex: secrets.walletKeyHex,
@@ -1026,7 +1073,7 @@ async function startControlPanel(
       await takeStatsSnapshotNow();
       return statsHistory.all();
     },
-    nodeUrl: config.node.url,
+    nodeUrl: () => config.node.url,
     fetchProfile: () => fetchProfile(publisher.client, publisher.address),
     setRegistered: (registered) => publisher.setRegistered(registered),
     settings: settingsDeps,

@@ -104,7 +104,7 @@ async function start(options: StartOptions = {}): Promise<{
   const auth = new PanelAuth({
     adminWallets: options.adminWallets ?? [operator.address],
     botAddress: bot.address,
-    network: 'testnet',
+    network: () => 'testnet',
     sessionTtlHours: 24,
   });
 
@@ -149,8 +149,8 @@ async function start(options: StartOptions = {}): Promise<{
   const deps: PanelDeps = {
     auth,
     trustedProxies: new TrustedProxies(options.trustedProxyCidrs ?? []),
-    network: 'testnet',
-    client: {} as OgmaraClient, // opaque — only ever forwarded to applyProfileFn
+    network: () => 'testnet',
+    client: () => ({}) as OgmaraClient, // opaque — only ever forwarded to applyProfileFn
     signer: bot,
     botAddress: bot.address,
     walletKeyHex: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex'),
@@ -168,7 +168,7 @@ async function start(options: StartOptions = {}): Promise<{
     queuedCountFn: () => options.queuedCount ?? 0,
     fetchStatsHistory: fetchStatsHistoryFn,
     refreshStatsHistory: refreshStatsHistoryFn,
-    nodeUrl: options.nodeUrl ?? 'https://node.example.test',
+    nodeUrl: () => options.nodeUrl ?? 'https://node.example.test',
     fetchProfile: fetchProfileFn,
     setRegistered: setRegisteredFn,
     ...(options.settings !== undefined ? { settings: options.settings } : {}),

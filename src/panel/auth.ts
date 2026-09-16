@@ -93,6 +93,15 @@ export async function verifyKleverMessage(
 interface PendingChallenge {
   timestampMs: number;
   createdAt: number;
+  /**
+   * The network in effect when this challenge was minted, not re-read live
+   * at verification time. `node.network` is now live-appliable — a save
+   * changing it while a login is in flight must not invalidate a
+   * signature the operator's wallet already produced against the OLD
+   * value; rebuilding the message with whatever is
+   * CURRENT at verify time would do exactly that.
+   */
+  network: string;
 }
 
 /** What a valid session token carries. */
@@ -108,8 +117,14 @@ export interface PanelAuthOptions {
   adminWallets: readonly string[];
   /** The bot's own wallet address — binds challenges to this instance. */
   botAddress: string;
-  /** Klever network the bot is attached to. */
-  network: string;
+  /**
+   * Klever network the bot is attached to. A function, not a plain string
+   * — `node.network` is now live-appliable, and this is read fresh at
+   * challenge-mint time (see `PendingChallenge.network`) rather than
+   * snapshotted once at construction, the same live-read idiom
+   * `PanelDeps.network`/`nodeUrl`/`client` already use.
+   */
+  network: () => string;
   /** Session lifetime in hours. */
   sessionTtlHours: number;
   /** Injected for tests. */
@@ -128,7 +143,7 @@ export class PanelAuth {
   readonly #hmacSecret = randomBytes(32);
   readonly #adminWallets: readonly string[];
   readonly #botAddress: string;
-  readonly #network: string;
+  readonly #network: () => string;
   readonly #sessionTtlHours: number;
   readonly #now: () => number;
 
@@ -177,8 +192,13 @@ export class PanelAuth {
     }
 
     const nonce = randomBytes(32).toString('hex');
-    this.#challenges.set(nonce, { timestampMs: now, createdAt: now });
-    return { nonce, timestamp: now, message: this.#buildMessage(nonce, now) };
+    // Snapshotted once, here — not read live again in consumeChallenge()
+    // — so a node.network save racing an in-flight login can never
+    // invalidate a signature the operator's wallet already produced
+    // against whatever this challenge actually declared.
+    const network = this.#network();
+    this.#challenges.set(nonce, { timestampMs: now, createdAt: now, network });
+    return { nonce, timestamp: now, message: this.#buildMessage(nonce, now, network) };
   }
 
   /**
@@ -192,7 +212,7 @@ export class PanelAuth {
     if (challenge === undefined) return undefined;
     this.#challenges.delete(nonce);
     if (this.#now() - challenge.createdAt > NONCE_TTL_MS) return undefined;
-    return this.#buildMessage(nonce, challenge.timestampMs);
+    return this.#buildMessage(nonce, challenge.timestampMs, challenge.network);
   }
 
   /** Whether an address appears in the configured allowlist. */
@@ -275,14 +295,14 @@ export class PanelAuth {
    *
    * `Bot` and `Network` are the replay bindings — see the module comment.
    */
-  #buildMessage(nonce: string, timestampMs: number): string {
+  #buildMessage(nonce: string, timestampMs: number, network: string): string {
     return (
       // Safe to rename: a challenge is held in memory and verified by the same
       // process that issued it, so this string never has to match one produced
       // by an older build.
       'Ogmara Bot Login\n' +
       `Bot: ${this.#botAddress}\n` +
-      `Network: ${this.#network}\n` +
+      `Network: ${network}\n` +
       `Nonce: ${nonce}\n` +
       `Timestamp: ${timestampMs}`
     );

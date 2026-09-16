@@ -170,7 +170,10 @@ export type DecryptOutcome = { readonly text: string } | 'waiting' | 'error';
  * module's `reply`/`decryptChannelText` dependencies.
  */
 export class ChannelKeyService {
-  readonly #client: OgmaraClient;
+  // Not readonly — see setClient(). Every encrypted-channel operation
+  // below reads `this.#client` fresh at call time (no method caches it
+  // across an await), so swapping the reference is enough.
+  #client: OgmaraClient;
   readonly #signer: WalletSigner;
   readonly #identity: DeviceEncIdentity;
   readonly #warn: (message: string) => void;
@@ -200,6 +203,18 @@ export class ChannelKeyService {
     this.#warn = warn;
   }
 
+  /**
+   * Live-apply a `node.url`/`node.network`/`node.timeoutMs` change: swap
+   * in the freshly-rebuilt client `OgmaraPublisher.rebuildClient()` just
+   * built. Without this, every encrypted-channel operation — including
+   * the commands module's encrypted reply path — would keep talking to
+   * the OLD node forever after a live node change, since this service
+   * held its own separate client reference.
+   */
+  setClient(client: OgmaraClient): void {
+    this.#client = client;
+  }
+
   /** This wallet's stable device id, hex. */
   get deviceId(): string {
     return this.#identity.deviceId;
@@ -213,8 +228,13 @@ export class ChannelKeyService {
    * work without it — it just means this run can't receive new keys yet.
    */
   async ensureBinding(walletAddress: string, network: string): Promise<void> {
+    // Snapshotted once — this method reads the client twice, across two
+    // awaits, so a setClient() swap (a live node.url/network change) landing
+    // in between must not let the fetch and the publish it's based on go to
+    // two different nodes. Same reasoning as OgmaraPublisher.publish().
+    const client = this.#client;
     try {
-      const existing = await this.#client.getEncKeys(walletAddress);
+      const existing = await client.getEncKeys(walletAddress);
       const alreadyBound = existing.keys.some(
         (k) =>
           k.device_id.toLowerCase() === this.#identity.deviceId.toLowerCase() &&
@@ -230,7 +250,7 @@ export class ChannelKeyService {
         walletSign: async (claim: string) =>
           this.#signer.signKleverMessage(new TextEncoder().encode(claim)),
       });
-      await this.#client.publishEncKeyEnvelope(walletAddress, envelope);
+      await client.publishEncKeyEnvelope(walletAddress, envelope);
     } catch (err) {
       this.#warn(
         '  warning: could not publish this device\'s encryption-key binding ' +
@@ -292,12 +312,16 @@ export class ChannelKeyService {
     }
     this.#vaultBackupPending = true;
     this.#vaultBackupDirty = false;
+    // Snapshotted once — this is a read-merge-write across two client
+    // calls; a setClient() swap landing between them must not read the
+    // vault from one node and write the merged result to another.
+    const client = this.#client;
     try {
       const sig = await this.#signer.signKleverMessage(new TextEncoder().encode(VAULT_SIGN_CLAIM));
       const bk = deriveVaultBackupKey(sig);
       let keyring: VaultKeyring;
       try {
-        const remote = await this.#client.getKeyVault();
+        const remote = await client.getKeyVault();
         keyring = remote === null ? emptyKeyring() : openKeyVault(bk, remote);
       } catch {
         // Can't safely merge into a vault we can't read — skip this pass
@@ -308,7 +332,7 @@ export class ChannelKeyService {
         keyring.chan[scopedEpoch] = key;
       }
       const sealed = sealKeyVault(bk, keyring);
-      await this.#client.syncKeyVault(sealed);
+      await client.syncKeyVault(sealed);
     } catch (err) {
       this.#warn(
         `  warning: could not back up channel keys to the key vault (${err instanceof Error ? err.message : String(err)})`,

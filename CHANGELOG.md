@@ -5,6 +5,63 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-09-16
+
+`node.url`/`node.network`/`node.timeoutMs` are now live-appliable. The
+SDK's client has no in-place reconfigure API, so this rebuilds it from
+scratch on a save and propagates the swap to every other place that held
+its own separate reference to the old one.
+
+### Added
+
+- **`node.url`/`node.network`/`node.timeoutMs` now apply live.**
+  `OgmaraPublisher.rebuildClient()` builds a fresh client and re-attaches
+  the wallet signer; `ChannelKeyService` (every encrypted-channel
+  operation, including the commands module's encrypted reply path), the
+  panel's own client/network/CSP, the login-challenge signer, and the
+  commands module's channel-listening connection all follow it.
+  `node.network` keeps its confirmation step — a wrong value here is
+  still exactly as expensive as it was under a restart-required label.
+
+### Fixed
+
+- **A stale-CSP gap**: the panel's Content-Security-Policy `img-src`
+  allowlist was built once at startup from `node.url` and never
+  recomputed — a live change would have kept allowing the old node's
+  origin and silently blocking avatar previews from the new one, with no
+  server-side error to notice it by. Now rebuilt fresh per request (a
+  cheap URL-origin parse, no measurable cost).
+- **A login-challenge race**: a `node.network` change landing while an
+  operator's login was in flight could invalidate a signature their
+  wallet had already produced against the OLD value. Challenges now
+  snapshot the network at mint time and verify against that snapshot,
+  never a value that may have moved on since.
+- **A pre-existing race in the node health check**: `node.network`/`.url`
+  used to be read again after the network round trip, not from the value
+  that was actually current when the check started — this phase makes it
+  meaningfully more likely to matter in practice, so it's fixed alongside
+  the rest.
+
+### Security
+
+- **Critical, caught by this release's own code audit before shipping**:
+  the SDK's wallet signer permanently caches its resolved network on
+  first use and never re-derives it — rebuilding the client alone was a
+  silent no-op for *signing* after the bot's first post. Every
+  subsequent post would have kept embedding whichever network was
+  resolved at startup, no matter how many times `node.network` changed
+  afterward — the exact cross-network replay this field's confirmation
+  step exists to prevent. Fixed by clearing the signer's cached
+  resolution on every rebuild, forcing the next signed envelope to
+  re-derive it through the freshly-repointed client.
+- Two related gaps, medium severity: `OgmaraPublisher.publish()` and two
+  `ChannelKeyService` methods each read the client twice across an
+  `await`, so a live `node.url` change landing mid-call could sign
+  against one client's context and send through a different one, or
+  read a vault from one node and write the merged result to another.
+  Both now snapshot the client once per call, matching the health
+  check's already-correct discipline.
+
 ## [0.33.0] - 2026-09-16
 
 First increment of a larger hot-reload expansion — everything except

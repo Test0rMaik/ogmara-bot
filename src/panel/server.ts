@@ -65,8 +65,17 @@ const MAX_AVATAR_BODY_BYTES = Math.ceil((MAX_AVATAR_BYTES * 4) / 3) + 4096;
 export interface PanelDeps {
   auth: PanelAuth;
   trustedProxies: TrustedProxies;
-  network: ScNetwork;
-  client: OgmaraClient;
+  /**
+   * `node.network`/`node.url`/the SDK client are all now live-appliable
+   * (see `OgmaraPublisher.rebuildClient()`), so these are functions
+   * re-read at call time — like `dailyLimitFn`/`burstLimitFn`/`dryRunFn`
+   * already were — rather than plain fields snapshotted once when the
+   * panel started. A plain field here would silently go stale after a
+   * live `node.*` change even though the underlying value it reads is
+   * genuinely current.
+   */
+  network: () => ScNetwork;
+  client: () => OgmaraClient;
   signer: WalletSigner;
   botAddress: string;
   /** Raw wallet key, for the one action (`registerWallet`) that needs it directly. */
@@ -133,8 +142,14 @@ export interface PanelDeps {
    * endpoint every Ogmara client uses) and so the CSP's `img-src` can allow
    * exactly that one origin rather than either blocking avatar previews
    * entirely or opening `img-src` up to anything.
+   *
+   * A function, not a plain string, and read fresh on every request (see
+   * `handle()`) rather than once at `startPanel()` time — `node.url` is
+   * now live-appliable, and a CSP built once at startup would otherwise
+   * keep allowing the OLD node's origin (and blocking the new one) forever
+   * after a live change, with no server-side error to notice it by.
    */
-  nodeUrl: string;
+  nodeUrl: () => string;
   /** Read the bot's own profile back from the node, for the Settings tab. */
   fetchProfile: () => Promise<ProfileSpec>;
   /**
@@ -275,9 +290,10 @@ export function startPanel(bind: string, port: number, deps: PanelDeps): Promise
     registrationBroadcastAt: 0,
     uploadingAvatar: false,
   };
-  const csp = buildCsp(deps.nodeUrl);
-
   const server = createServer((req, res) => {
+    // Built fresh per request, not once here — see the doc comment on
+    // `PanelDeps.nodeUrl`.
+    const csp = buildCsp(deps.nodeUrl());
     void handle(req, res, deps, state, csp).catch((err) => {
       console.error('panel: unhandled error:', err instanceof Error ? err.message : err);
       if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
@@ -375,7 +391,7 @@ async function handle(
 
   // ── Unauthenticated routes ──────────────────────────────────────────
   if (method === 'GET' && path === '/') {
-    sendHtml(res, 200, renderPage({ botAddress: deps.botAddress, network: deps.network }), csp);
+    sendHtml(res, 200, renderPage({ botAddress: deps.botAddress, network: deps.network() }), csp);
     return;
   }
   if (method === 'GET' && path === '/app.js') {
@@ -470,7 +486,7 @@ async function handle(
 
     let registration;
     try {
-      registration = await deps.checkRegistration(deps.network, deps.botAddress);
+      registration = await deps.checkRegistration(deps.network(), deps.botAddress);
     } catch (err) {
       sendJson(res, 502, {
         error: `could not reach the chain: ${err instanceof Error ? err.message : String(err)}`,
@@ -486,7 +502,7 @@ async function handle(
 
     sendJson(res, 200, {
       botAddress: deps.botAddress,
-      network: deps.network,
+      network: deps.network(),
       dryRun: deps.dryRunFn(),
       dailyLimit: deps.dailyLimitFn(),
       burstLimit: deps.burstLimitFn(),
@@ -606,7 +622,7 @@ async function handle(
       avatarCid: body.avatarCid as string | undefined,
     };
     try {
-      const result = await deps.applyProfile(deps.client, spec);
+      const result = await deps.applyProfile(deps.client(), spec);
       sendJson(res, 200, result);
     } catch (err) {
       sendJson(res, 502, {
@@ -625,7 +641,7 @@ async function handle(
       // credential into the browser's history/devtools for no reason the
       // client actually needs. `.origin` is exactly what ui.ts uses to build
       // the avatar's media URL. (Security audit, 0.14.0.)
-      sendJson(res, 200, { ...profile, nodeUrl: new URL(deps.nodeUrl).origin });
+      sendJson(res, 200, { ...profile, nodeUrl: new URL(deps.nodeUrl()).origin });
     } catch (err) {
       sendJson(res, 502, {
         error: `could not fetch profile: ${err instanceof Error ? err.message : String(err)}`,
@@ -733,7 +749,7 @@ async function handle(
     state.registering = true;
     try {
       const key = hexToKey(deps.walletKeyHex);
-      const result = await deps.registerWallet(deps.network, deps.signer, key);
+      const result = await deps.registerWallet(deps.network(), deps.signer, key);
       // The whole point of registering is the 6x ceiling; adopt it now rather
       // than at the next restart.
       if (result.status === 'registered' || result.status === 'already-registered') {
