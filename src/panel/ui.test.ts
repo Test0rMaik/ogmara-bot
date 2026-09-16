@@ -1407,3 +1407,96 @@ describe('sidebar identity header (avatar + name + handle)', () => {
     expect(fn).toMatch(/if\s*\(!silent\)\s*showError/);
   });
 });
+
+describe('exact visual match to the approved concept — badges, toggle switches, rail footer', () => {
+  it('the live/restart field badges use the soft-pill "badge" class, not the outlined "chip" class', () => {
+    // The concept uses two distinct visual languages: outlined chips for
+    // source/file-only info, soft-filled pills for the one pair the
+    // operator scans for at a glance (live vs. restart). Mixing them back
+    // together would erase that distinction.
+    const fn = extractFunction(script, 'buildFieldRow');
+    expect(fn).toContain("restartChip.className = 'badge badge-restart';");
+    expect(fn).toContain("liveChip.className = 'badge badge-live';");
+    expect(fn).not.toContain("'chip chip-restart'");
+    expect(fn).not.toContain("'chip chip-live'");
+  });
+
+  it('the source/file-only badges keep the original outlined "chip" class unchanged', () => {
+    const fn = extractFunction(script, 'buildFieldRow');
+    expect(fn).toMatch(/sourceChip\.className = 'chip'/);
+  });
+
+  it('a boolean field renders as a toggle switch — a real checkbox plus track/thumb spans, not a bare checkbox', () => {
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toContain("wrap.className = 'switch';");
+    expect(fn).toContain("input.type = 'checkbox';");
+    expect(fn).toContain("track.className = 'track';");
+    expect(fn).toContain("thumb.className = 'thumb';");
+  });
+
+  it('the toggle switch keeps the real checkbox\'s checked/change wiring untouched', () => {
+    // The visual swap must not touch the actual state — saveConfig() and
+    // fieldCurrentValue() both read straight off the checkbox element
+    // itself, regardless of what sits visually on top of it.
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toMatch(/input\.checked = Boolean\(value\)/);
+    expect(fn).toMatch(/input\.addEventListener\('change', \(\) => onChange\(input\.checked\)\)/);
+  });
+
+  it('the rail-footer restart button exists in the markup, hidden by default', () => {
+    expect(page).toContain('<div class="rail-footer" id="rail-footer" hidden>');
+    expect(page).toContain('id="rail-restart-btn"');
+  });
+
+  it('renderRestartBanner keeps the rail-footer button in sync with the same persisted data — no second counter', () => {
+    const fn = extractFunction(script, 'renderRestartBanner');
+    expect(fn).toContain("getElementById('rail-footer')");
+    expect(fn).toContain('railFooter.hidden = false');
+    expect(fn).toContain('railFooter.hidden = true');
+    // Same `title` string reused for both the top banner and the rail
+    // footer — not a second, possibly-drifting translation lookup.
+    expect(fn).toMatch(/getElementById\('rail-restart-btn'\)\.textContent = '↻ ' \+ title/);
+  });
+
+  it('clicking the rail-footer button scrolls to the existing top-of-page banner, rather than duplicating its content', () => {
+    expect(script).toMatch(
+      /getElementById\('rail-restart-btn'\)\.addEventListener\('click', \(\) => \{\s*document\.getElementById\('restart-banner'\)\.scrollIntoView/,
+    );
+  });
+
+  it('the rail gets its own surface background and border, not the bare page background', () => {
+    // REGRESSION GUARD: the shipped 0.30.0/0.31.0 rail had no background of
+    // its own and sat flush on the page background — reported as reading
+    // "thin" compared to the approved concept, where the rail is a
+    // distinct bordered panel.
+    expect(page).toMatch(/\.rail\s*\{[^}]*background:\s*var\(--surface\)/);
+    expect(page).toMatch(/\.rail\s*\{[^}]*border:\s*1px solid var\(--border\)/);
+  });
+
+  it('defines the new live/restart/accent-soft design tokens in every theme block', () => {
+    for (const token of ['--live', '--live-soft', '--restart', '--restart-soft', '--accent-soft']) {
+      // 3 theme blocks: the dark-default :root, the light prefers-color-scheme
+      // override, and the explicit :root[data-theme="light"] block.
+      const count = page.split(token + ':').length - 1;
+      expect(count).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it('the light-theme --live/--restart text colors are dark enough for WCAG AA at badge text size', () => {
+    // REGRESSION GUARD (code audit): the ORIGINAL light-theme values
+    // (#1f9d63 / #b7791f, mirrored straight from the design concept)
+    // measured under 3.2:1 contrast against the badges' own lightly-tinted
+    // background — below the 4.5:1 WCAG AA floor for small (0.68rem) text.
+    // #167048 / #855716 measure ~5.3:1. This test pins the darker values
+    // rather than re-deriving contrast math in a unit test — an accidental
+    // revert to the lighter originals (e.g. a future "restore the exact
+    // concept colors" pass) should fail loudly here, not silently ship an
+    // accessibility regression.
+    const lightBlocks = [...page.matchAll(/--live: (#[0-9a-f]{6}); --live-soft:/g)].map((m) => m[1]);
+    const restartBlocks = [...page.matchAll(/--restart: (#[0-9a-f]{6}); --restart-soft:/g)].map((m) => m[1]);
+    // Index 0 is the dark-default :root block (fine as-is, checked separately
+    // by the audit); indices 1 and 2 are the two light-theme blocks.
+    expect(lightBlocks.slice(1)).toEqual(['#167048', '#167048']);
+    expect(restartBlocks.slice(1)).toEqual(['#855716', '#855716']);
+  });
+});

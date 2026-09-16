@@ -49,30 +49,44 @@ export function renderPage(ctx: PageContext): string {
     color-scheme: dark;
     --bg: #12141a; --surface: #1c1f27; --surface-sunken: #12141a; --border: #2a2e38;
     --fg: #e6e6e6; --fg-secondary: #c8ccd2; --muted: #9aa0a8; --label: #b8bcc4;
-    --accent: #3a6ff7; --accent-fg: #ffffff;
+    --accent: #3a6ff7; --accent-fg: #ffffff; --accent-soft: rgba(91,139,255,.14);
     --danger: #d64545; --error: #ff8a8a; --success: #7fd88f;
     --banner-bg: #3a2a12; --banner-border: #a86a1e; --banner-fg: #ffd9a0;
     --chip-bg: #12141a;
+    --live: #34c77b; --live-soft: rgba(52,199,123,.14);
+    --restart: #e0a336; --restart-soft: rgba(224,163,54,.14);
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
       color-scheme: light;
       --bg: #f5f6f8; --surface: #ffffff; --surface-sunken: #eef0f4; --border: #dde1e8;
       --fg: #1b1e24; --fg-secondary: #3a4150; --muted: #6b7280; --label: #4a5160;
-      --accent: #3a6ff7; --accent-fg: #ffffff;
+      --accent: #3a6ff7; --accent-fg: #ffffff; --accent-soft: rgba(58,111,247,.09);
       --danger: #c0392b; --error: #c0392b; --success: #1e8449;
       --banner-bg: #fff4e0; --banner-border: #e0a13a; --banner-fg: #6b4a10;
       --chip-bg: #eef0f4;
+      /* Deliberately darker than the dark-theme --live/--restart hues (which
+         work fine at their own lightness against a near-black surface) —
+         the badge text sits on a very lightly tinted white background here
+         (12% alpha), so a lighter green/amber measured under 3.2:1 contrast
+         against it, below WCAG AA's 4.5:1 floor for small (0.68rem) text.
+         These pass at ~5.3:1. Raising the tint's alpha instead does NOT
+         fix this — it moves the background AWAY from white and toward the
+         text's own hue, which narrows the luminance gap further. */
+      --live: #167048; --live-soft: rgba(31,157,99,.12);
+      --restart: #855716; --restart-soft: rgba(183,121,31,.12);
     }
   }
   :root[data-theme="light"] {
     color-scheme: light;
     --bg: #f5f6f8; --surface: #ffffff; --surface-sunken: #eef0f4; --border: #dde1e8;
     --fg: #1b1e24; --fg-secondary: #3a4150; --muted: #6b7280; --label: #4a5160;
-    --accent: #3a6ff7; --accent-fg: #ffffff;
+    --accent: #3a6ff7; --accent-fg: #ffffff; --accent-soft: rgba(58,111,247,.09);
     --danger: #c0392b; --error: #c0392b; --success: #1e8449;
     --banner-bg: #fff4e0; --banner-border: #e0a13a; --banner-fg: #6b4a10;
     --chip-bg: #eef0f4;
+    --live: #167048; --live-soft: rgba(31,157,99,.12);
+    --restart: #855716; --restart-soft: rgba(183,121,31,.12);
   }
   :root[data-theme="dark"] { color-scheme: dark; }
 
@@ -110,9 +124,11 @@ export function renderPage(ctx: PageContext): string {
    * lopsided on a very wide screen, with the rail pinned left and a huge
    * gap of empty space accumulating only on the right of the content.
    */
-  .app-grid { display: grid; grid-template-columns: 220px 1fr; gap: 1.5rem; align-items: start; }
+  .app-grid { display: grid; grid-template-columns: 240px 1fr; gap: 1.5rem; align-items: start; }
   @media (max-width: 720px) { .app-grid { grid-template-columns: 1fr; } }
-  .rail { display: flex; flex-direction: column; gap: 0.15rem; position: sticky; top: 1rem; }
+  .rail { display: flex; flex-direction: column; gap: 0.15rem; position: sticky; top: 1rem;
+          background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+          padding: 1.1rem 0.7rem; }
   .rail-header { display: flex; align-items: center; gap: 0.6rem; padding: 0.2rem 0.6rem 0.9rem;
                  margin-bottom: 0.4rem; border-bottom: 1px solid var(--border); }
   .rail-avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; overflow: hidden;
@@ -124,13 +140,13 @@ export function renderPage(ctx: PageContext): string {
                          text-overflow: ellipsis; white-space: nowrap; }
   .rail-identity-handle { font-size: 0.72rem; color: var(--muted); font-family: ui-monospace, monospace;
                            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rail-item { display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left;
+  .rail-item { display: flex; align-items: center; gap: 0.65rem; width: 100%; text-align: left;
                background: none; color: var(--fg-secondary); border: none; border-radius: 8px;
-               padding: 0.55rem 0.6rem; font: inherit; font-size: 0.9rem; cursor: pointer; }
+               padding: 0.6rem 0.65rem; font: inherit; font-size: 0.88rem; font-weight: 500; cursor: pointer; }
   .rail-item:hover:not(.active) { background: var(--surface-sunken); color: var(--fg); }
-  .rail-item.active { background: var(--chip-bg); color: var(--accent); font-weight: 600; }
-  .rail-item .rail-glyph { width: 22px; height: 22px; border-radius: 6px; background: var(--surface-sunken);
-                            display: grid; place-items: center; flex: none; font-size: 0.8rem; }
+  .rail-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .rail-item .rail-glyph { width: 26px; height: 26px; border-radius: 7px; background: var(--surface-sunken);
+                            display: grid; place-items: center; flex: none; font-size: 0.85rem; }
   .rail-item.active .rail-glyph { background: var(--accent); color: var(--accent-fg); }
   .rail-subnav { display: flex; flex-direction: column; gap: 0.1rem; margin: 0.15rem 0 0.4rem 1.5rem; }
   .rail-subitem { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
@@ -138,12 +154,19 @@ export function renderPage(ctx: PageContext): string {
                   border: none; border-radius: 6px; padding: 0.35rem 0.5rem; font: inherit; font-size: 0.8rem;
                   cursor: pointer; }
   .rail-subitem:hover:not(.active) { color: var(--fg-secondary); background: var(--surface-sunken); }
-  .rail-subitem.active { color: var(--accent); background: var(--chip-bg); }
-  .rail-subitem-count { flex: none; min-width: 1.3em; padding: 0.05rem 0.35rem; border-radius: 999px;
-                         background: var(--surface-sunken); color: var(--muted); font-size: 0.68rem;
-                         text-align: center; font-variant-numeric: tabular-nums; }
-  .rail-subitem.active .rail-subitem-count { background: var(--accent); color: var(--accent-fg); }
+  .rail-subitem.active { color: var(--accent); background: var(--accent-soft); }
+  /* Plain muted number, not a pill — this is a count, not a status badge;
+     giving it the same pill treatment as the live/restart badges above
+     would visually conflate "how many fields" with "does this need a
+     restart," two unrelated facts about a topic. */
+  .rail-subitem-count { flex: none; margin-left: auto; font-size: 0.72rem; color: var(--muted);
+                         font-variant-numeric: tabular-nums; }
   .rail-main { min-width: 0; }
+  .rail-footer { margin-top: 0.5rem; padding: 0.75rem 0.5rem 0; border-top: 1px solid var(--border); }
+  .rail-footer button { width: 100%; padding: 0.55rem; border-radius: 8px; border: 1px solid var(--border);
+                         background: var(--surface-sunken); color: var(--fg-secondary); font: inherit;
+                         font-size: 0.8rem; cursor: pointer; text-align: center; }
+  .rail-footer button:hover { color: var(--fg); }
 
   .quick-stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0 0 1.2rem; }
   .quick-stats div { min-width: 6rem; }
@@ -199,8 +222,28 @@ export function renderPage(ctx: PageContext): string {
   .chip { display: inline-block; background: var(--chip-bg); border: 1px solid var(--border); color: var(--muted);
           border-radius: 999px; padding: 0.05rem 0.55rem; font-size: 0.72rem; white-space: nowrap; }
   .chip.chip-ui { color: var(--accent); border-color: var(--accent); }
-  .chip.chip-restart { color: var(--banner-fg); border-color: var(--banner-border); }
-  .chip.chip-live { color: var(--success); border-color: var(--success); }
+  /* Soft-filled pills, not outlined — a distinct visual language from the
+     plain .chip above, reserved for the one badge pair the operator scans
+     for at a glance ("will this apply now, or after a restart"). */
+  .badge { display: inline-block; border-radius: 999px; padding: 0.05rem 0.55rem;
+           font-size: 0.68rem; font-weight: 600; white-space: nowrap; letter-spacing: 0.01em; }
+  .badge.badge-restart { background: var(--restart-soft); color: var(--restart); }
+  .badge.badge-live { background: var(--live-soft); color: var(--live); }
+  /* A real checkbox underneath (opacity: 0, stretched to fill) — still the
+     most robust cross-browser, keyboard- and screen-reader-accessible
+     control; only the VISUAL presentation is a track+thumb, exactly the
+     technique the concept mockup itself uses. */
+  .switch { position: relative; width: 38px; height: 22px; flex: none; display: inline-block; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; background: var(--border); border-radius: 999px;
+                    transition: background 0.15s; pointer-events: none; }
+  .switch .thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+                    background: var(--surface); transition: transform 0.15s; pointer-events: none;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track + .thumb { transform: translateX(16px); }
+  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { .switch .track, .switch .thumb { transition: none; } }
   .reset-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 6px;
                padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; font-family: inherit; }
   .reset-btn:hover:not(:disabled) { color: var(--fg); border-color: var(--accent); }
@@ -307,6 +350,9 @@ export function renderPage(ctx: PageContext): string {
       <button class="rail-item" id="tab-btn-audit" data-tab="audit">
         <span class="rail-glyph" aria-hidden="true">▾</span><span data-i18n="nav.audit">Audit log</span>
       </button>
+      <div class="rail-footer" id="rail-footer" hidden>
+        <button type="button" id="rail-restart-btn"></button>
+      </div>
     </nav>
 
     <main class="rail-main">
@@ -1712,12 +1758,15 @@ function savePersistedRestartPending(paths) {
 function renderRestartBanner() {
   const paths = loadPersistedRestartPending();
   const banner = document.getElementById('restart-banner');
+  const railFooter = document.getElementById('rail-footer');
   if (paths.length === 0) {
     banner.hidden = true;
+    railFooter.hidden = true;
     return;
   }
+  const title = t('config.restart.banner.title', { count: paths.length });
   banner.hidden = false;
-  document.getElementById('restart-banner-title').textContent = t('config.restart.banner.title', { count: paths.length });
+  document.getElementById('restart-banner-title').textContent = title;
   const list = document.getElementById('restart-banner-list');
   list.textContent = '';
   for (const path of paths) {
@@ -1726,6 +1775,12 @@ function renderRestartBanner() {
     li.textContent = field ? fieldLabel(field) : path;
     list.appendChild(li);
   }
+  // The top-of-page banner scrolls out of view on a long Configuration
+  // page; the rail is sticky-positioned, so this is the reminder that
+  // stays visible while scrolled — same underlying data, no second
+  // counter to keep in sync.
+  railFooter.hidden = false;
+  document.getElementById('rail-restart-btn').textContent = '↻ ' + title;
 }
 
 function addRestartPending(paths) {
@@ -1789,16 +1844,18 @@ function buildFieldInput(field) {
 
   if (field.type.kind === 'boolean') {
     const wrap = document.createElement('label');
-    wrap.style.display = 'flex';
-    wrap.style.alignItems = 'center';
-    wrap.style.gap = '0.4rem';
-    wrap.style.margin = '0';
+    wrap.className = 'switch';
     const input = document.createElement('input');
     input.type = 'checkbox';
-    input.style.width = 'auto';
     input.checked = Boolean(value);
     input.addEventListener('change', () => onChange(input.checked));
     wrap.appendChild(input);
+    const track = document.createElement('span');
+    track.className = 'track';
+    wrap.appendChild(track);
+    const thumb = document.createElement('span');
+    thumb.className = 'thumb';
+    wrap.appendChild(thumb);
     return wrap;
   }
 
@@ -2061,7 +2118,7 @@ function buildFieldRow(field) {
     actions.appendChild(fileOnlyChip);
   } else if (field.restart) {
     const restartChip = document.createElement('span');
-    restartChip.className = 'chip chip-restart';
+    restartChip.className = 'badge badge-restart';
     restartChip.textContent = t('config.restart.badge');
     actions.appendChild(restartChip);
   } else {
@@ -2070,7 +2127,7 @@ function buildFieldRow(field) {
     // what the schema already says; whether that promise is actually kept
     // by the running process is a backend concern, not this UI's.
     const liveChip = document.createElement('span');
-    liveChip.className = 'chip chip-live';
+    liveChip.className = 'badge badge-live';
     liveChip.textContent = t('config.live.badge');
     actions.appendChild(liveChip);
   }
@@ -2423,6 +2480,9 @@ document.getElementById('config-discard-btn').addEventListener('click', discardC
 document.getElementById('restart-banner-dismiss').addEventListener('click', () => {
   savePersistedRestartPending([]);
   renderRestartBanner();
+});
+document.getElementById('rail-restart-btn').addEventListener('click', () => {
+  document.getElementById('restart-banner').scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
 document.getElementById('audit-filter-actor').addEventListener('input', renderAuditTable);
 document.getElementById('audit-filter-path').addEventListener('input', renderAuditTable);

@@ -5,6 +5,46 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-09-16
+
+Exact visual match to the approved sidebar-rail concept, after the user
+supplied the concept's actual source file — the 0.31.0 pass had closed
+some of the gap but missed real structural pieces, not just decoration.
+
+### Changed
+
+- **The sidebar rail now has its own surface and border**, reading as a
+  distinct panel rather than sitting flush on the page background — the
+  most visible single change, and very likely why the panel read as
+  "thin" before this.
+- Rail item glyphs enlarged to match the concept (26×26, from 22×22);
+  active-state highlight switched to a new soft accent tint.
+- Per-topic field-count badges are now plain muted numbers, not pills —
+  a count and a status badge are different kinds of information and
+  shouldn't share a visual language.
+- **Config-field live/restart badges are now soft-filled pills**
+  (new `--live`/`--restart` + `-soft` tint tokens), replacing the
+  previous outlined-chip treatment — a distinct visual language from the
+  "source" badge next to it, matching the concept.
+- **Boolean config fields render as toggle switches**, not bare
+  checkboxes. The underlying `<input type="checkbox">` and its
+  checked-state wiring are unchanged — only the presentation changed;
+  still fully keyboard-operable and screen-reader-correct.
+- **A persistent restart-pending indicator now lives in the sidebar
+  itself** (`↻ Restart required for N pending change(s)`), visible
+  regardless of which destination is open — mirrors the same
+  already-tracked data the existing top-of-page banner shows, so it
+  stays visible once that banner has scrolled out of view on a long
+  Configuration page. Clicking it scrolls back to the banner.
+
+### Fixed
+
+- The new light-theme badge text colors (`--live`/`--restart`) measured
+  under 3.2:1 contrast against their own tinted background — below the
+  WCAG AA floor (4.5:1) for text at badge size. Darkened both; dark
+  theme was already comfortably compliant (~5.8:1). Found by this
+  release's own code audit before shipping.
+
 ## [0.31.0] - 2026-09-15
 
 Live-tested follow-up to 0.30.0's panel redesign, and a closer visual match
