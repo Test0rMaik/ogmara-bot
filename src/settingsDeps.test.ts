@@ -69,6 +69,28 @@ describe('apply', () => {
     expect(JSON.parse(readFileSync(overridesPath, 'utf8')).values.posting.maxPostsPerHour).toBe(5);
   });
 
+  it('refuses to persist bot.channels emptied while bot.enabled is true', () => {
+    // REGRESSION GUARD, CRITICAL finding from security audit. Before
+    // `botSchema` gained this cross-field check (see
+    // modules/commands/schema.test.ts), an empty `bot.channels` passed
+    // schema validation here and got WRITTEN TO DISK before the commands
+    // module's own async validateBotConfig() ever ran — so an operator
+    // told their save was "rejected, keeping the previous configuration
+    // running" had, in fact, already persisted the bad value, and the next
+    // restart's preflight() would fail against it, locking them out of the
+    // one interface that could fix it. This proves the fix closes that at
+    // the actual commit() boundary: nothing reaches disk or the live
+    // config at all.
+    const deps = makeDeps();
+    expect(deps.apply({ bot: { enabled: true, channels: [7] } })).toEqual({ ok: true });
+    const before = readFileSync(overridesPath, 'utf8');
+
+    const result = deps.apply({ bot: { channels: [] } });
+    expect(result.ok).toBe(false);
+    expect(readFileSync(overridesPath, 'utf8')).toEqual(before);
+    expect(deps.describe().effective.bot.channels).toEqual([7]);
+  });
+
   it('validates the MERGED config, not the change in isolation', () => {
     // A field that is individually valid can still be invalid in combination,
     // and the schema is the only thing that knows.
@@ -414,6 +436,42 @@ describe('reconfigureHooks', () => {
     ]);
     const result = deps.apply({ posting: { maxPostsPerHour: -1 } });
     expect(result.ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('fires an array-valued path hook when its own content actually changes', () => {
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'bot.channels', apply: (v) => { calls.push(v); } },
+    ]);
+    deps.apply({ bot: { channels: [7] } });
+    expect(calls).toEqual([[7]]);
+  });
+
+  it('does NOT fire an array-valued path hook on an unrelated save', () => {
+    // REGRESSION GUARD. `validateConfig` re-parses the WHOLE config tree via
+    // Zod on every commit, which constructs a brand-new array instance for
+    // EVERY array field regardless of whether that field's own value
+    // changed — a plain `===` comparison (the original implementation)
+    // would see this as "changed" on every single save, no matter which
+    // field the operator actually touched. Every hook shipped before this
+    // one happened to target a primitive path (string/number), where `===`
+    // is correct across a fresh parse — this is the first array-valued
+    // path, and the first test that would have caught the gap.
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'bot.channels', apply: (v) => { calls.push(v); } },
+    ]);
+    deps.apply({ posting: { dryRun: false } });
+    expect(calls).toEqual([]);
+  });
+
+  it('does NOT fire an array-valued path hook when the save reasserts the same content', () => {
+    const calls: unknown[] = [];
+    const deps = makeDepsWithHooks([
+      { path: 'bot.channels', apply: (v) => { calls.push(v); } },
+    ]);
+    deps.apply({ bot: { channels: [] } }); // already [] by default
     expect(calls).toEqual([]);
   });
 

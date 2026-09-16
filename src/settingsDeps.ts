@@ -162,6 +162,32 @@ function collectUiSchema(modules: readonly BotModule[]): Record<string, UiMeta> 
   return out;
 }
 
+/**
+ * Whether two values a `ReconfigureHook` path resolved to, before and after
+ * a commit, represent the SAME config — not merely the same object.
+ *
+ * `commit()` re-derives the whole config tree from scratch on every save
+ * via `validateConfig` (a full Zod parse over the merged result), which
+ * constructs brand-new array/object instances for every array/object field
+ * REGARDLESS of whether that field's own value actually changed in this
+ * particular save. A plain `===` comparison would then see every
+ * array/object-valued hook path as "changed" on every single commit, no
+ * matter which field the operator actually touched — every primitive-typed
+ * hook already shipped (numbers/strings: `node.url`, `queue.maxAttempts`,
+ * `ai.model`, …) happens to survive a fresh parse with `===` intact, which
+ * is what let this go unnoticed until the first array-valued hook path
+ * (`bot.channels`/`bot.commands`) was registered. `JSON.stringify` is safe
+ * here specifically because config values are always JSON-safe (sourced
+ * from YAML + a JSON overrides file, Zod-validated) and Zod always emits
+ * object keys in schema-declaration order for both sides of this
+ * comparison, so two semantically-equal values serialize identically.
+ */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 function auditOptionsFor(config: Config): { path: string; maxBytes: number; keep: number } {
   return {
     path: config.settings.auditPath,
@@ -247,7 +273,7 @@ export function createSettingsDeps(input: SettingsDepsInput): SettingsDeps {
     // went through; only the live-apply side of one field did not).
     reconfigureHooks.forEach((hook, i) => {
       const after = getPath(effective, hook.path);
-      if (after === before[i]) return;
+      if (sameValue(after, before[i])) return;
       const reportFailure = (err: unknown): void => {
         console.error(
           `  warning: live-apply for "${hook.path}" failed (the save itself succeeded): ` +

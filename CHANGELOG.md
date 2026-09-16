@@ -5,6 +5,62 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-09-16
+
+`bot.handle`/`channels`/`commands`/`rateLimit.*` are now live-appliable — the
+biggest single gap in the hot-reload effort. `bot.enabled` and every
+`bot.autoJoin.*` field except `schedule` (already live from an earlier
+release) stay restart-required by design: the module registry decides which
+modules are even running, once, at boot.
+
+### Added
+
+- **`bot.handle`/`channels`/`commands`/`rateLimit.*` now apply live.** A new
+  `reconfigure(ctx)` module contract method (`BotModule`) re-derives
+  handlers, the rate limiter/budget, the advertised descriptor, and the
+  channel subscription from the current config — validated against the same
+  preconditions `preflight()` already enforces at startup (every declared
+  command has a handler, no command costs more than any rate-limit gate
+  allows, `channels` is non-empty, every channel is reachable/postable) —
+  and rejects an invalid combination outright, leaving the previous,
+  still-running configuration in place rather than applying it.
+
+### Fixed
+
+- **Critical, caught by this release's own code audit before shipping**: a
+  rejected live change did not actually protect the running bot. The
+  settings-save path mutates the shared, in-memory config object in place
+  *before* any module gets a chance to validate it, so the module's ongoing
+  message handling, auto-join polling, and rate-limit checks were reading
+  straight through that same mutated object — a save the operator was told
+  was "rejected, keeping the previous configuration running" had, in fact,
+  already taken effect on everything that mattered. Fixed with an
+  independent, decoupled snapshot of the approved config, reassigned only
+  when a change is actually accepted; every ongoing reader now goes through
+  that snapshot instead of the shared, continuously-mutating object.
+- **A second, independent bug found while fixing the first**: the
+  live-apply dispatch compared a field's before/after value with strict
+  equality, but the config is fully re-parsed from scratch on every save —
+  which builds a brand-new array/object instance every time, regardless of
+  whether that specific field changed. Every field made live before this
+  release happened to be a plain string or number, where strict equality is
+  correct across a fresh parse; `bot.channels`/`bot.commands` are the first
+  array-valued fields ever made live, and would have re-applied on *every*
+  settings save — rejoining channels and republishing the bot's descriptor
+  even for a save that never touched `bot.*` at all. Fixed by comparing
+  array/object values by content instead of by reference.
+- **A related boot-loop risk, caught by this release's own security audit
+  before shipping**: even after the two fixes above protected the *running*
+  process, an invalid `bot.channels` value could still be written to disk
+  before the module ever validated it — so a save that was correctly
+  rejected for the live bot would still leave the same bad value in the
+  settings overrides file, and the *next* restart would fail its own
+  startup check against that value and exit before the settings panel
+  could even start, locking the operator out of the one interface that
+  could fix it without SSH. Closed at the source: an empty channel list on
+  an enabled bot is now rejected at the configuration-schema level, before
+  it can ever be written to disk.
+
 ## [0.35.0] - 2026-09-16
 
 `ai.provider`/`model`/`baseUrl`/`effort`/`maxTokens` and the three

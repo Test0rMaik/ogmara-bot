@@ -565,19 +565,7 @@ async function run(args: CliArgs): Promise<number> {
   // new one via `publisher.rebuildClient()`.
   let reconnectChannelSubscription: (() => void) | undefined;
 
-  const allModules: BotModule[] = [
-    createNewsModule({
-      ledger,
-      queue,
-      provider: () => currentProvider,
-      templates: () => currentTemplates,
-      report: (outcome: RunOutcome) => reportOutcome(outcome, publisher.address),
-      // The health already fetched above for the startup banner — passed in so
-      // the module's media-uploads precondition does not make a second network
-      // round trip for information the core already has.
-      health,
-    }),
-    createCommandsModule({
+  const commandsModule = createCommandsModule({
       reply: async (channelId, text, mentions) => {
         // Encrypted first: a channel this bot has ever gotten a key for
         // always replies encrypted — silently plaintext-replying into a
@@ -659,7 +647,20 @@ async function run(args: CliArgs): Promise<number> {
         const { notifications } = await publisher.client.getNotifications(since, limit, type);
         return notifications;
       },
+    });
+  const allModules: BotModule[] = [
+    createNewsModule({
+      ledger,
+      queue,
+      provider: () => currentProvider,
+      templates: () => currentTemplates,
+      report: (outcome: RunOutcome) => reportOutcome(outcome, publisher.address),
+      // The health already fetched above for the startup banner — passed in so
+      // the module's media-uploads precondition does not make a second network
+      // round trip for information the core already has.
+      health,
     }),
+    commandsModule,
   ];
   const modules = enabledModules(allModules, effective);
 
@@ -842,6 +843,33 @@ async function run(args: CliArgs): Promise<number> {
     {
       path: 'ai.imagePromptPath',
       apply: (v) => reloadTemplate('imagedir', v as string),
+    },
+    // `commandsModule.reconfigure()` is a no-op if `bot.enabled` was false at
+    // boot (module never started) or a previous call is still in flight —
+    // both guarded inside the module itself, not here. All 8 leaf paths
+    // funnel into the SAME re-derive-from-config call, same "one shared
+    // rebuild, several trigger paths" shape as node.*/ai.* above; it
+    // internally re-validates the new config and keeps the old one running
+    // if the combination would be invalid (see its own doc comment).
+    { path: 'bot.handle', apply: () => commandsModule.reconfigure?.(ctx) },
+    { path: 'bot.channels', apply: () => commandsModule.reconfigure?.(ctx) },
+    { path: 'bot.commands', apply: () => commandsModule.reconfigure?.(ctx) },
+    {
+      path: 'bot.rateLimit.perWalletPerMinute',
+      apply: () => commandsModule.reconfigure?.(ctx),
+    },
+    { path: 'bot.rateLimit.globalPerMinute', apply: () => commandsModule.reconfigure?.(ctx) },
+    {
+      path: 'bot.rateLimit.noticeCooldownSeconds',
+      apply: () => commandsModule.reconfigure?.(ctx),
+    },
+    {
+      path: 'bot.rateLimit.maxShareOfNodeBudget',
+      apply: () => commandsModule.reconfigure?.(ctx),
+    },
+    {
+      path: 'bot.rateLimit.perWalletShareOfBudget',
+      apply: () => commandsModule.reconfigure?.(ctx),
     },
   ];
   if (effective.panel.enabled) {

@@ -19,7 +19,7 @@
 import type { ZodTypeAny } from 'zod';
 import { MSG_TYPE_NAME, MessageType, parseCommand, type Envelope, type Notification } from '@ogmara/sdk';
 import { NODE_LIMITS, type Config } from '../../config.js';
-import { schedule } from '../../scheduler.js';
+import { schedule, type ScheduledJob } from '../../scheduler.js';
 import type { BotContext, BotModule, ModuleHandle, ModuleJob, PreflightFailure } from '../types.js';
 import { botSchema, type BotConfig } from './schema.js';
 import { CommandRateLimiter, NodeBudget, capFor } from './rateLimit.js';
@@ -171,11 +171,171 @@ function botConfig(config: Config): BotConfig {
   return config.bot;
 }
 
+/**
+ * An independent COPY of a `BotConfig`, decoupled from `ctx.config.bot`'s
+ * ongoing in-place mutation — see `liveCfg`'s own doc comment for why this
+ * matters. `applyConfigInPlace` (config.ts) reassigns array/leaf fields by
+ * reference (so `{ ...cfg }` alone decouples `channels`/`commands`/`handle`)
+ * but mutates a nested PLAIN OBJECT's own fields in place without ever
+ * replacing the object itself — `rateLimit` is exactly that, so it needs
+ * its own shallow copy too, or `liveCfg.rateLimit.*` would keep tracking
+ * `ctx.config.bot.rateLimit.*` regardless of what this function returns.
+ */
+function snapshotCfg(cfg: BotConfig): BotConfig {
+  return { ...cfg, rateLimit: { ...cfg.rateLimit } };
+}
+
+/**
+ * The `bot.commands`/`rateLimit.*`/`channels` preconditions, shared between
+ * startup `preflight()` and a live `reconfigure()` — the latter needs the
+ * SAME checks so that switching to an invalid combination live (an
+ * undeclared command, a rate limit below some command's cost, a channel
+ * this wallet cannot post in) is REJECTED rather than silently breaking a
+ * running bot. Unlike `preflight()`, which can only ever abort startup,
+ * `reconfigure()`'s caller must keep the previous, still-valid state
+ * running when this returns non-null — see its own comment.
+ */
+async function validateBotConfig(
+  ctx: BotContext,
+  cfg: BotConfig,
+  handlers: ReadonlyMap<string, CommandHandler>,
+  describeChannel: CommandsDeps['describeChannel'],
+): Promise<PreflightFailure | null> {
+  // Every declared command must have a handler, or the bot advertises
+  // something it will silently ignore — which reads to a user as the bot
+  // being broken, and is worse than not advertising it at all.
+  const undeclared = cfg.commands.filter((c) => !handlers.has(c.name)).map((c) => c.name);
+  if (undeclared.length > 0) {
+    return {
+      message:
+        `\nbot.commands declares ${undeclared.map((n) => `"/${n}"`).join(', ')}, ` +
+        'which this build has no handler for.\n' +
+        `Known commands: ${[...handlers.keys()].map((n) => `/${n}`).join(', ')}.\n` +
+        'Remove the unknown entries, or the bot would advertise commands it silently ignores.',
+    };
+  }
+
+  // Explicit rather than "every channel this wallet has joined". There is no
+  // membership query to resolve that against, and probing every channel is
+  // unbounded network work at startup — but more to the point, "answer
+  // everywhere I have ever joined" is a surprising default for something
+  // that spends the wallet's posting quota.
+  // A command costing more than a limit can never be invoked: every attempt
+  // is refused, and the user is told they are going too fast when in fact
+  // they can never go slowly enough.
+  //
+  // Checked against EVERY gate, not just the per-minute one. There are three,
+  // and the tightest is derived rather than configured — on an unregistered
+  // wallet (5 messages per 10 min) the per-wallet window cap floors at 1,
+  // which is below the cost of a command shipped in config.example.yaml.
+  // Validating only `perWalletPerMinute` let that through.
+  // Same helper the running NodeBudget uses, so this check cannot validate a
+  // limit different from the one enforced.
+  const burstCap = capFor(ctx.publisher.burstLimit, cfg.rateLimit.maxShareOfNodeBudget);
+  const windowCap = walletWindowCap(burstCap, cfg);
+  const gates: Array<{ limit: number; name: string; hint: string }> = [
+    {
+      limit: cfg.rateLimit.perWalletPerMinute,
+      name: 'bot.rateLimit.perWalletPerMinute',
+      hint: 'Raise it to at least the command\'s cost.',
+    },
+    {
+      // Silent denial, which is worse: nothing is logged and nothing is sent.
+      limit: cfg.rateLimit.globalPerMinute,
+      name: 'bot.rateLimit.globalPerMinute',
+      hint: 'Raise it to at least the command\'s cost.',
+    },
+    {
+      limit: windowCap,
+      name:
+        `the per-wallet window cap (${windowCap} per ${NODE_LIMITS.burstWindowMinutes}min, ` +
+        "derived from this wallet's node quota)",
+      hint:
+        'Register the wallet on-chain for 6x the node quota, or raise ' +
+        'bot.rateLimit.maxShareOfNodeBudget / perWalletShareOfBudget.',
+    },
+  ];
+  for (const gate of gates) {
+    const blocked = cfg.commands
+      .map((c) => ({ name: c.name, cost: handlers.get(c.name)?.cost ?? 1 }))
+      .filter((c) => c.cost > gate.limit);
+    if (blocked.length === 0) continue;
+    // The most expensive, not merely the first: it is the one that sets the
+    // limit the operator has to clear.
+    const worst = blocked.reduce((a, b) => (b.cost > a.cost ? b : a));
+    return {
+      message:
+        `\n"/${worst.name}" costs ${worst.cost}, which is more than ${gate.name} ` +
+        `allows (${gate.limit}).\nNo wallet could ever invoke it — every attempt would ` +
+        `be refused.\n${gate.hint}`,
+    };
+  }
+
+  if (cfg.channels.length === 0) {
+    return {
+      message:
+        '\nbot.enabled is true but bot.channels is empty.\n' +
+        'List the channel ids the bot should answer in, e.g.\n  bot:\n    channels: [1, 7]',
+    };
+  }
+
+  for (const id of cfg.channels) {
+    const facts = await describeChannel(id);
+    if (facts === 'unreachable') {
+      // A PreflightFailure, not a thrown error: preflight already has a
+      // clean "print this and exit 2" path, whereas a throw lands in the
+      // process-level catch-all and prints a stack trace at an operator
+      // whose node is simply down.
+      return {
+        message:
+          `\nCould not reach the node to check channel ${id}.\n` +
+          'This is the node being unavailable rather than a config problem — ' +
+          'the bot will retry when it restarts.',
+      };
+    }
+    if (facts === null) {
+      return {
+        message:
+          `\nbot.channels lists channel ${id}, which this node does not serve or this ` +
+          'wallet cannot see.\nCheck the id, and that the bot has joined the channel.',
+      };
+    }
+    if (!facts.canPost) {
+      return {
+        message:
+          `\nbot.channels lists channel ${id} ("${forLog(facts.name)}"), where this wallet is not ` +
+          'allowed to post.\nIt could read commands but never answer them.',
+      };
+    }
+  }
+  return null;
+}
+
 export function createCommandsModule(deps: CommandsDeps): BotModule {
   let limiter: CommandRateLimiter | undefined;
   let nodeBudget: NodeBudget | undefined;
   let handlers: Map<string, CommandHandler> = new Map();
   let close: (() => void) | undefined;
+  /**
+   * The config every ONGOING piece of this module — the message handler,
+   * the auto-join poll, the rate limiter's window-cap getter — actually
+   * reads, instead of `ctx.config.bot` directly.
+   *
+   * REGRESSION GUARD, found by security audit before ship. `ctx.config.bot`
+   * is a single object `applyConfigInPlace` mutates IN PLACE on every save,
+   * and `settingsDeps.ts`'s `commit()` performs that mutation — persisting
+   * to disk too — BEFORE `reconfigure()` ever gets to call
+   * `validateBotConfig()`. A naive `cfg = botConfig(ctx.config)` is an
+   * ALIAS into that same mutating object, not a snapshot: even when
+   * `reconfigure()` correctly rejects an invalid save and leaves `handlers`/
+   * `limiter`/`close` untouched, anything still reading `cfg.channels`/
+   * `.commands`/`.handle` through that alias would observe the REJECTED
+   * value anyway, since the mutation already happened. `liveCfg` is
+   * reassigned to an independent copy (`snapshotCfg`) ONLY at the moment
+   * `start()`/`reconfigure()` actually commits to a config — on rejection,
+   * it simply keeps pointing at the last config that was actually approved.
+   */
+  let liveCfg: BotConfig | undefined;
   /**
    * False before start and after stop.
    *
@@ -186,6 +346,30 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
    * the registry guards against for crons.
    */
   let running = false;
+  /**
+   * Hoisted out of `start()` (was a local `const`) so `stop()` and
+   * `reconfigure()` — both defined once, inside the `ModuleHandle` `start()`
+   * returns on its ONE call — always act on whichever job currently exists,
+   * not the one that existed when they were first defined. Not touched by
+   * `reconfigure()` today (its schedule already reconfigures live via the
+   * existing `ModuleJob.configPath` hook, and none of `reconfigure()`'s own
+   * fields affect it) — hoisted anyway as the fix for a concrete bug a
+   * naive "redo start()'s body in place" reconfigure would hit the moment
+   * anything DOES touch it: a second `schedule(...)` call would produce a
+   * second job that `stop()`/`index.ts`'s reschedule hook — both already
+   * closed over the first — would never see, silently orphaning it.
+   */
+  let autoJoinJob: ScheduledJob | undefined;
+  /**
+   * Guards `reconfigure()` against overlapping calls — two `bot.*` saves
+   * close together could otherwise both pass the `running` check and both
+   * rebuild the rate limiter / resubscribe channels concurrently, racing
+   * each other's `close()`/`subscribeChannels()` calls. Mirrors
+   * `scheduler.ts`'s own overlap guard around a scheduled task; lives here
+   * rather than in `settingsDeps.ts` because `commit()` has no visibility
+   * into a still-in-flight async hook from a previous save.
+   */
+  let reconfiguring = false;
   /**
    * Channel ids granted answer rights via invite (on top of `cfg.channels`,
    * which the operator wrote down by hand and has no cap). Loaded from the
@@ -234,13 +418,21 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
 
     schemas: { bot: botSchema as ZodTypeAny },
 
-    // Every one of these is read once, at `start()`, and closed over — there
-    // is no live-apply path, so all of them are restart-required. Left explicit
-    // rather than relying on the settings page's restart-by-default fallback:
-    // that default exists for paths NO module claimed, and silently matching it
-    // here would make it easy to forget when a live-apply path is eventually
-    // added for one of these.
+    // `handle`/`channels`/`commands`/`rateLimit.*` are live via
+    // `reconfigure()` below, which re-derives handlers/limiter/descriptor/
+    // subscription from `ctx.config.bot` fresh — see its own doc comment for
+    // exactly what it does and does not touch. `bot.enabled` and every
+    // `bot.autoJoin.*` field OTHER than `schedule` stay restart-required —
+    // left explicit rather than relying on the settings page's
+    // restart-by-default fallback, so it stays obvious which of these still
+    // need one if a live-apply path is added for them later.
     uiSchema: {
+      // Permanently restart-required, NOT a gap: `registry.ts` decides which
+      // modules are in the `started` list once, at boot, via `isEnabled()`.
+      // Flipping this live would mean starting a module mid-process that
+      // never ran `preflight()`, or tearing one down outside the normal
+      // shutdown path — real, separate work the module contract does not
+      // support today.
       'bot.enabled': {
         label: 'field.bot.enabled.label',
         help: 'field.bot.enabled.help',
@@ -249,39 +441,39 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       'bot.handle': {
         label: 'field.bot.handle.label',
         help: 'field.bot.handle.help',
-        restart: true,
+        restart: false,
       },
       'bot.channels': {
         label: 'field.bot.channels.label',
         help: 'field.bot.channels.help',
-        restart: true,
+        restart: false,
       },
       'bot.commands': {
         label: 'field.bot.commands.label',
         help: 'field.bot.commands.help',
-        restart: true,
+        restart: false,
       },
       'bot.rateLimit.perWalletPerMinute': {
         label: 'field.bot.rateLimit.perWalletPerMinute.label',
-        restart: true,
+        restart: false,
       },
       'bot.rateLimit.globalPerMinute': {
         label: 'field.bot.rateLimit.globalPerMinute.label',
-        restart: true,
+        restart: false,
       },
       'bot.rateLimit.noticeCooldownSeconds': {
         label: 'field.bot.rateLimit.noticeCooldownSeconds.label',
-        restart: true,
+        restart: false,
       },
       'bot.rateLimit.maxShareOfNodeBudget': {
         label: 'field.bot.rateLimit.maxShareOfNodeBudget.label',
         help: 'field.bot.rateLimit.maxShareOfNodeBudget.help',
-        restart: true,
+        restart: false,
       },
       'bot.rateLimit.perWalletShareOfBudget': {
         label: 'field.bot.rateLimit.perWalletShareOfBudget.label',
         help: 'field.bot.rateLimit.perWalletShareOfBudget.help',
-        restart: true,
+        restart: false,
       },
       'bot.autoJoin.schedule': {
         label: 'field.bot.autoJoin.schedule.label',
@@ -314,119 +506,16 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     async preflight(ctx: BotContext): Promise<PreflightFailure | null> {
       const cfg = botConfig(ctx.config);
       handlers = (deps.handlersOverride ?? buildHandlers)(ctx.config, cfg);
-
-      // Every declared command must have a handler, or the bot advertises
-      // something it will silently ignore — which reads to a user as the bot
-      // being broken, and is worse than not advertising it at all.
-      const undeclared = cfg.commands.filter((c) => !handlers.has(c.name)).map((c) => c.name);
-      if (undeclared.length > 0) {
-        return {
-          message:
-            `\nbot.commands declares ${undeclared.map((n) => `"/${n}"`).join(', ')}, ` +
-            'which this build has no handler for.\n' +
-            `Known commands: ${[...handlers.keys()].map((n) => `/${n}`).join(', ')}.\n` +
-            'Remove the unknown entries, or the bot would advertise commands it silently ignores.',
-        };
-      }
-
-      // Explicit rather than "every channel this wallet has joined". There is no
-      // membership query to resolve that against, and probing every channel is
-      // unbounded network work at startup — but more to the point, "answer
-      // everywhere I have ever joined" is a surprising default for something
-      // that spends the wallet's posting quota.
-      // A command costing more than a limit can never be invoked: every attempt
-      // is refused, and the user is told they are going too fast when in fact
-      // they can never go slowly enough.
-      //
-      // Checked against EVERY gate, not just the per-minute one. There are three,
-      // and the tightest is derived rather than configured — on an unregistered
-      // wallet (5 messages per 10 min) the per-wallet window cap floors at 1,
-      // which is below the cost of a command shipped in config.example.yaml.
-      // Validating only `perWalletPerMinute` let that through.
-      // Same helper the running NodeBudget uses, so this check cannot validate a
-      // limit different from the one enforced.
-      const burstCap = capFor(ctx.publisher.burstLimit, cfg.rateLimit.maxShareOfNodeBudget);
-      const windowCap = walletWindowCap(burstCap, cfg);
-      const gates: Array<{ limit: number; name: string; hint: string }> = [
-        {
-          limit: cfg.rateLimit.perWalletPerMinute,
-          name: 'bot.rateLimit.perWalletPerMinute',
-          hint: 'Raise it to at least the command\'s cost.',
-        },
-        {
-          // Silent denial, which is worse: nothing is logged and nothing is sent.
-          limit: cfg.rateLimit.globalPerMinute,
-          name: 'bot.rateLimit.globalPerMinute',
-          hint: 'Raise it to at least the command\'s cost.',
-        },
-        {
-          limit: windowCap,
-          name:
-            `the per-wallet window cap (${windowCap} per ${NODE_LIMITS.burstWindowMinutes}min, ` +
-            "derived from this wallet's node quota)",
-          hint:
-            'Register the wallet on-chain for 6x the node quota, or raise ' +
-            'bot.rateLimit.maxShareOfNodeBudget / perWalletShareOfBudget.',
-        },
-      ];
-      for (const gate of gates) {
-        const blocked = cfg.commands
-          .map((c) => ({ name: c.name, cost: handlers.get(c.name)?.cost ?? 1 }))
-          .filter((c) => c.cost > gate.limit);
-        if (blocked.length === 0) continue;
-        // The most expensive, not merely the first: it is the one that sets the
-        // limit the operator has to clear.
-        const worst = blocked.reduce((a, b) => (b.cost > a.cost ? b : a));
-        return {
-          message:
-            `\n"/${worst.name}" costs ${worst.cost}, which is more than ${gate.name} ` +
-            `allows (${gate.limit}).\nNo wallet could ever invoke it — every attempt would ` +
-            `be refused.\n${gate.hint}`,
-        };
-      }
-
-      if (cfg.channels.length === 0) {
-        return {
-          message:
-            '\nbot.enabled is true but bot.channels is empty.\n' +
-            'List the channel ids the bot should answer in, e.g.\n  bot:\n    channels: [1, 7]',
-        };
-      }
-
-      for (const id of cfg.channels) {
-        const facts = await deps.describeChannel(id);
-        if (facts === 'unreachable') {
-          // A PreflightFailure, not a thrown error: preflight already has a
-          // clean "print this and exit 2" path, whereas a throw lands in the
-          // process-level catch-all and prints a stack trace at an operator
-          // whose node is simply down.
-          return {
-            message:
-              `\nCould not reach the node to check channel ${id}.\n` +
-              'This is the node being unavailable rather than a config problem — ' +
-              'the bot will retry when it restarts.',
-          };
-        }
-        if (facts === null) {
-          return {
-            message:
-              `\nbot.channels lists channel ${id}, which this node does not serve or this ` +
-              'wallet cannot see.\nCheck the id, and that the bot has joined the channel.',
-          };
-        }
-        if (!facts.canPost) {
-          return {
-            message:
-              `\nbot.channels lists channel ${id} ("${forLog(facts.name)}"), where this wallet is not ` +
-              'allowed to post.\nIt could read commands but never answer them.',
-          };
-        }
-      }
-      return null;
+      return validateBotConfig(ctx, cfg, handlers, deps.describeChannel);
     },
 
     async start(ctx: BotContext): Promise<ModuleHandle> {
       const cfg = botConfig(ctx.config);
+      // Committed immediately: `start()` only ever runs after `preflight()`
+      // already validated this exact `cfg` (registry.ts's `startAll` always
+      // follows a successful `preflightAll`), and nothing here awaits before
+      // callbacks that read `liveCfg` could possibly fire.
+      liveCfg = snapshotCfg(cfg);
       if (handlers.size === 0) handlers = (deps.handlersOverride ?? buildHandlers)(ctx.config, cfg);
 
       // Restore previously-earned answer grants BEFORE subscribing, so a
@@ -492,8 +581,11 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       limiter = new CommandRateLimiter({
         ...cfg.rateLimit,
         // Built from the budget that actually exists, so no single wallet can
-        // take the whole window however politely it paces itself.
-        perWalletPerWindow: () => walletWindowCap(budget.burstCap, cfg),
+        // take the whole window however politely it paces itself. Reads
+        // `liveCfg`, not `cfg`: this getter is called on every rate check for
+        // as long as `limiter` lives, which can outlast this specific
+        // start()/reconfigure() call by a long way — see `liveCfg`'s comment.
+        perWalletPerWindow: () => walletWindowCap(budget.burstCap, liveCfg ?? cfg),
       });
 
 
@@ -566,7 +658,10 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
 
       running = true;
       close = await deps.subscribeChannels([...cfg.channels], (envelope) => {
-        void handleMessage(ctx, cfg, envelope).catch((err) => {
+        // `liveCfg`, not `cfg`: this callback fires for as long as the
+        // subscription lives, potentially long after this start()/
+        // reconfigure() call returned — see `liveCfg`'s own comment.
+        void handleMessage(ctx, liveCfg ?? cfg, envelope).catch((err) => {
           // Through `forLog`: the SDK embeds up to 200 characters of the node's
           // raw response body in the message, so this text is not ours.
           ctx.warn(`  warning: command handling failed (${forLog(String(err))})`);
@@ -584,7 +679,13 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       } catch (err) {
         ctx.warn(`  warning: initial invite check failed (${forLog(String(err))})`);
       }
-      const autoJoinJob = schedule(cfg.autoJoin.schedule, () => pollForInvites(ctx, cfg));
+      // `liveCfg`, not `cfg`: this cron callback fires on every scheduled
+      // tick for the module's whole lifetime — see `liveCfg`'s own comment.
+      // `cfg.autoJoin.schedule` itself is fine to read once here: it stays
+      // restart-required except for a SEPARATE, already-existing live
+      // hook (`bot.autoJoin.schedule` → `job.reschedule()`), which acts on
+      // the `ScheduledJob` directly rather than through this closure.
+      autoJoinJob = schedule(cfg.autoJoin.schedule, () => pollForInvites(ctx, liveCfg ?? cfg));
       ctx.log(
         `Commands: checking for channel invites "${cfg.autoJoin.schedule}" — next ` +
           `${autoJoinJob.nextRun()?.toISOString() ?? 'never'}`,
@@ -604,9 +705,167 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
           running = false;
           close?.();
           close = undefined;
-          autoJoinJob.stop();
+          autoJoinJob?.stop();
         },
       };
+    },
+
+    /**
+     * Live-apply `bot.handle`/`channels`/`commands`/`rateLimit.*`.
+     *
+     * Deliberately narrower than "redo start()'s body": it re-derives only
+     * what those specific fields feed — handlers, the rate limiter/budget,
+     * the descriptor, and the channel subscription (rejoining afresh so a
+     * newly-added channel is actually joined, exactly like `start()`'s own
+     * unconditional-join loop). It does NOT touch `autoJoin` state (job,
+     * persisted grants, restored channel set) — none of that is covered by
+     * this uiSchema flip, `bot.autoJoin.schedule` already reconfigures live
+     * through its own existing `ModuleJob.configPath` hook, and re-running
+     * that restoration logic a second time mid-process is not what a
+     * `handle`/`channels`/`commands`/`rateLimit` change should ever trigger.
+     *
+     * Validated against the SAME preconditions `preflight()` enforces at
+     * startup (`validateBotConfig`) before anything is touched — an invalid
+     * combination (an undeclared command, a rate limit below some command's
+     * cost, a channel this wallet cannot post in) is rejected, leaving the
+     * previous, still-running configuration in place and warning the
+     * operator, rather than applying it and silently breaking the bot's
+     * channel listening. This is the same "check before commit, keep
+     * last-known-good on failure" shape `rebuildAiProvider()` (index.ts)
+     * already applies to `ai.*`.
+     *
+     * `bot.enabled` itself stays restart-required, permanently: the module
+     * registry (`registry.ts`) decides which modules are even IN the
+     * `started` list once, at boot, via `isEnabled()` — flipping this
+     * module in or out of a running process would mean starting a module
+     * that never ran `preflight()`, or tearing one down outside the normal
+     * shutdown path. That is real, separate work the registry does not
+     * support today, not a gap this phase's field-level reconfigure can
+     * safely paper over.
+     */
+    async reconfigure(ctx: BotContext): Promise<void> {
+      if (!running || reconfiguring) return;
+      reconfiguring = true;
+      try {
+        const cfg = botConfig(ctx.config);
+        const nextHandlers = (deps.handlersOverride ?? buildHandlers)(ctx.config, cfg);
+
+        const failure = await validateBotConfig(ctx, cfg, nextHandlers, deps.describeChannel);
+        if (failure !== null) {
+          ctx.warn(
+            `  warning: live bot.* change rejected — ${failure.message.trim().replace(/\n+/g, ' ')} ` +
+              'Keeping the previous configuration running.',
+          );
+          return;
+        }
+        // `validateBotConfig` just awaited real network calls — long enough
+        // for a shutdown racing this save to have already called stop(). No
+        // point re-joining channels or republishing a descriptor for a
+        // module that just reported itself stopped; the subscription tail
+        // below re-checks this again for the same reason.
+        if (!running) return;
+        handlers = nextHandlers;
+        // The actual commit: everything reading `liveCfg` (handleMessage,
+        // pollForInvites, the window-cap getter below) observes the new
+        // config from this line on, and — critically — a REJECTED call
+        // above never reached here, so those readers keep observing
+        // whatever the last successful commit set. See `liveCfg`'s comment.
+        liveCfg = snapshotCfg(cfg);
+
+        nodeBudget = new NodeBudget(
+          () => ctx.publisher.burstLimit,
+          () => ctx.publisher.dailyLimit,
+          cfg.rateLimit.maxShareOfNodeBudget,
+        );
+        const budget = nodeBudget;
+        limiter = new CommandRateLimiter({
+          ...cfg.rateLimit,
+          perWalletPerWindow: () => walletWindowCap(budget.burstCap, liveCfg ?? cfg),
+        });
+
+        for (const channelId of cfg.channels) {
+          if (ctx.config.posting.dryRun) {
+            ctx.log(`  [dry run] would join channel ${channelId}`);
+            continue;
+          }
+          try {
+            await deps.joinChannel(channelId);
+          } catch (err) {
+            ctx.warn(`  warning: could not join channel ${channelId} (${forLog(String(err))})`);
+          }
+        }
+
+        const descriptor = {
+          ...(cfg.handle !== undefined ? { handle: cfg.handle } : {}),
+          commands: cfg.commands.map((c) => ({
+            name: c.name,
+            description: c.description,
+            ...(c.argsHint !== undefined ? { args_hint: c.argsHint } : {}),
+          })),
+        };
+        if (ctx.config.posting.dryRun) {
+          ctx.log(`  [dry run] would advertise ${descriptor.commands.length} command(s)`);
+        } else {
+          try {
+            await deps.publishDescriptor(descriptor);
+          } catch (err) {
+            ctx.warn(
+              `  warning: could not publish the bot descriptor (${forLog(String(err))}). ` +
+                'Commands still work for anyone who types them; clients will not ' +
+                'offer them in the "/" picker until the next restart succeeds.',
+            );
+          }
+        }
+
+        // Re-checked here, not just at entry: everything above this line has
+        // awaited real network calls (describeChannel/joinChannel/
+        // publishDescriptor), long enough for a shutdown racing this save to
+        // have already called stop() — which set `running = false`, closed
+        // the subscription, and reported the module stopped. Without this,
+        // a stale reconfigure resuming afterward would close (a no-op, the
+        // reference is already gone) and then OPEN A NEW subscription,
+        // resurrecting exactly the listening the shutdown just tore down —
+        // the same "stopped bot keeps working" failure `running` exists to
+        // prevent for message handling, now for the subscription itself.
+        if (!running) return;
+
+        close?.();
+        try {
+          close = await deps.subscribeChannels([...cfg.channels], (envelope) => {
+            void handleMessage(ctx, liveCfg ?? cfg, envelope).catch((err) => {
+              ctx.warn(`  warning: command handling failed (${forLog(String(err))})`);
+            });
+          });
+        } catch (err) {
+          // Unguarded in `start()` too (a throw there aborts an entire fresh
+          // boot loudly), but here it would otherwise leave `close` stale —
+          // still pointing at the just-invoked OLD close function — and the
+          // bot silently deaf with no subscription at all, discovered only
+          // via the generic "live-apply ... failed" log. Explicit here so a
+          // failure is at least clearly attributed and `close` is left in a
+          // consistent state (undefined, not a double-closeable stale ref).
+          close = undefined;
+          // Explicit about the consequence, not just the failure: nothing
+          // else self-heals this — `close` stays undefined until either
+          // another bot.* save triggers a fresh reconfigure() or the
+          // process restarts, and in the meantime this module receives NO
+          // channel traffic at all (news/other modules are unaffected).
+          ctx.warn(
+            `  warning: could not re-subscribe to channels (${forLog(String(err))}). ` +
+              'The bot will not receive or answer any commands until the next ' +
+              'settings save or a restart.',
+          );
+          return;
+        }
+
+        ctx.log(
+          `Commands: reconfigured — advertising ${cfg.commands.length} command(s)` +
+            (cfg.handle !== undefined ? ` as @${cfg.handle}` : '') +
+            `, listening in channel(s) ${cfg.channels.join(', ')}`,
+        );
+      } finally {
+        reconfiguring = false;
+      }
     },
   };
 

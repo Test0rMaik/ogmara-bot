@@ -230,6 +230,38 @@ export const botSchema = z.object({
       maxUnservedEncryptedHours: z.int().min(1).max(24 * 30).default(24),
     })
     .prefault({}),
-});
+})
+  // A pure cross-field SHAPE check — `enabled` and `channels` are both
+  // already IN the object being validated, no node/network/filesystem
+  // involved — so this doesn't repeat the 0.12.0 mistake the file header
+  // warns about (a NETWORK-dependent check living in a `.refine()`).
+  //
+  // Without this, an empty `bot.channels` passed schema validation and was
+  // only ever caught by `validateBotConfig()` — async, network-dependent,
+  // and critically for a LIVE settings save: it runs strictly AFTER
+  // `commit()` (settingsDeps.ts) has already written the bad value to the
+  // overrides file and mutated the live config in place. A save that
+  // `reconfigure()` correctly rejects for the RUNNING process was still
+  // landing on disk — so the very next restart re-validates the same bad,
+  // persisted value at `preflight()`, fails, and exits before the settings
+  // panel can even start: an operator locked out of the one interface that
+  // could fix it, by the exact class of boot loop this whole feature exists
+  // to eliminate SSH for. Catching it here, at the schema layer, means
+  // `commit()` refuses the write outright — nothing bad ever reaches disk
+  // in the first place. `validateBotConfig()` still separately owns the
+  // checks that need the node/handler-registry (unreachable channels,
+  // undeclared commands, cost-vs-rate-limit) — this only takes the one
+  // check that was always shape-only, but had been living in the wrong
+  // layer because the module contract at the time had no cross-field-shape
+  // hook available.
+  .superRefine((bot, ctx) => {
+    if (bot.enabled && bot.channels.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['channels'],
+        message: 'bot.enabled is true but bot.channels is empty — list at least one channel id.',
+      });
+    }
+  });
 
 export type BotConfig = z.infer<typeof botSchema>;

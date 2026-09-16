@@ -193,4 +193,23 @@ export interface BotModule {
 
   /** Begin scheduled operation. */
   start(ctx: BotContext): Promise<ModuleHandle>;
+
+  /**
+   * Live-apply a config change to an ALREADY-RUNNING module, for any field
+   * this module's own `uiSchema` marks `restart: false` via a registered
+   * `ReconfigureHook` (see `settingsDeps.ts`) rather than being read fresh
+   * off `ctx.config` on every use.
+   *
+   * Module-granularity, not per-field: called whenever any covered field
+   * changes, and expected to re-derive whatever it depends on from
+   * `ctx.config` fresh — the same way `preflight`/`start` already do.
+   * Must be a no-op if the module was never started (its own `isEnabled`
+   * was false at boot — `index.ts` calls this on every registered module
+   * regardless of whether it is currently running, since a hook has no
+   * cheap way to know that without asking the module itself) and safe to
+   * call while a previous call is still in flight (two settings saves
+   * close together must not race two overlapping reconfigures) — both are
+   * the module's own responsibility to guard, not the caller's.
+   */
+  reconfigure?(ctx: BotContext): Promise<void>;
 }

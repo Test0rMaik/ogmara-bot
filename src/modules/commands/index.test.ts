@@ -16,6 +16,20 @@ function botCfg(over: Record<string, unknown> = {}): BotConfig {
   return botSchema.parse({ enabled: true, channels: [7], ...over });
 }
 
+/**
+ * Builds a BotConfig with `over` applied AFTER schema validation, bypassing
+ * `botSchema`'s own cross-field checks (e.g. its `enabled && channels.length
+ * === 0` refinement). For exercising `validateBotConfig`/`reconfigure()`'s
+ * OWN defense-in-depth checks with a shape the schema itself now refuses at
+ * `commit()` time — those checks stay valuable for inputs that never went
+ * through the schema at all (a directly-mutated `ctx.config.bot`, which is
+ * exactly what `reconfigure()` sees), even though a legitimate settings save
+ * can no longer produce an empty `channels` list in the first place.
+ */
+function unsafeBotCfg(over: Record<string, unknown> = {}): BotConfig {
+  return { ...botCfg(), ...over } as BotConfig;
+}
+
 function configWith(bot: BotConfig, dryRun = false): Config {
   return {
     posting: { dryRun },
@@ -100,7 +114,11 @@ function msg(
 async function startAndCapture(
   deps: CommandsDeps,
   ctx: BotContext,
-): Promise<{ deliver: (e: Envelope) => void; stop: () => Promise<void> }> {
+): Promise<{
+  deliver: (e: Envelope) => void;
+  stop: () => Promise<void>;
+  mod: ReturnType<typeof createCommandsModule>;
+}> {
   let deliver: ((e: Envelope) => void) | undefined;
   const subscribeChannels = vi.fn(async (_ch: number[], onMessage: (e: Envelope) => void) => {
     deliver = onMessage;
@@ -112,6 +130,7 @@ async function startAndCapture(
   return {
     deliver: (e) => deliver!(e),
     stop: () => handle.stop(),
+    mod,
   };
 }
 
@@ -130,8 +149,13 @@ describe('commands module preflight', () => {
   });
 
   it('refuses an empty channel list rather than guessing', async () => {
+    // unsafeBotCfg: botSchema itself now also refuses this shape (see its
+    // `enabled && channels.length === 0` cross-field check) — this test
+    // exercises validateBotConfig's OWN defense-in-depth copy of the same
+    // check, which stays reachable for anything that skips the schema
+    // (e.g. reconfigure() reading a directly-mutated ctx.config.bot).
     const failure = await createCommandsModule(depsWith()).preflight!(
-      ctxWith(configWith(botCfg({ channels: [] }))),
+      ctxWith(configWith(unsafeBotCfg({ channels: [] }))),
     );
     expect(failure!.message).toContain('bot.channels is empty');
   });
@@ -372,6 +396,212 @@ describe('commands module start', () => {
     const handle = await mod.start(ctx);
     await handle.stop();
     await expect(handle.stop()).resolves.toBeUndefined();
+  });
+});
+
+describe('commands module reconfigure', () => {
+  it('is a no-op before start() has ever run', async () => {
+    const deps = depsWith();
+    const mod = createCommandsModule(deps);
+    await mod.reconfigure!(ctxWith(configWith(botCfg())));
+    expect(deps.subscribeChannels).not.toHaveBeenCalled();
+    expect(deps.publishDescriptor).not.toHaveBeenCalled();
+  });
+
+  it('re-subscribes to a changed channel list and republishes the descriptor', async () => {
+    const closeFns: Array<ReturnType<typeof vi.fn>> = [];
+    const subscribeChannels = vi.fn(async (_channels: number[]) => {
+      const close = vi.fn();
+      closeFns.push(close);
+      return close;
+    });
+    const deps = depsWith({ subscribeChannels });
+    const mod = createCommandsModule(deps);
+    const ctx1 = ctxWith(configWith(botCfg({ channels: [7] })));
+    await mod.preflight!(ctx1);
+    await mod.start(ctx1);
+    expect(subscribeChannels).toHaveBeenCalledTimes(1);
+    expect(subscribeChannels.mock.calls[0]![0]).toEqual([7]);
+
+    const ctx2 = ctxWith(configWith(botCfg({ channels: [7, 9] })));
+    await mod.reconfigure!(ctx2);
+
+    // The OLD subscription was actually torn down, not merely superseded —
+    // a leak here would mean the bot double-answers on channel 7 forever.
+    expect(closeFns[0]).toHaveBeenCalledTimes(1);
+    expect(subscribeChannels).toHaveBeenCalledTimes(2);
+    expect(subscribeChannels.mock.calls[1]![0]).toEqual([7, 9]);
+    expect(deps.publishDescriptor).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects an invalid change and keeps the previous configuration running', async () => {
+    // REGRESSION GUARD, same shape as B3's imagedirVisionError: bot.channels
+    // is now live, so a save that empties it must not be allowed to silently
+    // tear down a working subscription — the same precondition preflight()
+    // already enforces at startup has to hold here too.
+    const deps = depsWith();
+    const mod = createCommandsModule(deps);
+    const ctx1 = ctxWith(configWith(botCfg({ channels: [7] })));
+    await mod.preflight!(ctx1);
+    await mod.start(ctx1);
+    vi.mocked(deps.publishDescriptor).mockClear();
+    vi.mocked(deps.subscribeChannels).mockClear();
+
+    // unsafeBotCfg: simulates the real-world shape reconfigure() actually
+    // has to defend against — a directly-mutated ctx.config.bot, which is
+    // what commit() produces BEFORE this module's own validation runs
+    // (botSchema's own cross-field check can no longer let a legitimate
+    // save reach this shape at all, but reconfigure() must still cope with
+    // it since it reads whatever ctx.config.bot currently holds).
+    const warn = vi.fn();
+    const ctx2 = { ...ctxWith(configWith(unsafeBotCfg({ channels: [] }))), warn } as BotContext;
+    await mod.reconfigure!(ctx2);
+
+    expect(deps.publishDescriptor).not.toHaveBeenCalled();
+    expect(deps.subscribeChannels).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain('bot.channels is empty');
+  });
+
+  it('drops a second reconfigure that arrives while one is still in flight', async () => {
+    const deps = depsWith(); // default describeChannel resolves immediately
+    const mod = createCommandsModule(deps);
+    const ctx = ctxWith(configWith(botCfg({ channels: [7] })));
+    await mod.preflight!(ctx);
+    await mod.start(ctx);
+
+    // Swapped in AFTER start()/preflight() complete — both already called
+    // describeChannel via the default fixture, and gating it from the start
+    // would hang preflight() itself, never reaching the calls under test.
+    let resolveFirst: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      resolveFirst = r;
+    });
+    const describeChannel = vi.fn(async () => {
+      await gate;
+      return publicChannel;
+    });
+    Object.assign(deps, { describeChannel });
+
+    const first = mod.reconfigure!(ctx); // blocks inside validateBotConfig on `gate`
+    const second = mod.reconfigure!(ctx); // must be dropped, not queued
+    await second;
+    expect(describeChannel).toHaveBeenCalledTimes(1);
+
+    resolveFirst!();
+    await first;
+  });
+
+  it('accepts a later reconfigure after an earlier one was rejected', async () => {
+    // Proves the reentrancy guard's `finally` actually clears — a rejected
+    // call must not permanently wedge every future reconfigure.
+    const deps = depsWith();
+    const mod = createCommandsModule(deps);
+    const ctx = ctxWith(configWith(botCfg({ channels: [7] })));
+    await mod.preflight!(ctx);
+    await mod.start(ctx);
+
+    await mod.reconfigure!(ctxWith(configWith(unsafeBotCfg({ channels: [] }))));
+    vi.mocked(deps.subscribeChannels).mockClear();
+
+    await mod.reconfigure!(ctxWith(configWith(botCfg({ channels: [9] }))));
+    expect(deps.subscribeChannels).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.subscribeChannels).mock.calls[0]![0]).toEqual([9]);
+  });
+
+  it('does not resurrect the subscription if stop() races an in-flight reconfigure', async () => {
+    // REGRESSION GUARD, found by code audit before ship: reconfigure() only
+    // checked `running` once, at entry, before its own real awaits
+    // (describeChannel/joinChannel/publishDescriptor). A shutdown landing
+    // during one of those would call stop() — running=false, subscription
+    // closed, module reported stopped — and the stale reconfigure, unaware,
+    // would resume and OPEN A NEW subscription: a stopped bot that keeps
+    // listening, the same failure class `running` exists to prevent for
+    // message handling.
+    const deps = depsWith();
+    const mod = createCommandsModule(deps);
+    const ctx = ctxWith(configWith(botCfg({ channels: [7] })));
+    await mod.preflight!(ctx);
+    const handle = await mod.start(ctx);
+    vi.mocked(deps.subscribeChannels).mockClear();
+
+    let resolveJoin: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      resolveJoin = r;
+    });
+    const joinChannel = vi.fn(async () => {
+      await gate;
+    });
+    Object.assign(deps, { joinChannel });
+
+    const reconfigurePromise = mod.reconfigure!(ctx); // blocks inside the join loop
+    await handle.stop(); // shutdown races ahead of the still-pending save
+    resolveJoin!();
+    await reconfigurePromise;
+
+    expect(deps.subscribeChannels).not.toHaveBeenCalled();
+  });
+
+  it('a rejected reconfigure does not let handleMessage observe the corrupted live config', async () => {
+    // REGRESSION GUARD, CRITICAL finding from security audit. In production,
+    // settingsDeps.ts's commit() mutates ctx.config.bot IN PLACE (and
+    // persists to disk) BEFORE any ReconfigureHook — including this
+    // module's own validateBotConfig() — ever runs. `cfg = botConfig(ctx
+    // .config)` is an ALIAS into that same object, not a snapshot: even
+    // when reconfigure() correctly rejects an invalid save and leaves
+    // handlers/limiter/close untouched, handleMessage's channel gate was
+    // reading straight through that alias and would have gone deaf anyway.
+    // This test reproduces the REAL ordering — mutate ctx.config.bot in
+    // place, THEN call reconfigure() — which is exactly what the earlier
+    // "rejects an invalid change" test above does NOT do (it builds a
+    // fresh, already-invalid ctx up front), and exactly why that test did
+    // not catch this.
+    const cfg = botCfg({
+      channels: [7],
+      commands: [{ name: 'about', description: 'who I am' }],
+    });
+    const config = configWith(cfg);
+    const ctx = ctxWith(config);
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const { deliver, mod } = await startAndCapture(depsWith({ reply }), ctx);
+
+    // Simulate commit()'s applyConfigInPlace: REASSIGN (not mutate) the
+    // shared bot object's `channels` field to a fresh, invalid array — this
+    // is what real applyConfigInPlace does for array-typed leaf fields
+    // (reference swap, never an in-place element mutation), and it matters
+    // here: a shallow-copied snapshot keeps pointing at the OLD array
+    // object only if this is a reassignment, not a truncation of that same
+    // array.
+    (config.bot as BotConfig).channels = [];
+
+    await mod.reconfigure!(ctx);
+
+    deliver(msg('/about', { mentions: ['klv1bot'], channel: 7 }));
+    await settle();
+    expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves close cleared, not stale, when re-subscribing fails', async () => {
+    const deps = depsWith();
+    const mod = createCommandsModule(deps);
+    const ctx = ctxWith(configWith(botCfg({ channels: [7] })));
+    await mod.preflight!(ctx);
+    await mod.start(ctx);
+
+    const subscribeChannels = vi.fn(async () => {
+      throw new Error('connection refused');
+    });
+    Object.assign(deps, { subscribeChannels });
+    const warn = vi.fn();
+
+    await mod.reconfigure!({ ...ctx, warn } as BotContext);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain('could not re-subscribe');
+    // A second reconfigure attempt must not throw trying to close a stale
+    // reference left over from the failed attempt above.
+    Object.assign(deps, { subscribeChannels: vi.fn(async () => () => {}) });
+    await expect(mod.reconfigure!(ctx)).resolves.toBeUndefined();
   });
 });
 

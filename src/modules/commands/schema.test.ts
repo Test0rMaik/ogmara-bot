@@ -11,6 +11,31 @@ describe('bot config schema', () => {
     expect(cfg.commands).toEqual([]);
   });
 
+  it('rejects enabled with an empty channel list', () => {
+    // REGRESSION GUARD, CRITICAL finding from security audit: before this
+    // cross-field check existed, an empty `channels` array passed schema
+    // validation, so `settingsDeps.ts`'s commit() would write it to the
+    // overrides file and mutate the live config BEFORE the module's own
+    // async validateBotConfig() ever got a chance to reject it — a live
+    // save the operator was TOLD was rejected ("keeping the previous
+    // configuration running") had, in fact, already been persisted to
+    // disk, and the next restart's preflight() would fail against that
+    // same bad value, locking the operator out of the panel that could fix
+    // it. Catching it here means commit() refuses the write outright —
+    // nothing bad reaches disk in the first place. This is a pure
+    // cross-field SHAPE check (both `enabled` and `channels` are already in
+    // the object being validated) — it does not repeat the network-
+    // dependent-refine mistake this file's header warns about.
+    expect(parse({ enabled: true, channels: [] }).success).toBe(false);
+  });
+
+  it('allows enabled with an empty channel list ONLY while disabled', () => {
+    // `channels` defaults to `[]` and `enabled` defaults to `false` — a bot
+    // that has never been configured must still load cleanly.
+    expect(parse({ enabled: false, channels: [] }).success).toBe(true);
+    expect(parse({}).success).toBe(true);
+  });
+
   it('rejects a command name with a leading slash', () => {
     // The config carries bare names; the "/" is display only. Accepting "/help"
     // would publish a command called "/help" that no client can ever match.
