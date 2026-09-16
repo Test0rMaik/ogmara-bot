@@ -101,6 +101,47 @@ describe('PostQueue', () => {
     expect(q.next(muchLater)).toBeUndefined();
   });
 
+  describe('setMaxAttempts', () => {
+    it('takes effect on the next recordAttempt(), without a restart', () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const q = PostQueue.load(path, 5); // starts at 5 attempts
+      q.enqueue(entry('a'));
+      q.setMaxAttempts(2); // shrink live
+      q.recordAttempt('a');
+      expect(q.size).toBe(1); // 1 of 2 — not dropped yet
+      q.recordAttempt('a');
+      expect(q.size).toBe(0); // 2 of 2 — now dropped
+    });
+
+    it('a widened cap keeps an entry that would otherwise now be dropped', () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const q = PostQueue.load(path, 1);
+      q.enqueue(entry('a'));
+      q.setMaxAttempts(5); // widen BEFORE the entry is ever dropped at 1
+      q.recordAttempt('a');
+      expect(q.size).toBe(1);
+    });
+  });
+
+  describe('setMaxAgeHours', () => {
+    it('takes effect on the next prune, without a restart', () => {
+      const q = PostQueue.load(path, 5, 24);
+      const now = Date.now();
+      q.enqueue(entry('mid'), now - 12 * 3_600_000); // 12h old, inside the 24h window
+      expect(q.next(now)?.key).toBe('mid');
+      q.setMaxAgeHours(6); // shrink live — the 12h-old entry is now too old
+      expect(q.next(now)).toBeUndefined();
+    });
+
+    it('a widened age cap keeps an entry that would otherwise now be expired', () => {
+      const q = PostQueue.load(path, 5, 6);
+      const now = Date.now();
+      q.setMaxAgeHours(48); // widen BEFORE the entry is ever expired at 6h
+      q.enqueue(entry('old'), now - 24 * 3_600_000);
+      expect(q.next(now)?.key).toBe('old');
+    });
+  });
+
   it('recovers from a corrupt file instead of refusing to start', () => {
     // Unlike the ledger: losing a few pending posts is recoverable, whereas a
     // reset ledger reposts everything. An unattended bot should keep running.

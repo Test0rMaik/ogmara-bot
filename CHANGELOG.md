@@ -5,6 +5,33 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-09-16
+
+First increment of a larger hot-reload expansion — everything except
+`.env` secrets and the file-only `panel.*`/`settings.*` security boundary
+should eventually apply without an SSH restart. This lands the
+foundational fix the rest of that work depends on, plus the first new
+live field.
+
+### Added
+
+- **`queue.maxAttempts`/`queue.maxAgeHours` now apply live.** New
+  `PostQueue.setMaxAttempts`/`setMaxAgeHours`, mirroring the existing
+  `RateBudget.setMaxPostsPerHour`/`Ledger.setRetentionDays` pattern.
+  `queue.path` stays restart-required — changing the backing file live
+  means abandoning or migrating in-memory queue state, a different and
+  harder problem.
+
+### Changed
+
+- **The settings hot-reload mechanism (`ReconfigureHook`) now supports
+  async live-apply callbacks**, not just synchronous field writes —
+  required for upcoming phases (rebuilding an AI provider client,
+  reinitializing a whole module) that do genuinely async work. A
+  rejected async hook is caught and logged the same way a synchronous
+  throw already was, rather than becoming an unhandled rejection; later
+  hooks in the same save still run either way.
+
 ## [0.32.0] - 2026-09-16
 
 Exact visual match to the approved sidebar-rail concept, after the user

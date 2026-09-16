@@ -79,14 +79,29 @@ function isQueuedPost(value: unknown): value is QueuedPost {
 /** FIFO queue of composed posts waiting to be published. */
 export class PostQueue {
   readonly #path: string;
-  readonly #maxAttempts: number;
-  readonly #maxAgeMs: number;
+  #maxAttempts: number;
+  #maxAgeMs: number;
   #pending: QueuedPost[];
 
   private constructor(path: string, pending: QueuedPost[], maxAttempts: number, maxAgeHours: number) {
     this.#path = path;
     this.#pending = pending;
     this.#maxAttempts = maxAttempts;
+    this.#maxAgeMs = maxAgeHours * 3_600_000;
+  }
+
+  /**
+   * Live-apply a new `queue.maxAttempts` without restarting. Both fields
+   * it feeds (`next()`'s eligibility filter, `recordAttempt()`'s giving-up
+   * check) already read `this.#maxAttempts` fresh on every call, so
+   * changing it here is immediately observable — no other state to touch.
+   */
+  setMaxAttempts(maxAttempts: number): void {
+    this.#maxAttempts = maxAttempts;
+  }
+
+  /** Live-apply a new `queue.maxAgeHours` without restarting. Same reasoning as `setMaxAttempts`. */
+  setMaxAgeHours(maxAgeHours: number): void {
     this.#maxAgeMs = maxAgeHours * 3_600_000;
   }
 

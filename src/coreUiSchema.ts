@@ -93,8 +93,11 @@ export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
   'profile.bio': { label: 'field.profile.bio.label', restart: true },
   'profile.avatarCid': { label: 'field.profile.avatarCid.label', restart: true },
 
-  'queue.maxAttempts': { label: 'field.queue.maxAttempts.label', restart: true },
-  'queue.maxAgeHours': { label: 'field.queue.maxAgeHours.label', restart: true },
+  // queue.path stays restart: true (falls to the default) — changing the
+  // backing file at runtime means abandoning or migrating in-memory queue
+  // state, a different and harder problem than a live setter can solve.
+  'queue.maxAttempts': { label: 'field.queue.maxAttempts.label', restart: false },
+  'queue.maxAgeHours': { label: 'field.queue.maxAgeHours.label', restart: false },
 
   'storage.retentionDays': { label: 'field.storage.retentionDays.label', restart: false },
 

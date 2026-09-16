@@ -40,10 +40,18 @@ import {
  *
  * Only fires when the value actually changed — a save that touches other
  * fields, or that reasserts the same value, does not re-trigger it.
+ *
+ * `apply` may return a `Promise` — rebuilding an AI provider, swapping a
+ * network client, or re-initializing a whole module are all genuinely
+ * async. `commit()` never awaits it (a save must not block on a live-apply
+ * side effect), but it DOES attach its own `.catch()` to whatever `apply`
+ * returns, so a rejected promise still reaches the same
+ * `console.error("live-apply ... failed")` path a synchronous throw does,
+ * rather than becoming an unhandled rejection.
  */
 export interface ReconfigureHook {
   readonly path: string;
-  readonly apply: (value: unknown, config: Config) => void;
+  readonly apply: (value: unknown, config: Config) => void | Promise<void>;
 }
 
 export interface SettingsDepsInput {
@@ -240,13 +248,21 @@ export function createSettingsDeps(input: SettingsDepsInput): SettingsDeps {
     reconfigureHooks.forEach((hook, i) => {
       const after = getPath(effective, hook.path);
       if (after === before[i]) return;
-      try {
-        hook.apply(after, effective);
-      } catch (err) {
+      const reportFailure = (err: unknown): void => {
         console.error(
           `  warning: live-apply for "${hook.path}" failed (the save itself succeeded): ` +
             (err instanceof Error ? err.message : String(err)),
         );
+      };
+      // `apply` may be sync or async — wrapping the CALL itself in try/catch
+      // only ever catches a synchronous throw; an async hook's rejection
+      // would otherwise escape as an unhandled promise rejection instead of
+      // reaching the same warning a sync throw does. `Promise.resolve(...)`
+      // normalizes either shape into one path.
+      try {
+        Promise.resolve(hook.apply(after, effective)).catch(reportFailure);
+      } catch (err) {
+        reportFailure(err);
       }
     });
 

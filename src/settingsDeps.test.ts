@@ -383,7 +383,7 @@ describe('reconfigureHooks', () => {
   it('fires when its path actually changes', () => {
     const calls: unknown[] = [];
     const deps = makeDepsWithHooks([
-      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+      { path: 'posting.maxPostsPerHour', apply: (v) => { calls.push(v); } },
     ]);
     deps.apply({ posting: { maxPostsPerHour: 9 } });
     expect(calls).toEqual([9]);
@@ -392,7 +392,7 @@ describe('reconfigureHooks', () => {
   it('does NOT fire when an unrelated field changes', () => {
     const calls: unknown[] = [];
     const deps = makeDepsWithHooks([
-      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+      { path: 'posting.maxPostsPerHour', apply: (v) => { calls.push(v); } },
     ]);
     deps.apply({ posting: { dryRun: false } });
     expect(calls).toEqual([]);
@@ -401,7 +401,7 @@ describe('reconfigureHooks', () => {
   it('does NOT fire when the save reasserts the value already in effect', () => {
     const calls: unknown[] = [];
     const deps = makeDepsWithHooks([
-      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+      { path: 'posting.maxPostsPerHour', apply: (v) => { calls.push(v); } },
     ]);
     deps.apply({ posting: { maxPostsPerHour: 3 } }); // config.yaml already says 3
     expect(calls).toEqual([]);
@@ -410,7 +410,7 @@ describe('reconfigureHooks', () => {
   it('does NOT fire on a rejected (invalid) save', () => {
     const calls: unknown[] = [];
     const deps = makeDepsWithHooks([
-      { path: 'posting.maxPostsPerHour', apply: (v) => calls.push(v) },
+      { path: 'posting.maxPostsPerHour', apply: (v) => { calls.push(v); } },
     ]);
     const result = deps.apply({ posting: { maxPostsPerHour: -1 } });
     expect(result.ok).toBe(false);
@@ -420,9 +420,9 @@ describe('reconfigureHooks', () => {
   it('fires each independently-changed hook exactly once, ignores untouched ones', () => {
     const changed: string[] = [];
     const deps = makeDepsWithHooks([
-      { path: 'posting.maxPostsPerHour', apply: () => changed.push('rate') },
-      { path: 'posting.dryRun', apply: () => changed.push('dryRun') },
-      { path: 'storage.retentionDays', apply: () => changed.push('retention') },
+      { path: 'posting.maxPostsPerHour', apply: () => { changed.push('rate'); } },
+      { path: 'posting.dryRun', apply: () => { changed.push('dryRun'); } },
+      { path: 'storage.retentionDays', apply: () => { changed.push('retention'); } },
     ]);
     deps.apply({ posting: { maxPostsPerHour: 9, dryRun: false } });
     expect(changed.sort()).toEqual(['dryRun', 'rate']);
@@ -440,13 +440,85 @@ describe('reconfigureHooks', () => {
           throw new Error('boom');
         },
       },
-      { path: 'posting.dryRun', apply: () => ran.push('dryRun') },
+      { path: 'posting.dryRun', apply: () => { ran.push('dryRun'); } },
     ]);
     const result = deps.apply({ posting: { maxPostsPerHour: 9, dryRun: false } });
     expect(result).toEqual({ ok: true });
     expect(ran).toEqual(['dryRun']);
     // The save itself is unaffected by the throw.
     expect(deps.describe().effective.posting.maxPostsPerHour).toBe(9);
+  });
+
+  describe('async hooks', () => {
+    // `apply()` may return a Promise — rebuilding an AI provider, swapping
+    // a network client, or a module's own reconfigure() are all genuinely
+    // async. `commit()` never awaits it (a save must not block on a
+    // live-apply side effect); these tests confirm that guarantee AND that
+    // an async hook's eventual success/failure is still observable and
+    // still doesn't disturb the rest of the hook loop.
+
+    it("apply() returning a pending Promise does not make deps.apply() wait for it", () => {
+      let resolveHook: (() => void) | undefined;
+      const deps = makeDepsWithHooks([
+        {
+          path: 'posting.maxPostsPerHour',
+          apply: () =>
+            new Promise<void>((resolve) => {
+              resolveHook = resolve;
+            }),
+        },
+      ]);
+      const result = deps.apply({ posting: { maxPostsPerHour: 9 } });
+      // Synchronous return, even though the hook's own promise is still
+      // pending — proven by the fact resolveHook was captured but never
+      // called, and the save already reports success.
+      expect(result).toEqual({ ok: true });
+      expect(resolveHook).toBeDefined();
+    });
+
+    it('an async hook that eventually resolves does not throw or reject anywhere observable', async () => {
+      let resolved = false;
+      const deps = makeDepsWithHooks([
+        {
+          path: 'posting.maxPostsPerHour',
+          apply: async () => {
+            await Promise.resolve();
+            resolved = true;
+          },
+        },
+      ]);
+      deps.apply({ posting: { maxPostsPerHour: 9 } });
+      await new Promise((r) => setTimeout(r, 0)); // let the microtask queue drain
+      expect(resolved).toBe(true);
+    });
+
+    it('an async hook that REJECTS does not become an unhandled rejection, and does not block later hooks', async () => {
+      const ran: string[] = [];
+      const deps = makeDepsWithHooks([
+        {
+          path: 'posting.maxPostsPerHour',
+          apply: async () => {
+            await Promise.resolve();
+            throw new Error('async boom');
+          },
+        },
+        { path: 'posting.dryRun', apply: () => { ran.push('dryRun'); } },
+      ]);
+      const unhandled: unknown[] = [];
+      const onUnhandled = (err: unknown): void => {
+        unhandled.push(err);
+      };
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        const result = deps.apply({ posting: { maxPostsPerHour: 9, dryRun: false } });
+        expect(result).toEqual({ ok: true });
+        expect(ran).toEqual(['dryRun']);
+        await new Promise((r) => setTimeout(r, 0)); // let the rejection's .catch() run
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+    });
   });
 
   it('receives the up-to-date effective config as its second argument', () => {

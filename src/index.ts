@@ -723,6 +723,14 @@ async function run(args: CliArgs): Promise<number> {
       // it lazily, by the time a save could ever actually trigger it.
       apply: (v) => statsHistory?.setRetentionDays(v as number),
     },
+    {
+      path: 'queue.maxAttempts',
+      apply: (v) => queue.setMaxAttempts(v as number),
+    },
+    {
+      path: 'queue.maxAgeHours',
+      apply: (v) => queue.setMaxAgeHours(v as number),
+    },
   ];
   if (effective.panel.enabled) {
     statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);
