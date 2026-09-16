@@ -5,6 +5,35 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.1] - 2026-09-16
+
+### Fixed
+
+- **The Configuration tab's field rows now actually match the approved
+  design concept's layout, not just its colors.** The earlier "exact
+  visual match" pass (0.32.0) reskinned badge colors, the toggle switch,
+  and the sidebar rail, but never adopted the concept's own field-row
+  structure — every field still rendered as a single stacked column
+  (label, then badges, then description, then the input below), just
+  wearing the new badge styles. The concept uses a two-column grid: label
+  and description on the left, the live/restart badge and the actual
+  control stacked on the right. `.config-field` is now that grid, with a
+  `.config-field-info`/`.config-field-control` split matching the concept
+  exactly. Caught only once real, rendered screenshots were compared
+  section-by-section against the concept, not by checking that individual
+  classes/colors were present — see `feedback_exact_concept_match` for
+  the standing lesson this produced: an approved concept means matching
+  its actual layout mechanism, not just restyling the existing one.
+- **A regression from that fix, caught by this release's own code audit
+  before shipping**: the array editor (`sources.rss.feeds` and friends)
+  and the multi-field commands editor (`bot.commands`) would have
+  collapsed into an unusably narrow column under the new grid — the
+  code's own reasoning for why they'd "widen naturally" was wrong, since
+  every ancestor in that column is shrink-to-fit and a percentage width
+  resolves to nothing against an indefinite size. Fixed with an explicit
+  minimum width on those two editors specifically, breaking the chain
+  that was collapsing them.
+
 ## [0.37.0] - 2026-09-16
 
 `sources.rss/topics/imagedir.enabled` and each source's own configuration

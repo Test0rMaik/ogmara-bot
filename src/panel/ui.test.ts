@@ -1499,4 +1499,52 @@ describe('exact visual match to the approved concept — badges, toggle switches
     expect(lightBlocks.slice(1)).toEqual(['#167048', '#167048']);
     expect(restartBlocks.slice(1)).toEqual(['#855716', '#855716']);
   });
+
+  it('.config-field is a two-column grid, not a stacked single column', () => {
+    // REGRESSION GUARD: the FIRST "exact visual match" pass (0.32.0)
+    // reskinned the badges/toggle/rail but never adopted the concept's own
+    // field-row layout mechanism — it kept the original stacked structure
+    // (label+badges row, then description, then a full-width input below)
+    // wearing the new badge colors, which still read as a visible mismatch
+    // once compared to the concept screenshot section-by-section. The
+    // concept's actual .field rule is `display: grid; grid-template-columns:
+    // 1fr auto;` — label+description in the first column, badges+control
+    // right-aligned in the second. Pinned here so a future restyle can't
+    // silently regress back to the stacked layout while still passing every
+    // class-name-only check above.
+    expect(page).toMatch(/\.config-field\s*\{[^}]*display:\s*grid/);
+    expect(page).toMatch(/\.config-field\s*\{[^}]*grid-template-columns:\s*1fr auto/);
+  });
+
+  it('.config-field-control right-aligns its content with the badge stacked above the input', () => {
+    expect(page).toMatch(/\.config-field-control\s*\{[^}]*flex-direction:\s*column/);
+    expect(page).toMatch(/\.config-field-control\s*\{[^}]*align-items:\s*flex-end/);
+  });
+
+  it('buildFieldRow puts the label+description in an info column and the badges+control in a separate control column', () => {
+    const fn = extractFunction(script, 'buildFieldRow');
+    expect(fn).toContain("info.className = 'config-field-info';");
+    expect(fn).toContain("control.className = 'config-field-control';");
+    // The description/file-only note belong with the label in the LEFT
+    // column now, not stacked between the header and the input the way the
+    // old single-column layout had them.
+    expect(fn).toMatch(/info\.appendChild\(help\)/);
+    expect(fn).toMatch(/info\.appendChild\(note\)/);
+    // Badges, then the actual control, both inside the RIGHT column.
+    expect(fn).toMatch(/control\.appendChild\(actions\)/);
+    expect(fn).toMatch(/control\.appendChild\(buildFieldInput\(field\)\)/);
+  });
+
+  it('the array and commands editors get an explicit min-width, not just the grid column\'s "auto" sizing', () => {
+    // REGRESSION GUARD, caught by code audit: `.config-field-control` is a
+    // non-stretched flex column, so a percentage width (the input{width:
+    // 100%} rule every input already has) resolves against an INDEFINITE
+    // ancestor size through this whole chain and collapses to the input's
+    // own intrinsic content — an array/commands editor would render in a
+    // ~200px column regardless of its actual content, not "widen
+    // naturally" the way an earlier version of this comment incorrectly
+    // claimed. A concrete min-width (not a percentage) breaks that chain.
+    expect(page).toMatch(/\.config-array-list\s*\{[^}]*min-width:\s*240px/);
+    expect(page).toMatch(/\.config-command-row\s*\{[^}]*min-width:\s*260px/);
+  });
 });

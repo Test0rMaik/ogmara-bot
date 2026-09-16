@@ -214,11 +214,26 @@ export function renderPage(ctx: PageContext): string {
   /* ── Configuration tab ── */
   .config-section { margin: 1.2rem 0; }
   .config-section > h3 { margin-bottom: 0.2rem; }
-  .config-field { border-bottom: 1px solid var(--border); padding: 0.7rem 0; }
+  /* Two-column grid — label+description left, badges+control right,
+     right column right-aligned with the badge stacked above the control —
+     matches the approved concept's .field/.field-info/.field-control
+     exactly (see feedback_exact_concept_match in memory: a prior pass
+     reskinned the badges/toggle but kept the OLD stacked single-column
+     layout underneath, which still read as a visible mismatch despite
+     every individual class/color matching). The second column is "auto"-
+     sized by the grid, which is NOT automatically wide enough for content
+     the static concept never modeled (the array editor, the multi-field
+     commands editor) — those need their own explicit min-width to avoid
+     collapsing to a cramped, unusable column; see the comment on
+     .config-array-list/.config-command-row for why. */
+  .config-field { display: grid; grid-template-columns: 1fr auto; gap: 0.35rem 1.5rem;
+                   align-items: start; border-bottom: 1px solid var(--border); padding: 0.9rem 0; }
   .config-field:last-child { border-bottom: none; }
-  .config-field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
-  .config-field-actions { display: flex; gap: 0.4rem; align-items: center; }
-  .field-help { color: var(--muted); font-size: 0.8rem; margin: 0.15rem 0 0.4rem; }
+  .config-field-info label { font-size: 0.88rem; font-weight: 600; display: block; }
+  .config-field-control { display: flex; flex-direction: column; align-items: flex-end;
+                            gap: 0.4rem; min-width: 200px; }
+  .config-field-actions { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  .field-help { color: var(--muted); font-size: 0.8rem; margin: 0.15rem 0 0; max-width: 48ch; line-height: 1.5; }
   .chip { display: inline-block; background: var(--chip-bg); border: 1px solid var(--border); color: var(--muted);
           border-radius: 999px; padding: 0.05rem 0.55rem; font-size: 0.72rem; white-space: nowrap; }
   .chip.chip-ui { color: var(--accent); border-color: var(--accent); }
@@ -248,10 +263,21 @@ export function renderPage(ctx: PageContext): string {
                padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; font-family: inherit; }
   .reset-btn:hover:not(:disabled) { color: var(--fg); border-color: var(--accent); }
   .reset-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .config-array-list { display: flex; flex-direction: column; gap: 0.35rem; margin: 0.3rem 0; }
+  /* min-width, not a percentage: .config-field-control (the grid's
+     "auto" column) and every ancestor down to here are all shrink-to-fit
+     (a non-stretched flex item / an unstyled div), so a percentage width
+     on the inputs inside resolves against an indefinite size and collapses
+     to their own intrinsic content instead of filling the row — exactly
+     the cramped-array-editor regression the code audit caught. A concrete
+     min-width breaks that chain: it gives the grid's auto column a real
+     size to expand the column to, and once THAT resolves, the plain
+     input-width-100% rule above correctly fills whatever room results,
+     on both narrow and wide screens. */
+  .config-array-list { display: flex; flex-direction: column; gap: 0.35rem; margin: 0.3rem 0; min-width: 240px; }
   .config-array-row { display: flex; gap: 0.4rem; align-items: center; }
   .config-array-row input { flex: 1; }
-  .config-command-row { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; margin-bottom: 0.5rem; }
+  .config-command-row { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem;
+                          margin-bottom: 0.5rem; min-width: 260px; }
   .config-toolbar { display: flex; gap: 0.6rem; align-items: center; margin: 1rem 0; position: sticky; bottom: 0;
                     background: var(--bg); padding: 0.6rem 0; border-top: 1px solid var(--border); }
   .config-toolbar .muted { flex: 1; }
@@ -2094,14 +2120,39 @@ function buildFieldRow(field) {
   const row = document.createElement('div');
   row.className = 'config-field';
 
-  const head = document.createElement('div');
-  head.className = 'config-field-head';
+  // Left column: label + description, matching the concept's .field-info
+  // — everything descriptive about the field, nothing interactive.
+  const info = document.createElement('div');
+  info.className = 'config-field-info';
 
-  const labelWrap = document.createElement('div');
   const label = document.createElement('label');
   label.textContent = fieldLabel(field);
-  labelWrap.appendChild(label);
-  head.appendChild(labelWrap);
+  info.appendChild(label);
+
+  if (field.helpKey) {
+    const help = document.createElement('p');
+    help.className = 'field-help';
+    help.textContent = t(field.helpKey);
+    info.appendChild(help);
+  }
+
+  if (field.fileOnly) {
+    const note = document.createElement('p');
+    note.className = 'field-help';
+    note.textContent = t('config.fileOnly.note');
+    info.appendChild(note);
+  }
+
+  row.appendChild(info);
+
+  // Right column: badges, then the control itself, stacked — matching the
+  // concept's .field-control (badge above input, right-aligned). The
+  // concept only ever shows one badge; this app also needs a source badge
+  // (which config layer the value comes from) and a reset button, which
+  // the static mockup never had to model — both sit in the same badge row
+  // rather than spilling into a third column.
+  const control = document.createElement('div');
+  control.className = 'config-field-control';
 
   const actions = document.createElement('div');
   actions.className = 'config-field-actions';
@@ -2143,24 +2194,10 @@ function buildFieldRow(field) {
     actions.appendChild(resetBtn);
   }
 
-  head.appendChild(actions);
-  row.appendChild(head);
+  control.appendChild(actions);
+  control.appendChild(buildFieldInput(field));
+  row.appendChild(control);
 
-  if (field.helpKey) {
-    const help = document.createElement('p');
-    help.className = 'field-help';
-    help.textContent = t(field.helpKey);
-    row.appendChild(help);
-  }
-
-  if (field.fileOnly) {
-    const note = document.createElement('p');
-    note.className = 'field-help';
-    note.textContent = t('config.fileOnly.note');
-    row.appendChild(note);
-  }
-
-  row.appendChild(buildFieldInput(field));
   return row;
 }
 
