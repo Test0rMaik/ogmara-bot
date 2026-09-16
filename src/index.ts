@@ -648,20 +648,18 @@ async function run(args: CliArgs): Promise<number> {
         return notifications;
       },
     });
-  const allModules: BotModule[] = [
-    createNewsModule({
-      ledger,
-      queue,
-      provider: () => currentProvider,
-      templates: () => currentTemplates,
-      report: (outcome: RunOutcome) => reportOutcome(outcome, publisher.address),
-      // The health already fetched above for the startup banner — passed in so
-      // the module's media-uploads precondition does not make a second network
-      // round trip for information the core already has.
-      health,
-    }),
-    commandsModule,
-  ];
+  const newsModule = createNewsModule({
+    ledger,
+    queue,
+    provider: () => currentProvider,
+    templates: () => currentTemplates,
+    report: (outcome: RunOutcome) => reportOutcome(outcome, publisher.address),
+    // The health already fetched above for the startup banner — passed in so
+    // the module's media-uploads precondition does not make a second network
+    // round trip for information the core already has.
+    health,
+  });
+  const allModules: BotModule[] = [newsModule, commandsModule];
   const modules = enabledModules(allModules, effective);
 
   console.log(
@@ -871,6 +869,28 @@ async function run(args: CliArgs): Promise<number> {
       path: 'bot.rateLimit.perWalletShareOfBudget',
       apply: () => commandsModule.reconfigure?.(ctx),
     },
+    // Same shape again: every leaf path under `sources.*` that isn't
+    // ALREADY read fresh off `ctx.config` by pipeline.ts (fetchImages, the
+    // two image-size/timeout caps, imagedir's contentRating — no hook
+    // needed for those) funnels into `newsModule.reconfigure()`, which
+    // rebuilds `sources: Source[]` and reconciles the per-source cron job
+    // set to match. `sourcesSchema`'s own cross-field check (config.ts)
+    // already refuses an unconfigured-but-enabled combination that would
+    // leave every source empty, at the write itself — so unlike
+    // `commands`'s reconfigure(), this one has nothing left to validate.
+    { path: 'sources.rss.enabled', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.rss.schedule', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.rss.feeds', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.rss.maxAgeDays', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.rss.timeoutMs', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.rss.maxBytes', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.topics.enabled', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.topics.schedule', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.topics.topics', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.topics.minIntervalHours', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.imagedir.enabled', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.imagedir.schedule', apply: () => newsModule.reconfigure?.(ctx) },
+    { path: 'sources.imagedir.directories', apply: () => newsModule.reconfigure?.(ctx) },
   ];
   if (effective.panel.enabled) {
     statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);

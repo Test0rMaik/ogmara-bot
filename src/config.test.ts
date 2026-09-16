@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { configFieldTypes, configPaths, loadConfig } from './config.js';
+import { configFieldTypes, configPaths, loadConfig, sourcesSchema } from './config.js';
 import { FILE_ONLY_IN_OVERRIDES, leafPaths } from './settings.js';
 import { FILE_ONLY_SECTIONS } from './panel/settings.js';
 
@@ -34,6 +34,39 @@ function load(postingYaml: string) {
   writeFileSync(path, `node:\n  url: http://localhost:8080\n${postingYaml}`);
   return loadConfig(path);
 }
+
+describe('sourcesSchema', () => {
+  it('rejects every enabled source left fully unconfigured', () => {
+    // REGRESSION GUARD, same shape as commands/schema.ts's bot.channels fix:
+    // this combination was already fatal at preflight() (news.ts), but that
+    // check runs too late once sources.*.enabled/feeds/topics/directories
+    // are live-appliable — the bad value would already be written to disk
+    // before preflight ever saw it. Closing it here means commit() refuses
+    // the write outright.
+    expect(sourcesSchema.safeParse({ rss: { enabled: true, feeds: [] } }).success).toBe(false);
+    expect(sourcesSchema.safeParse({ topics: { enabled: true, topics: [] } }).success).toBe(false);
+    expect(
+      sourcesSchema.safeParse({ imagedir: { enabled: true, directories: [] } }).success,
+    ).toBe(false);
+  });
+
+  it('accepts an unconfigured source as long as ANOTHER enabled one is configured', () => {
+    expect(
+      sourcesSchema.safeParse({
+        rss: { enabled: true, feeds: [] },
+        topics: { enabled: true, topics: ['klever'] },
+      }).success,
+    ).toBe(true);
+  });
+
+  it('accepts every source disabled and unconfigured — the all-off default', () => {
+    expect(sourcesSchema.safeParse({}).success).toBe(true);
+  });
+
+  it('accepts an unconfigured source as long as it is disabled', () => {
+    expect(sourcesSchema.safeParse({ rss: { enabled: false, feeds: [] } }).success).toBe(true);
+  });
+});
 
 describe('posting.maxPostsPerHour', () => {
   it('no longer fails config load for a cadence that only exceeds the UNVERIFIED tier', () => {

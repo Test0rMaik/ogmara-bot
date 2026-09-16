@@ -5,6 +5,40 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-09-16
+
+`sources.rss/topics/imagedir.enabled` and each source's own configuration
+(`feeds`/`topics`/`directories`, each source's `schedule`, rss's
+`maxAgeDays`/`timeoutMs`/`maxBytes`, topics' `minIntervalHours`) are now
+live-appliable. This is the last field group left restart-required from
+the original hot-reload scope — everything short of `.env` secrets and
+the login-wallet/panel security boundary can now be changed through the
+settings panel without SSHing in to restart.
+
+### Added
+
+- **`sources.*` now applies live.** A source can be switched on or off, or
+  have its feed/topic/directory list, schedule, or fetch limits changed,
+  and the bot picks it up on the very next settings save: sources are
+  rebuilt from the current config, and the per-source scheduled job is
+  created, stopped, or rescheduled to match — without disturbing any
+  other source's already-running job.
+
+### Fixed
+
+- **The same disk-persistence gap the previous release closed for
+  `bot.channels`, found proactively this time before it could ship**:
+  every enabled source left fully unconfigured has been a fatal startup
+  condition since before this project's hot-reload work began — the bot
+  refuses to start rather than run a source that can never do anything.
+  Once these fields became live-appliable, that same combination reached
+  through a live settings save would have been written to disk before
+  the news module ever got a chance to object, and the next restart
+  would fail its own startup check against the now-persisted bad value —
+  the identical boot-loop lockout found in the previous release. Closed
+  the same way: rejected at the configuration-schema level, before it
+  can ever be written.
+
 ## [0.36.0] - 2026-09-16
 
 `bot.handle`/`channels`/`commands`/`rateLimit.*` are now live-appliable — the

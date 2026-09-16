@@ -203,11 +203,45 @@ const imageDirSourceSchema = z.object({
  * readable; the module is the declared owner and the settings UI reads it from
  * there.
  */
-export const sourcesSchema = z.object({
-  rss: rssSourceSchema.prefault({}),
-  topics: topicsSourceSchema.prefault({}),
-  imagedir: imageDirSourceSchema.prefault({}),
-});
+export const sourcesSchema = z
+  .object({
+    rss: rssSourceSchema.prefault({}),
+    topics: topicsSourceSchema.prefault({}),
+    imagedir: imageDirSourceSchema.prefault({}),
+  })
+  // A pure cross-field SHAPE check, mirroring `commands/schema.ts`'s
+  // `botSchema` refinement and the reasoning behind it: `enabled` and each
+  // source's own list (`feeds`/`topics`/`directories`) are all already in
+  // the object being validated, no node/network/filesystem involved.
+  //
+  // `news.ts`'s `preflight()` already refuses to START when every enabled
+  // source is unconfigured — `sources.length === 0` after `buildSources`
+  // skips each one, with a warning. Once `sources.*.enabled`/`feeds`/
+  // `topics`/`directories` became live-appliable, that same bad
+  // combination reachable through a SETTINGS SAVE would otherwise be
+  // written to the overrides file and applied to the live config before
+  // any module got a chance to object — exactly the boot-loop gap found
+  // and closed for `bot.channels` (see `commands/schema.ts`): the next
+  // restart's `preflight()` would fail against the now-persisted bad
+  // value and exit before the settings panel could even start. Catching
+  // it here means `commit()` refuses the write outright.
+  .superRefine((sources, ctx) => {
+    const anyEnabled = sources.rss.enabled || sources.topics.enabled || sources.imagedir.enabled;
+    const anyConfigured =
+      (sources.rss.enabled && sources.rss.feeds.length > 0) ||
+      (sources.topics.enabled && sources.topics.topics.length > 0) ||
+      (sources.imagedir.enabled && sources.imagedir.directories.length > 0);
+    if (anyEnabled && !anyConfigured) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [],
+        message:
+          'Every enabled source under `sources:` is unconfigured — rss has no feeds, ' +
+          'topics has no topics, or imagedir has no directories. Configure at least ' +
+          'one, or set its `enabled: false` if you did not mean to switch it on.',
+      });
+    }
+  });
 
 const aiSchema = z
   .object({
