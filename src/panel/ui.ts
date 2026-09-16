@@ -278,6 +278,11 @@ export function renderPage(ctx: PageContext): string {
   .config-array-row input { flex: 1; }
   .config-command-row { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem;
                           margin-bottom: 0.5rem; min-width: 260px; }
+  .node-url-check { display: flex; flex-direction: column; gap: 0.4rem; min-width: 240px; }
+  .node-url-check-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end; }
+  .node-url-check-result { font-size: 0.8rem; }
+  .node-url-check-result.success { color: var(--live); }
+  .node-url-check-result.error { color: var(--restart); }
   .config-toolbar { display: flex; gap: 0.6rem; align-items: center; margin: 1rem 0; position: sticky; bottom: 0;
                     background: var(--bg); padding: 0.6rem 0; border-top: 1px solid var(--border); }
   .config-toolbar .muted { flex: 1; }
@@ -1868,6 +1873,58 @@ function buildFieldInput(field) {
     return span;
   }
 
+  // node.network is not a value the operator should pick — every signature
+  // adopts whatever the CONNECTED NODE reports (see ogmara.ts's NodeHealth
+  // doc comment), and this stored value exists only as a safety tripwire
+  // health() compares against that live report before it lets the bot
+  // start. Presenting it as a free-choice dropdown implied selecting it
+  // did something, when picking the wrong one only breaks the tripwire
+  // silently. Read-only here; the "Check network" button on node.url is
+  // the actual way to learn/confirm/update it (see checkNodeNetwork()).
+  if (field.path === 'node.network') {
+    const span = document.createElement('span');
+    span.id = 'node-network-display';
+    span.textContent = value || '—';
+    return span;
+  }
+
+  // A candidate URL is worth confirming BEFORE it's saved, since node.url
+  // and node.network are meant to describe the SAME node and a mismatch
+  // between them is what the startup safety check exists to catch — see
+  // the comment on the node.network case above.
+  if (field.path === 'node.url') {
+    const wrap = document.createElement('div');
+    wrap.className = 'node-url-check';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = value === null || value === undefined ? '' : String(value);
+    input.addEventListener('change', () => onChange(input.value === '' ? undefined : input.value));
+    wrap.appendChild(input);
+
+    const row = document.createElement('div');
+    row.className = 'node-url-check-row';
+    const checkBtn = document.createElement('button');
+    checkBtn.type = 'button';
+    checkBtn.className = 'secondary-btn';
+    checkBtn.textContent = t('config.node.checkNetwork');
+    const result = document.createElement('span');
+    result.className = 'node-url-check-result muted';
+    checkBtn.addEventListener('click', () => checkNodeNetwork(input.value, checkBtn, result));
+    // A check result — and the node.network value it staged — describes
+    // ONE specific URL. If the operator edits the URL again without
+    // re-checking, that result no longer means anything: left in place, it
+    // would carry a stale, unrelated value into the "confirm this network"
+    // dialog on Save. 'input' (not 'change') so this catches the edit
+    // immediately, not only once the field loses focus.
+    input.addEventListener('input', () => invalidateNodeNetworkCheck(result));
+    row.appendChild(checkBtn);
+    row.appendChild(result);
+    wrap.appendChild(row);
+
+    return wrap;
+  }
+
   if (field.type.kind === 'boolean') {
     const wrap = document.createElement('label');
     wrap.className = 'switch';
@@ -1945,6 +2002,75 @@ function buildFieldInput(field) {
     onChange(input.value === '' ? undefined : input.value);
   });
   return input;
+}
+
+/**
+ * Probes a CANDIDATE node.url (not necessarily saved yet) for the network it
+ * actually reports, via the read-only /api/node/check endpoint (no signing,
+ * the same unauthenticated health call the bot itself makes at startup).
+ *
+ * On success, also stages node.network as a pending change to match — so
+ * confirming a check and then saving genuinely persists the SAME value that
+ * was just verified, rather than leaving the operator to separately notice
+ * and update a second field by hand.
+ */
+async function checkNodeNetwork(candidateUrl, btn, resultEl) {
+  if (!candidateUrl) {
+    resultEl.className = 'node-url-check-result error';
+    resultEl.textContent = t('config.node.checkNetwork.emptyUrl');
+    return;
+  }
+  btn.disabled = true;
+  resultEl.className = 'node-url-check-result muted';
+  resultEl.textContent = t('config.node.checkNetwork.checking');
+  try {
+    const body = await api('/api/node/check?url=' + encodeURIComponent(candidateUrl), { method: 'GET' });
+    if (!body.network) {
+      resultEl.className = 'node-url-check-result error';
+      resultEl.textContent = t('config.node.checkNetwork.unknown');
+      return;
+    }
+    resultEl.className = 'node-url-check-result success';
+    resultEl.textContent = t('config.node.checkNetwork.result', { network: body.network });
+    // Tags the result with the URL it actually describes, so a later edit
+    // to node.url (invalidateNodeNetworkCheck, below) can tell this result
+    // is now stale and roll the staged value back — see that function.
+    resultEl.dataset.checkedUrl = candidateUrl;
+    configPending['node.network'] = body.network;
+    updateConfigToolbar();
+    renderResetButtonState('node.network');
+    const display = document.getElementById('node-network-display');
+    if (display) display.textContent = body.network;
+  } catch (err) {
+    resultEl.className = 'node-url-check-result error';
+    resultEl.textContent = t('config.node.checkNetwork.error', { error: err.message || String(err) });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/**
+ * Called whenever node.url is edited after a "Check network" result is
+ * showing (success OR error — both describe a URL that may no longer be
+ * current). Clears the now-stale result text unconditionally; additionally
+ * rolls back the staged node.network value (and re-syncs the read-only
+ * display) if this check had actually staged one, so Save can never persist
+ * a network value that was verified against a DIFFERENT URL than the one
+ * about to be saved — the exact gap a code audit caught in the first
+ * version of this feature.
+ */
+function invalidateNodeNetworkCheck(resultEl) {
+  const hadStagedNetwork = resultEl.dataset.checkedUrl !== undefined;
+  delete resultEl.dataset.checkedUrl;
+  resultEl.className = 'node-url-check-result muted';
+  resultEl.textContent = '';
+  if (!hadStagedNetwork) return;
+  delete configPending['node.network'];
+  updateConfigToolbar();
+  renderResetButtonState('node.network');
+  const display = document.getElementById('node-network-display');
+  const networkField = configFields.find((f) => f.path === 'node.network');
+  if (display && networkField) display.textContent = networkField.value || '—';
 }
 
 /**

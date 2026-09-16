@@ -13,7 +13,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import type { OgmaraClient, ScNetwork, WalletSigner } from '@ogmara/sdk';
+import { OgmaraClient, type ScNetwork, type WalletSigner } from '@ogmara/sdk';
 import type { ProfileResult, ProfileSpec, RegisterResult, RegistrationStatus } from '../identity.js';
 import { MAX_AVATAR_BYTES } from '../identity.js';
 import { MediaError } from '../media.js';
@@ -522,6 +522,56 @@ async function handle(
       walletBackupPending,
       bot: deps.botDescriptor(),
     });
+    return;
+  }
+
+  // Lets the operator see which network a CANDIDATE node.url actually
+  // serves before saving it — node.network is a deliberate, independently-
+  // saved safety tripwire (health() refuses to start on a mismatch between
+  // it and what the node reports, since testnet/mainnet share a wallet key
+  // and a wrong value publishes irreversibly under the real identity), not
+  // a value the operator should have to guess from a bare dropdown. This
+  // only ever probes GET /api/v1/health on the given URL — the same
+  // unauthenticated, read-only call the bot already makes to its
+  // configured node at startup — never signs or writes anything.
+  //
+  // Gated the same as the settings API below, not left open like
+  // /api/status: this makes the SERVER issue an outbound request to a
+  // caller-supplied URL, which an unauthenticated caller could otherwise
+  // use to probe the panel's own network position (an SSRF vector) even
+  // though the same admin tier could already point the bot's real,
+  // SIGNING client at any URL via node.url itself — this endpoint adds no
+  // new capability for an admin, but must not be reachable below that tier.
+  if (method === 'GET' && path === '/api/node/check') {
+    const actor = verifySession(req, deps.auth);
+    if (actor === undefined) {
+      sendJson(res, 401, { error: 'sign in to check a node.' });
+      return;
+    }
+    const candidate = url.searchParams.get('url') ?? '';
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      sendJson(res, 400, { error: 'not a valid URL' });
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      sendJson(res, 400, { error: 'must be an http:// or https:// URL' });
+      return;
+    }
+    try {
+      const probe = new OgmaraClient({ nodeUrl: candidate, timeout: 8_000 });
+      const health = await probe.health();
+      sendJson(res, 200, {
+        network: health.network ?? null,
+        version: health.version,
+      });
+    } catch (err) {
+      sendJson(res, 502, {
+        error: `could not reach that node: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
     return;
   }
 

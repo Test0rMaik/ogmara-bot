@@ -1,4 +1,4 @@
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import { WalletSigner, type OgmaraClient } from '@ogmara/sdk';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ProfileResult, RegisterResult, RegistrationStatus } from '../identity.js';
@@ -1584,5 +1584,115 @@ describe('wallet backup reminder', () => {
     const res = await fetch(`${baseUrl}/api/wallet/ack-backup`, { method: 'POST' });
     expect(res.status).toBe(415);
     expect(fns.acknowledgeWalletBackup).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A minimal fake node, just enough to answer GET /api/v1/health — the one
+ * unauthenticated call OgmaraClient.health() makes, which is all
+ * /api/node/check needs from a real node.
+ */
+function startFakeNode(
+  body: Record<string, unknown> = { status: 'ok', version: '0.99.0', peers: 3, network: 'testnet' },
+): Promise<{ url: string; close: () => Promise<void>; requests: string[] }> {
+  const requests: string[] = [];
+  const server: Server = createServer((req, res) => {
+    requests.push(req.url ?? '');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address !== null ? address.port : 0;
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        close: () => new Promise((r) => server.close(() => r())),
+        requests,
+      });
+    });
+  });
+}
+
+describe('GET /api/node/check', () => {
+  // REGRESSION CONTEXT: node.network used to be a free-choice dropdown the
+  // operator picked by hand, even though real signing always follows
+  // whatever the CONNECTED NODE reports (see ogmara.ts's NodeHealth doc
+  // comment) — the stored value only ever mattered as a startup safety
+  // check against that live report. This endpoint lets the panel show what
+  // a CANDIDATE node.url actually serves before it's saved, so node.network
+  // becomes something confirmed from the node, not guessed.
+
+  it('requires a signed-in session, even from localhost — it makes the server fetch an arbitrary caller-supplied URL', async () => {
+    const { baseUrl } = await start();
+    const res = await fetch(`${baseUrl}/api/node/check?url=${encodeURIComponent('http://example.test')}`);
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects a missing or unparseable url', async () => {
+    const { baseUrl } = await start();
+    const { cookie } = await loginAs(baseUrl, operator);
+    let res = await fetch(`${baseUrl}/api/node/check`, { headers: { Cookie: cookie } });
+    expect(res.status).toBe(400);
+    res = await fetch(`${baseUrl}/api/node/check?url=not-a-url`, { headers: { Cookie: cookie } });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a non-http(s) URL scheme', async () => {
+    const { baseUrl } = await start();
+    const { cookie } = await loginAs(baseUrl, operator);
+    const res = await fetch(
+      `${baseUrl}/api/node/check?url=${encodeURIComponent('file:///etc/passwd')}`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('reports the network a reachable candidate node serves', async () => {
+    const node = await startFakeNode({ status: 'ok', version: '0.99.0', peers: 3, network: 'mainnet' });
+    try {
+      const { baseUrl } = await start();
+      const { cookie } = await loginAs(baseUrl, operator);
+      const res = await fetch(`${baseUrl}/api/node/check?url=${encodeURIComponent(node.url)}`, {
+        headers: { Cookie: cookie },
+      });
+      expect(res.status).toBe(200);
+      const body = await json(res);
+      expect(body.network).toBe('mainnet');
+      // Confirms this hit the CANDIDATE node, not the panel's own configured
+      // one — the whole point of the feature.
+      expect(node.requests).toEqual(['/api/v1/health']);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('a node that omits the network field (pre-0.48.7) reports null, not a crash', async () => {
+    const node = await startFakeNode({ status: 'ok', version: '0.40.0', peers: 1 });
+    try {
+      const { baseUrl } = await start();
+      const { cookie } = await loginAs(baseUrl, operator);
+      const res = await fetch(`${baseUrl}/api/node/check?url=${encodeURIComponent(node.url)}`, {
+        headers: { Cookie: cookie },
+      });
+      expect(res.status).toBe(200);
+      const body = await json(res);
+      expect(body.network).toBeNull();
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('reports an unreachable node as a clear failure, not a 500', async () => {
+    const { baseUrl } = await start();
+    const { cookie } = await loginAs(baseUrl, operator);
+    // Port 1: nothing listens there, so this is a fast connection refusal
+    // rather than a multi-second timeout.
+    const res = await fetch(`${baseUrl}/api/node/check?url=${encodeURIComponent('http://127.0.0.1:1')}`, {
+      headers: { Cookie: cookie },
+    });
+    expect(res.status).toBe(502);
+    const body = await json(res);
+    expect(body.error).toContain('could not reach');
   });
 });

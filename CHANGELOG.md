@@ -5,6 +5,39 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-09-16
+
+`node.network` was presented as a free-choice dropdown (testnet/mainnet),
+but real signing never actually reads it — every signature follows
+whatever the connected node itself reports, always. The stored value's
+only real job is a startup safety check comparing the operator's
+declared expectation against the node's actual report, refusing to start
+on a mismatch (testnet and mainnet share a wallet key, so publishing to
+the wrong one is irreversible). Presenting it as something to freely
+pick implied selecting it did something, when picking the wrong one only
+silently broke that check. Reported as a real bug against the running
+panel.
+
+### Added
+
+- **"Check network" next to Node URL.** Verifies what a candidate node
+  actually serves — before it's saved, not after — via a new endpoint
+  that makes the one unauthenticated health call the bot itself already
+  makes at startup, requiring the same signed-in session the rest of the
+  settings API does. A successful check stages the confirmed value as
+  the network to save, so what the operator saw verified is what
+  actually gets persisted. `node.network` itself is now a read-only
+  display, not a dropdown.
+
+### Fixed
+
+- **Caught by this release's own code audit before shipping**: a staged
+  check result wasn't invalidated if the operator edited the URL again
+  afterward without re-checking, which could silently save a network
+  value that had been verified against a different URL than the one
+  actually saved. Editing the URL after a check now clears the stale
+  result and rolls back the staged value immediately.
+
 ## [0.37.1] - 2026-09-16
 
 ### Fixed

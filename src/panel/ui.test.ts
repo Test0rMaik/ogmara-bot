@@ -80,7 +80,19 @@ describe('renderPage structure', () => {
     // aimed at an id that doesn't exist (a typo, a removed element) returns
     // null and silently no-ops or throws deep in an event handler — exactly
     // the "nothing happens" failure mode, just from a different cause.
-    const ids = [...script.matchAll(/getElementById\('([a-z-]+)'\)/g)].map((m) => m[1]);
+    //
+    // DYNAMIC_IDS: ids this blanket check can't verify, because the element
+    // is built by JS at render time (buildFieldRow/buildFieldInput), never
+    // part of the static page returned by renderPage() — the same reason
+    // config-save-btn etc. above ARE in the static #tab-config shell but a
+    // per-field id like this one is not. checkNodeNetwork()'s own lookup is
+    // null-guarded (`if (display) …`) precisely because the field it targets
+    // might not currently be rendered, so a missing element is already a
+    // handled case, not the silent-failure class this test exists to catch.
+    const DYNAMIC_IDS = new Set(['node-network-display']);
+    const ids = [...script.matchAll(/getElementById\('([a-z-]+)'\)/g)]
+      .map((m) => m[1])
+      .filter((id): id is string => id !== undefined && !DYNAMIC_IDS.has(id));
     expect(ids.length).toBeGreaterThan(0);
     for (const id of ids) {
       expect(page).toContain(`id="${id}"`);
@@ -1546,5 +1558,92 @@ describe('exact visual match to the approved concept — badges, toggle switches
     // claimed. A concrete min-width (not a percentage) breaks that chain.
     expect(page).toMatch(/\.config-array-list\s*\{[^}]*min-width:\s*240px/);
     expect(page).toMatch(/\.config-command-row\s*\{[^}]*min-width:\s*260px/);
+  });
+});
+
+describe('node.network is derived from the node, not a free-choice dropdown', () => {
+  // REGRESSION CONTEXT: real signing always follows whatever the CONNECTED
+  // NODE reports (see ogmara.ts's NodeHealth doc comment) — the stored
+  // node.network value only ever mattered as a startup safety check against
+  // that live report. Rendering it as an editable dropdown implied picking
+  // a value did something, when picking the wrong one only silently broke
+  // that safety check. It's read-only here; /api/node/check (server.test.ts)
+  // is the actual way to learn/confirm/update it.
+
+  it('renders node.network as a read-only display, not an editable control', () => {
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toMatch(/field\.path === 'node\.network'/);
+    // The read-only branch must come before the generic 'enum' branch would
+    // otherwise turn this into a <select> — order matters in an if-chain.
+    const networkBranchIndex = fn.indexOf("field.path === 'node.network'");
+    const enumBranchIndex = fn.indexOf("field.type.kind === 'enum'");
+    expect(networkBranchIndex).toBeGreaterThan(-1);
+    expect(enumBranchIndex).toBeGreaterThan(-1);
+    expect(networkBranchIndex).toBeLessThan(enumBranchIndex);
+  });
+
+  it('the node.network display has a stable id so a network check can update it after the fact', () => {
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toContain("span.id = 'node-network-display'");
+  });
+
+  it('node.url renders a "Check network" button wired to checkNodeNetwork', () => {
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toMatch(/field\.path === 'node\.url'/);
+    expect(fn).toContain("t('config.node.checkNetwork')");
+    expect(fn).toMatch(/checkNodeNetwork\(input\.value, checkBtn, result\)/);
+  });
+
+  it('checkNodeNetwork stages the checked value as a pending node.network change, so saving persists what was just verified', () => {
+    const fn = extractFunction(script, 'checkNodeNetwork');
+    expect(fn).toContain("configPending['node.network'] = body.network");
+    expect(fn).toContain('updateConfigToolbar()');
+  });
+
+  it('checkNodeNetwork refuses to probe an empty URL rather than sending a request', () => {
+    const fn = extractFunction(script, 'checkNodeNetwork');
+    expect(fn).toMatch(/if\s*\(!candidateUrl\)\s*\{/);
+  });
+
+  it('checkNodeNetwork calls the read-only check endpoint, GET only, never a settings write', () => {
+    const fn = extractFunction(script, 'checkNodeNetwork');
+    expect(fn).toContain("api('/api/node/check?url=' + encodeURIComponent(candidateUrl)");
+    expect(fn).toMatch(/method:\s*'GET'/);
+  });
+
+  it('checkNodeNetwork tags a successful result with the URL it actually checked', () => {
+    // REGRESSION GUARD, caught by code audit: without this tag,
+    // invalidateNodeNetworkCheck has no way to tell a stale result apart
+    // from a fresh one, and a staged node.network value could survive an
+    // unrelated later edit to node.url and get saved alongside a URL it was
+    // never actually checked against.
+    const fn = extractFunction(script, 'checkNodeNetwork');
+    expect(fn).toContain('resultEl.dataset.checkedUrl = candidateUrl');
+  });
+
+  it("editing node.url after a check re-fires on the input's 'input' event, not just 'change'", () => {
+    // 'input' (fires on every keystroke) rather than 'change' (fires only on
+    // blur/Enter) — a check result must be invalidated the moment the URL
+    // starts changing, not only once the operator clicks away.
+    const fn = extractFunction(script, 'buildFieldInput');
+    expect(fn).toMatch(/input\.addEventListener\('input', \(\) => invalidateNodeNetworkCheck\(result\)\)/);
+  });
+
+  it('invalidateNodeNetworkCheck rolls back a staged node.network value and re-syncs the read-only display', () => {
+    const fn = extractFunction(script, 'invalidateNodeNetworkCheck');
+    expect(fn).toContain("delete configPending['node.network']");
+    expect(fn).toContain("getElementById('node-network-display')");
+    // Restores the field's SAVED value, not an arbitrary default — reads it
+    // back off the schema-sourced configFields list, matching how every
+    // other field's "current value" is resolved elsewhere in this file.
+    expect(fn).toMatch(/configFields\.find\(\(f\) => f\.path === 'node\.network'\)/);
+  });
+
+  it('invalidateNodeNetworkCheck is a no-op for an unrelated field edit — it never fires without a staged check', () => {
+    // Guards against the inverse mistake: clearing configPending['node.network']
+    // on EVERY node.url keystroke, even before any check ever ran or after
+    // one already failed (nothing staged to roll back).
+    const fn = extractFunction(script, 'invalidateNodeNetworkCheck');
+    expect(fn).toMatch(/if\s*\(!hadStagedNetwork\)\s*return;/);
   });
 });
