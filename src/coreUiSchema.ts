@@ -75,20 +75,28 @@ export const CORE_UI_SCHEMA: Readonly<Record<string, UiField>> = {
     restart: false, // read live: pipeline.ts's withAttribution()
   },
 
+  // Live: index.ts's ai.* reconfigure hooks rebuild the provider client
+  // (provider/model/baseUrl/effort/maxTokens all funnel into ONE rebuild,
+  // since createProvider takes the whole `ai` section) or reload one
+  // template file (each *PromptPath). Still confirm: true on `provider`
+  // — switching providers can fail loudly if the new one's API key isn't
+  // set, same stakes as before, restart or not.
   'ai.provider': {
     label: 'field.ai.provider.label',
     help: 'field.ai.provider.help',
-    restart: true,
+    restart: false,
     confirm: true,
   },
-  'ai.model': { label: 'field.ai.model.label', help: 'field.ai.model.help', restart: true },
-  'ai.baseUrl': { label: 'field.ai.baseUrl.label', help: 'field.ai.baseUrl.help', restart: true },
-  'ai.effort': { label: 'field.ai.effort.label', restart: true },
-  'ai.maxTokens': { label: 'field.ai.maxTokens.label', restart: true },
-  'ai.promptPath': { label: 'field.ai.promptPath.label', restart: true },
+  'ai.model': { label: 'field.ai.model.label', help: 'field.ai.model.help', restart: false },
+  'ai.baseUrl': { label: 'field.ai.baseUrl.label', help: 'field.ai.baseUrl.help', restart: false },
+  'ai.effort': { label: 'field.ai.effort.label', restart: false },
+  'ai.maxTokens': { label: 'field.ai.maxTokens.label', restart: false },
+  'ai.promptPath': { label: 'field.ai.promptPath.label', restart: false },
+  'ai.topicPromptPath': { label: 'field.ai.topicPromptPath.label', restart: false },
+  'ai.imagePromptPath': { label: 'field.ai.imagePromptPath.label', restart: false },
   // The four below are read live, fresh per pipeline run, straight from
-  // `config.ai.*` inside pipeline.ts — unlike `model`/`provider`/`baseUrl`
-  // above, nothing bakes them into the AI client at construction.
+  // `config.ai.*` inside pipeline.ts — no reconfigure hook needed at all,
+  // unlike the provider/template fields above.
   'ai.targetContentChars': { label: 'field.ai.targetContentChars.label', restart: false },
   'ai.maxTags': { label: 'field.ai.maxTags.label', restart: false },
   'ai.maxSourceTitleChars': { label: 'field.ai.maxSourceTitleChars.label', restart: false },

@@ -53,7 +53,7 @@ import { MAX_AUDIT_REASON, startPanel, truncate, type Panel } from './panel/serv
 import { diffForAudit } from './panel/settings.js';
 import { PostQueue } from './queue.js';
 import { type RunOutcome } from './pipeline.js';
-import { createNewsModule } from './modules/news.js';
+import { createNewsModule, imagedirVisionError } from './modules/news.js';
 import { createCommandsModule } from './modules/commands/index.js';
 import { enabledModules, preflightAll, startAll, stopAll } from './modules/registry.js';
 import type { BotContext, BotModule } from './modules/types.js';
@@ -517,8 +517,12 @@ async function run(args: CliArgs): Promise<number> {
   );
   console.log(`Queue:   ${effective.queue.path} (${queue.size} pending)`);
 
-  const provider = await createProvider(effective.ai, secrets);
-  console.log(`AI:      ${provider.id} / ${provider.model}`);
+  // `let`, not `const` — ai.provider/model/baseUrl/effort/maxTokens are now
+  // live-appliable (see the reconfigureHooks entries below); the news
+  // module reads this THROUGH an accessor function passed into
+  // createNewsModule, never capturing the object itself.
+  let currentProvider = await createProvider(effective.ai, secrets);
+  console.log(`AI:      ${currentProvider.id} / ${currentProvider.model}`);
 
   if (effective.profile.applyOnStart) {
     const result = await applyProfile(publisher.client, {
@@ -529,7 +533,10 @@ async function run(args: CliArgs): Promise<number> {
     if (result.status === 'updated') console.log('Profile: published from config');
   }
 
-  const templates = {
+  // Same reasoning as `currentProvider` — each `*PromptPath` reconfigure
+  // hook reloads just its own entry, replacing the whole object so nothing
+  // ever observes a partially-updated one.
+  let currentTemplates = {
     rss: loadTemplate(effective.ai.promptPath),
     topics: loadTemplate(effective.ai.topicPromptPath),
     imagedir: loadTemplate(effective.ai.imagePromptPath),
@@ -562,8 +569,8 @@ async function run(args: CliArgs): Promise<number> {
     createNewsModule({
       ledger,
       queue,
-      provider,
-      templates,
+      provider: () => currentProvider,
+      templates: () => currentTemplates,
       report: (outcome: RunOutcome) => reportOutcome(outcome, publisher.address),
       // The health already fetched above for the startup banner — passed in so
       // the module's media-uploads precondition does not make a second network
@@ -738,6 +745,46 @@ async function run(args: CliArgs): Promise<number> {
     reconnectChannelSubscription?.();
   }
 
+  /**
+   * Live-apply an `ai.provider`/`model`/`baseUrl`/`effort`/`maxTokens`
+   * change: rebuild the provider client from the current config. All five
+   * paths funnel into this SAME rebuild — `createProvider` takes the whole
+   * `ai` section, not one field, and it's cheap (a thin, stateless HTTP
+   * client wrapper) either way. If the new config is invalid (e.g. no API
+   * key for the newly-selected provider), `createProvider` rejects and
+   * `currentProvider` is simply never reassigned — the bot keeps
+   * publishing with the last-known-good provider rather than being left
+   * with none, and the rejection reaches the operator via the existing
+   * "live-apply ... failed" log (see settingsDeps.ts's async hook
+   * dispatch).
+   *
+   * Also re-checks the same imagedir/vision precondition `news.ts`'s
+   * `preflight()` enforces at startup. Preflight only ever runs once, at
+   * boot — a live provider swap has no other gate, so without this check
+   * an operator could switch to a text-only model while `sources.imagedir`
+   * is enabled and only discover it from an opaque per-item compose
+   * failure on the next imagedir run, instead of the same clear,
+   * actionable message preflight already gives. Checked BEFORE
+   * `currentProvider` is reassigned, for the same last-known-good reason
+   * as the rejection case above.
+   */
+  async function rebuildAiProvider(): Promise<void> {
+    const next = await createProvider(effective.ai, secrets);
+    const visionError = imagedirVisionError(effective, next);
+    if (visionError !== null) throw new AiConfigError(visionError);
+    currentProvider = next;
+  }
+
+  /**
+   * Live-apply one `ai.*PromptPath` change: reload just that one template
+   * file's contents. Replaces the whole `currentTemplates` object (rather
+   * than mutating one field of it) so nothing reading it mid-update ever
+   * observes a partially-updated set.
+   */
+  function reloadTemplate(key: keyof typeof currentTemplates, path: string): void {
+    currentTemplates = { ...currentTemplates, [key]: loadTemplate(path) };
+  }
+
   const reconfigureHooks: ReconfigureHook[] = [
     // The values below are the ones the uiSchema promises are live
     // (`restart: false`) specifically BECAUSE something baked them into a
@@ -778,6 +825,24 @@ async function run(args: CliArgs): Promise<number> {
     { path: 'node.url', apply: () => rebuildNodeConnections() },
     { path: 'node.network', apply: () => rebuildNodeConnections() },
     { path: 'node.timeoutMs', apply: () => rebuildNodeConnections() },
+    // Same "one shared rebuild, several trigger paths" shape as node.* above.
+    { path: 'ai.provider', apply: () => rebuildAiProvider() },
+    { path: 'ai.model', apply: () => rebuildAiProvider() },
+    { path: 'ai.baseUrl', apply: () => rebuildAiProvider() },
+    { path: 'ai.effort', apply: () => rebuildAiProvider() },
+    { path: 'ai.maxTokens', apply: () => rebuildAiProvider() },
+    {
+      path: 'ai.promptPath',
+      apply: (v) => reloadTemplate('rss', v as string),
+    },
+    {
+      path: 'ai.topicPromptPath',
+      apply: (v) => reloadTemplate('topics', v as string),
+    },
+    {
+      path: 'ai.imagePromptPath',
+      apply: (v) => reloadTemplate('imagedir', v as string),
+    },
   ];
   if (effective.panel.enabled) {
     statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);

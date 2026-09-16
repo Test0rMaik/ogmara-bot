@@ -5,6 +5,45 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-09-16
+
+`ai.provider`/`model`/`baseUrl`/`effort`/`maxTokens` and the three
+`*PromptPath` fields are now live-appliable. The provider client and
+template contents were previously captured once into closures at
+startup; both now live behind a mutable holder a reconfigure hook
+rebuilds or reloads on save.
+
+### Added
+
+- **`ai.provider`/`model`/`baseUrl`/`effort`/`maxTokens` now apply
+  live.** All five funnel into one rebuild — `createProvider` takes the
+  whole `ai` section, and building it is cheap either way (a thin,
+  stateless HTTP client wrapper). `ai.provider` keeps its confirmation
+  step: switching providers can fail loudly if the new one's API key
+  isn't set, the same stakes as before, restart or not. If the rebuild
+  fails, the bot keeps publishing with the last-known-good provider
+  rather than being left with none.
+- **`ai.promptPath`/`ai.topicPromptPath`/`ai.imagePromptPath` now apply
+  live.** Each reloads just its own template file, replacing the whole
+  template set atomically so nothing mid-run ever observes a
+  partially-updated one. `ai.topicPromptPath`/`ai.imagePromptPath` also
+  gain their first-ever uiSchema entries and labels (7 languages) — they
+  previously had none and fell back to a humanized path string.
+
+### Fixed
+
+- **A safety check the live-swap path had silently bypassed, caught by
+  this release's own code audit before shipping**: `sources.imagedir`'s
+  startup check that the configured model can actually accept images
+  only ever ran once, at boot. Switching to a text-only model via the
+  new live `ai.provider`/`model` reload had no equivalent gate, so the
+  mismatch would have surfaced only as an opaque per-item pipeline
+  failure instead of the clear, actionable startup message. The check is
+  now a single shared function called both at startup preflight and on
+  every live provider rebuild, so a live swap that would leave imagedir
+  unable to run is rejected with the same message, keeping the
+  last-known-good provider in place.
+
 ## [0.34.0] - 2026-09-16
 
 `node.url`/`node.network`/`node.timeoutMs` are now live-appliable. The

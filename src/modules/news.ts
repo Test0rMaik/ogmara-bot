@@ -43,8 +43,16 @@ import type {
 export interface NewsDeps {
   readonly ledger: Ledger;
   readonly queue: PostQueue;
-  readonly provider: AiProvider;
-  readonly templates: Templates;
+  /**
+   * `ai.provider`/`model`/`baseUrl`/`effort`/`maxTokens` and the three
+   * `*PromptPath` fields are all now live-appliable — functions, not plain
+   * values, so a reconfigure hook rebuilding the provider or reloading a
+   * template file is observed on the very next pipeline run rather than
+   * only after a restart. Same live-read idiom as `PanelDeps.dailyLimitFn`
+   * etc.
+   */
+  readonly provider: () => AiProvider;
+  readonly templates: () => Templates;
   /** Called with each run's outcome so the core can report it consistently. */
   readonly report: (outcome: RunOutcome) => void;
   /**
@@ -109,6 +117,22 @@ export function newsEnabled(config: Config): boolean {
   return s.rss.enabled || s.topics.enabled || s.imagedir.enabled;
 }
 
+/**
+ * The imagedir/vision precondition, as a plain message-or-null so both the
+ * startup preflight check AND a live `ai.*` reconfigure can enforce it —
+ * the latter needs this to survive an operator switching to a text-only
+ * model AFTER boot, since preflight itself only ever runs once, at startup.
+ */
+export function imagedirVisionError(config: Config, provider: AiProvider): string | null {
+  if (!config.sources.imagedir.enabled || provider.supportsVision) return null;
+  return (
+    `sources.imagedir is enabled but the configured model ` +
+    `(${provider.id}/${provider.model}) cannot accept images.\n` +
+    'Use a vision-capable model, or set ai.compatibleSupportsVision: true if your ' +
+    'local model does support them.'
+  );
+}
+
 export function createNewsModule(deps: NewsDeps): BotModule {
   let sources: Source[] = [];
   // Tracks whether the build RAN, not whether it produced anything. Guarding on
@@ -128,8 +152,12 @@ export function createNewsModule(deps: NewsDeps): BotModule {
     ledger: deps.ledger,
     queue: deps.queue,
     publisher: ctx.publisher,
-    provider: deps.provider,
-    templates: deps.templates,
+    // Called fresh here, on every pipeline run — not once at module
+    // construction — so a live ai.* reconfigure is observed on the very
+    // next run. `pipeline.ts` itself still takes plain values: a one-shot
+    // run doesn't need to re-read anything mid-flight.
+    provider: deps.provider(),
+    templates: deps.templates(),
   });
 
   return {
@@ -226,14 +254,9 @@ export function createNewsModule(deps: NewsDeps): BotModule {
       // Zod refinement.
       if (!ctx.config.sources.imagedir.enabled) return null;
 
-      if (!deps.provider.supportsVision) {
-        return {
-          message:
-            `\nsources.imagedir is enabled but the configured model ` +
-            `(${deps.provider.id}/${deps.provider.model}) cannot accept images.\n` +
-            'Use a vision-capable model, or set ai.compatibleSupportsVision: true if your ' +
-            'local model does support them.',
-        };
+      const visionError = imagedirVisionError(ctx.config, deps.provider());
+      if (visionError !== null) {
+        return { message: `\n${visionError}` };
       }
 
       if (!deps.health.mediaUploads) {

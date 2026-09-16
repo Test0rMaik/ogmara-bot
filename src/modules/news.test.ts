@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Config } from '../config.js';
+import type { AiProvider } from '../ai/index.js';
 import type { BotContext } from './types.js';
-import { buildSources, createNewsModule, newsEnabled, type NewsDeps } from './news.js';
+import {
+  buildSources,
+  createNewsModule,
+  imagedirVisionError,
+  newsEnabled,
+  type NewsDeps,
+} from './news.js';
 
 function configWith(over: {
   rss?: { enabled?: boolean; feeds?: unknown[]; schedule?: string };
@@ -54,8 +61,8 @@ function depsWith(over: Partial<NewsDeps> = {}): NewsDeps {
   return {
     ledger: {} as NewsDeps['ledger'],
     queue: {} as NewsDeps['queue'],
-    provider: { id: 'openai', model: 'gpt-x', supportsVision: true } as NewsDeps['provider'],
-    templates: { rss: '', topics: '', imagedir: '' } as NewsDeps['templates'],
+    provider: (() => ({ id: 'openai', model: 'gpt-x', supportsVision: true })) as NewsDeps['provider'],
+    templates: (() => ({ rss: '', topics: '', imagedir: '' })) as NewsDeps['templates'],
     report: () => {},
     health: { mediaUploads: true },
     ...over,
@@ -69,6 +76,26 @@ describe('newsEnabled', () => {
     // see the fatal-when-unconfigured test below.
     expect(newsEnabled(configWith({ rss: { enabled: true, feeds: [] } }))).toBe(true);
     expect(newsEnabled(configWith({}))).toBe(false);
+  });
+});
+
+describe('imagedirVisionError', () => {
+  const visionProvider = { id: 'openai', model: 'gpt-x', supportsVision: true } as AiProvider;
+  const textOnlyProvider = { id: 'openai', model: 'text-only-x', supportsVision: false } as AiProvider;
+
+  it('is null when imagedir is disabled, regardless of the model', () => {
+    expect(imagedirVisionError(configWith({}), textOnlyProvider)).toBeNull();
+  });
+
+  it('is null when imagedir is enabled and the model supports vision', () => {
+    expect(imagedirVisionError(configWith({ imagedir: { enabled: true } }), visionProvider)).toBeNull();
+  });
+
+  it('names the offending model when imagedir is enabled on a text-only model', () => {
+    const message = imagedirVisionError(configWith({ imagedir: { enabled: true } }), textOnlyProvider);
+    expect(message).not.toBeNull();
+    expect(message).toContain('text-only-x');
+    expect(message).toContain('cannot accept images');
   });
 });
 
@@ -125,7 +152,11 @@ describe('news module preflight', () => {
       configWith({ imagedir: { enabled: true, directories: ['/tmp/pics'] } }),
     );
     const deps = depsWith({
-      provider: { id: 'openai', model: 'text-only-x', supportsVision: false } as NewsDeps['provider'],
+      provider: (() => ({
+        id: 'openai',
+        model: 'text-only-x',
+        supportsVision: false,
+      })) as NewsDeps['provider'],
     });
     const failure = await createNewsModule(deps).preflight!(ctx);
     expect(failure!.message).toContain('cannot accept images');
@@ -151,6 +182,25 @@ describe('news module preflight', () => {
     await createNewsModule(depsWith()).preflight!(ctx);
     expect((ctx.publisher as unknown as { health: ReturnType<typeof vi.fn> }).health)
       .not.toHaveBeenCalled();
+  });
+
+  it('reads deps.provider() fresh on every call — a live provider swap is observed without recreating the module', async () => {
+    // Regression guard for the ai.* hot-reload path: `deps.provider` is a
+    // function precisely so a reconfigure hook rebuilding the provider (see
+    // index.ts's rebuildAiProvider) takes effect on the module's NEXT run,
+    // not only for a module built fresh after a restart.
+    let current: AiProvider = { id: 'openai', model: 'gpt-x', supportsVision: true } as AiProvider;
+    const { ctx } = ctxWith(
+      configWith({ imagedir: { enabled: true, directories: ['/tmp/pics'] } }),
+    );
+    const mod = createNewsModule(depsWith({ provider: () => current }));
+
+    expect(await mod.preflight!(ctx)).toBeNull();
+
+    current = { id: 'openai', model: 'text-only-x', supportsVision: false } as AiProvider;
+    const failure = await mod.preflight!(ctx);
+    expect(failure).not.toBeNull();
+    expect(failure!.message).toContain('text-only-x');
   });
 });
 
