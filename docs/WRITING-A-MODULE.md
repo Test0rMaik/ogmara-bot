@@ -22,16 +22,31 @@ One interface, in [`src/modules/types.ts`](../src/modules/types.ts):
 export interface BotModule {
   readonly name: string;
   readonly schemas: Readonly<Record<string, ZodTypeAny>>;
+  readonly uiSchema?: Readonly<Record<string, UiField>>;
   isEnabled(config: Config): boolean;
   preflight?(ctx: BotContext): Promise<PreflightFailure | null>;
   runOnce?(ctx: BotContext): Promise<void>;
   start(ctx: BotContext): Promise<ModuleHandle>;
+  reconfigure?(ctx: BotContext): Promise<void>;
 }
 ```
 
 A module declares **everything about itself in one place**: its config section
 *and* the schema for it, whether it's on, what must be true before the bot can
 start with it on, and how to run.
+
+`uiSchema` is optional presentation metadata, keyed by dotted config path
+(`widget.schedule`) — a label, help text, and whether the field applies live
+or needs a restart. A field with no entry still works (a humanised label,
+assumed restart-required); add an entry once you want a better label or once
+a field genuinely applies without one.
+
+**A field defaults to restart-required until you prove otherwise.** Adding
+`restart: false` to `uiSchema` is a promise, not a description — it means
+either the field is read fresh off `ctx.config` on every use (nothing further
+to do), or you've implemented `reconfigure` (below) to actually apply it live.
+Never flip the flag first and wire the behavior later; the settings page will
+tell the operator their change took effect immediately when it did not.
 
 That last point is why `schemas` exists rather than the config file declaring
 everything centrally. Because a module owns its schema, the operator settings
@@ -140,3 +155,43 @@ it can only do that if it can see your crons.
 same forceful kill. One module throwing on stop does not prevent the others
 stopping; a shutdown that gives up halfway leaves a cron alive, and a "stopped"
 bot whose cron survived keeps posting.
+
+## Going live: `reconfigure` (optional)
+
+Every field starts restart-required — reasonable default, no work needed. Some
+fields are worth more: an operator changing a schedule or a limit without
+SSHing in to restart. That's `reconfigure`, called on your ALREADY-RUNNING
+module whenever a field your `uiSchema` marks `restart: false` actually
+changes.
+
+**It must re-derive everything it touches from `ctx.config`, fresh** — the
+same way `preflight`/`start` already do — never accept a diff or assume what
+changed. Two things the caller does *not* guard for you, because only the
+module knows what "safe" means for its own state:
+
+- **No-op if you were never started.** `isEnabled` could have been `false` at
+  boot; `reconfigure` still gets called (the caller has no cheap way to know
+  otherwise), so check your own "am I running" flag first.
+- **No-op — or queue — if a previous call is still in flight.** Two saves
+  close together must not race. If your `reconfigure` has no `await` in it at
+  all (rebuilding in-memory state only, no network calls), this is free: two
+  synchronous calls literally cannot interleave. The moment you add an
+  `await`, add a reentrancy guard too — see `commands/index.ts`'s
+  `reconfiguring` flag.
+
+**If you manage a dynamic set of jobs** (one source can be switched on or off
+live, not just rescheduled), the array on your `ModuleHandle` must be mutated
+in place — `jobs.push(...)`/`jobs.splice(...)`, never `jobs = [...]` — because
+the *same* array object is what the `ModuleHandle` you already returned from
+`start()` still points to. Replacing it silently orphans whatever the core
+already holds.
+
+Two real, audited examples worth reading before writing your own:
+`commands/index.ts`'s `reconfigure` (awaits real network calls, needs the
+reentrancy guard, validates before committing so an invalid change can't take
+effect) and `news.ts`'s (fully synchronous, needs the in-place job-array
+mutation because sources can be switched on/off live). Both were shipped only
+after a security/code audit caught a real bug in the first version — a
+rejected change that still took effect, and a race between a shutdown and an
+in-flight save — so treat "small, self-contained function" as a trap, not a
+reassurance.

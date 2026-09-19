@@ -5,6 +5,19 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.1] - 2026-09-19
+
+### Changed
+
+- **`docs/WRITING-A-MODULE.md` updated for the `uiSchema`/`reconfigure`
+  contract members added during the hot-reload work (0.33.0–0.37.0)** —
+  the interface snippet and prose still showed the pre-hot-reload
+  `BotModule` shape, silently telling a new module author that a field
+  is restart-required by default with no path to make it live. Caught
+  while writing an "extend ogmara-bot with your own module" section for
+  the website's upcoming bot-authoring page, which was about to link to
+  this doc as the canonical guide.
+
 ## [0.38.0] - 2026-09-16
 
 `node.network` was presented as a free-choice dropdown (testnet/mainnet),
