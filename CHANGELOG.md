@@ -5,6 +5,135 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-09-25
+
+Interactive-message-buttons plan, Phase 6 (worked example). Requires
+`@ogmara/sdk` 0.62.0+ and l2-node 0.133.0+ (encrypted-`ChatEdit` support).
+
+### Added
+
+- **`/c <symbol> [15m|30m|1h|4h|1d]`** — price and approximate windowed
+  change for a KDA token (`api.bitcoin.me/tokens`, memory
+  `reference_bitcoin_me.md`; keyless, 5-minute shared cache, concurrent
+  lookups coalesced into one fetch). The worked example itself: the reply
+  carries a `[15m][30m][1h][4h][1d]` button row, and pressing one **edits
+  the same message** with the new timeframe rather than posting a fresh
+  reply every time — the in-place-menu-edit pattern (protocol §3.7, §2.6).
+  Honest about the feed's own resolution: `sparkline7d` is ~168 HOURLY
+  points, so 15m/30m show the latest price with an explicit note that
+  sub-hourly change isn't computable from this feed, rather than
+  fabricating a number. New `src/modules/commands/prices.ts`.
+- **`CommandHandler.run()` may now return `{ text, buttons? }`** (still
+  accepts a plain `string`, so every existing handler is unaffected) —
+  `CommandsDeps.reply` gained an optional trailing `buttons` parameter,
+  and a new `CommandsDeps.editReply(channelId, msgId, text, buttons?)`
+  edits a message this wallet previously posted, returning `false` (never
+  throwing) on any failure so the caller can decide how to recover.
+- **Button-press dispatch**: `index.ts`'s `handleMessage` checks the
+  incoming message's `viaButton`/`replyTo` (newly exposed by
+  `payload.ts`'s `decodeChatPayload`) and, when authorized (see Security
+  below), EDITS `replyTo` in place (`sendEdit`) instead of posting a new
+  message (`send`). `sendEdit` falls back to a fresh reply if the edit
+  fails (expired 30-minute window, or any other node/network error).
+- `channelKeys.ts` gained `encryptedEditEnvelope()`, mirroring
+  `encryptedReplyEnvelope()`'s cache-only-key / fresh-epoch-floor-check
+  shape, built on sdk-js's new `buildEncryptedChannelEdit`.
+- `config.example.yaml` documents the new command.
+
+No new rate-limit code — button-triggered invocations are ordinary command
+invocations and already flow through the existing per-wallet/global token
+bucket (§7.2); `/c`'s cost is 1 regardless of press count, since the
+upstream price fetch is shared and cached across every invocation.
+
+### Security
+
+Found by a code/security audit BEFORE this version's first commit (this
+feature was never shipped in the vulnerable shape).
+
+- **Any wallet could rewrite any recent chat message this bot posted,
+  including cross-channel, by forging `via_button`/`reply_to` on an
+  unrelated command (BLOCKING).** The first version of the dispatch above
+  routed to `sendEdit` whenever an incoming message merely SET
+  `via_button: true` and a `reply_to` — both fields are attacker-controlled
+  (any wallet can set them on any message it sends; protocol §3.3 is
+  explicit that neither is a security boundary) — and trusted the node's
+  own `authorize_edit_delete` as "the real gate." That check only verifies
+  the CALLER's wallet matches the TARGET's author; since the target is
+  always this bot's own message once via_button routing fires at all (any
+  edit attempt is signed by this bot's own wallet), authorship trivially
+  passes regardless of whether the target ever carried a button row. It
+  also never verifies the target's channel matches the one the press
+  arrived in (l2-node's own `resolve_chat_channel_id` documents this gap
+  against itself). Concretely: `/about` (or any declared command) addressed
+  to the bot with a crafted `reply_to` naming ANY recent bot message — a
+  plain-text reply to a different user, say — got silently overwritten
+  with the `/about` handler's output, under this bot's Bot-badged, funded
+  wallet identity. Cross-channel was worse: a press in channel A naming a
+  bot message in channel B edited the message in B, and for two ENCRYPTED
+  channels, encrypted the replacement under channel A's key/epoch and
+  stored it as B's message — permanently undecryptable for every member of
+  B. Fixed with a new bounded `buttonMessageChannels: Map<msgId,
+  channelId>`, populated only when `send` actually posts a reply carrying
+  `buttons`; a press now routes to `sendEdit` only when `replyTo` is a
+  KNOWN entry in that map AND its recorded channel matches the incoming
+  message's own channel. `CommandsDeps.reply` now returns the sent
+  message's `msg_id` so `send`/`sendEdit`'s fallback path can record it.
+  4 new tests reproduce the untracked-target and cross-channel cases.
+- **A price-feed ticker reached a bot-signed reply and a button's literal
+  `command` string with no sanitization or length bound (BLOCKING).**
+  `/c`'s success path used `api.bitcoin.me/tokens`' `tokenInAbbr` verbatim
+  — the exact asymmetry `safeEcho` (used on the miss path) exists to
+  prevent: clients auto-link URLs and render `@klv1…`/`#tag` as clickable
+  mentions/search links, and this bot is the highest-trust poster in a
+  channel. A crafted or malformed feed entry could carry `@`/`#`/URL-shaped
+  text into a signed reply, or (with no length cap) overflow
+  l2-node's `MAX_BUTTON_COMMAND` (256 bytes) — silently killing the whole
+  reply AFTER its quota slot was already spent. Fixed in `prices.ts`: a
+  `tokenInAbbr` not matching `^[A-Za-z0-9]{1,16}$` is now dropped BEFORE it
+  ever enters the cache, rather than sanitized on the way out — the same
+  value has to survive round-tripping through a button's `command` too,
+  which has no escaping mechanism. 2 new tests.
+- **`sendEdit`'s fallback under-counted the node budget (WARNING).** A
+  failed edit followed by its fallback reply are two real requests that
+  reach the node, but only one budget slot was charged — contradicting
+  `send`'s own documented invariant ("a request that reached the node
+  counts against it whether or not we liked the response") and letting a
+  losing 30-minute-window race drive roughly double the request rate the
+  budget believes it caps. Fixed: the fallback now consumes its own slot,
+  and is dropped (with the existing budget-exhausted warning) rather than
+  sent unaccounted if none remains.
+
+**Deferred, with reason**: `channelKeys.ts`'s `encryptedReplyEnvelope`/
+`encryptedEditEnvelope` return `null` for three DIFFERENT reasons (no
+cached key at all — "not encrypted"; a `getChannel` failure — "cannot
+verify, refuse to send"; the cached epoch below the channel's rotation
+floor — "refuse, key is stale") and `index.ts`'s `reply`/`editReply` cannot
+tell them apart, so both refuse-to-send cases are currently treated the
+same as "not encrypted" and silently fall through to a PLAINTEXT send —
+in an operator's "legacy" channel (content genuinely encrypted but missing
+the `encryption_enabled` metadata flag `check_channel_encryption_required`
+keys off), this degrades a "refuse" into a real cleartext post. This bug
+predates this version (`encryptedReplyEnvelope`/`reply` already had it);
+`encryptedEditEnvelope`/`editReply` duplicate the same conflation rather
+than introducing a new one. Not fixed here: closing it needs a
+discriminated return (`'encrypted' | 'plaintext' | 'refuse'`) threaded
+through both reply AND edit paths plus their call sites — real, separate
+scope — and, unlike the two BLOCKING findings above, this needs an unusual
+OPERATOR-side channel-metadata state to trigger, not anything an attacker
+can force on demand. Tracked as a follow-up.
+
+`npm run lint` clean, `npm test` 1079/1079 passing (23 new: 9
+`prices.test.ts`, 5 `payload.test.ts`, 9 `index.test.ts`), `npm audit`
+0 vulnerabilities. Three rounds of Code Audit + Security Audit ran before
+this version's first commit — the security-fix round above is the first
+round's own findings; the second round re-verified the fix with no bypass
+found and added a handful of NOTE-level polish (validating the bot's own
+`msg_id` before using it as a map key, matching a guard this file already
+applies to every other node-supplied id; two additional regression tests
+pinning exactly what the fix's own first-draft tests could not — the
+budget-fallback accounting, and that a buttonless reply's `msg_id` is
+genuinely never recorded, not just untested).
+
 ## [0.38.1] - 2026-09-19
 
 ### Changed

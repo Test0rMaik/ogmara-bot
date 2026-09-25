@@ -56,7 +56,8 @@ const publicChannel: ChannelFacts = { name: 'general', encrypted: false, canPost
 
 function depsWith(over: Partial<CommandsDeps> = {}): CommandsDeps {
   return {
-    reply: vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {}),
+    reply: vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' })),
+    editReply: vi.fn(async (_channelId: number, _msgId: string, _text: string) => true),
     subscribeChannels: vi.fn(async () => () => {}),
     describeChannel: vi.fn(async () => publicChannel),
     publishDescriptor: vi.fn(async () => {}),
@@ -94,9 +95,18 @@ function msg(
     mentions?: string[];
     msgType?: number | string;
     msgId?: string;
+    /** Button-press signal (protocol §3.7) — see `payload.ts`'s `viaButton`/`replyTo`. */
+    viaButton?: boolean;
+    /** Hex msg_id of the message the button row was displayed on; encoded as raw 32 bytes, matching the real wire shape. */
+    replyTo?: string;
   } = {},
 ): Envelope {
-  const payload = encode({ content, mentions: opts.mentions ?? [] });
+  const payload = encode({
+    content,
+    mentions: opts.mentions ?? [],
+    ...(opts.viaButton !== undefined && { via_button: opts.viaButton }),
+    ...(opts.replyTo !== undefined && { reply_to: Buffer.from(opts.replyTo, 'hex') }),
+  });
   msgSeq += 1;
   return {
     author: opts.from ?? 'klv1user',
@@ -562,7 +572,7 @@ describe('commands module reconfigure', () => {
     });
     const config = configWith(cfg);
     const ctx = ctxWith(config);
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, mod } = await startAndCapture(depsWith({ reply }), ctx);
 
     // Simulate commit()'s applyConfigInPlace: REASSIGN (not mutate) the
@@ -684,7 +694,7 @@ describe('commands module auto-join', () => {
     // answerInvitedChannels defaults to true: inviting the bot should be
     // enough by itself, with no separate operator step, for it to actually
     // become usable in that channel — not just a member.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '99',
@@ -704,7 +714,7 @@ describe('commands module auto-join', () => {
 
   it('does NOT auto-answer an invited channel when answerInvitedChannels is false', async () => {
     // The opt-out: still joins (membership), never answers.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const joinChannel = vi.fn(async (_id: number) => {});
     const notification: Notification = {
       type: 'channel_invite',
@@ -725,7 +735,7 @@ describe('commands module auto-join', () => {
   });
 
   it('stops auto-answering new invites once maxAutoAnsweredChannels is reached', async () => {
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const notifications: Notification[] = [
       { type: 'channel_invite', channel_id: '98', from: 'klv1a', timestamp: 1000 },
       { type: 'channel_invite', channel_id: '99', from: 'klv1b', timestamp: 2000 },
@@ -749,7 +759,7 @@ describe('commands module auto-join', () => {
   });
 
   it('an auto-answer grant survives a restart, without a fresh invite', async () => {
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '99',
@@ -793,7 +803,7 @@ describe('commands module auto-join', () => {
     );
     await first.stop();
 
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const noNewInvites = vi.fn(async (_since?: number) => []);
     const second = await startAndCapture(
       depsWith({ reply, getNotifications: noNewInvites }),
@@ -829,7 +839,7 @@ describe('commands module auto-join', () => {
     );
     await paused.stop();
 
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const resumed = await startAndCapture(
       depsWith({ reply, getNotifications: noNewInvites }),
       ctxWith(configWith(cfgWithAutoJoin())),
@@ -857,7 +867,7 @@ describe('commands module auto-join', () => {
     );
     await first.stop();
 
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const noNewInvites = vi.fn(async (_since?: number) => []);
     const second = await startAndCapture(
       depsWith({ reply, getNotifications: noNewInvites }),
@@ -894,7 +904,7 @@ describe('commands module auto-join', () => {
     // Second run: the channel has since become invisible (deleted, or this
     // wallet's membership/visibility was lost) — describeChannel now
     // returns null for it. No new invites this poll.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts | null> =>
       id === 99 ? null : publicChannel,
     );
@@ -995,7 +1005,7 @@ describe('commands module auto-join', () => {
 
     // Second run: metadata STILL says unencrypted (the attack's whole
     // point), and it never decrypts anything this run either.
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
     const noNewInvites = vi.fn(async (_since?: number) => []);
     const second = await startAndCapture(
       depsWith({ reply, getNotifications: noNewInvites, decryptChannelText }),
@@ -1021,7 +1031,7 @@ describe('commands module auto-join', () => {
     const first = await startAndCapture(depsWith({ getNotifications }), ctxWith(configWith(cfgWithAutoJoin())));
     await first.stop();
 
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts | 'unreachable'> =>
       id === 99 ? 'unreachable' : publicChannel,
     );
@@ -1467,7 +1477,7 @@ describe('commands module auto-join', () => {
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
     const decryptChannelText = vi.fn<CommandsDeps['decryptChannelText']>(async () => 'waiting');
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(
       depsWith({ getNotifications, decryptChannelText, reply }),
       ctxWith(configWith(cfgWithAutoJoin())),
@@ -1508,7 +1518,7 @@ describe('commands module auto-join', () => {
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
     const decryptChannelText = vi.fn(async () => 'error' as const);
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(
       depsWith({ getNotifications, decryptChannelText, reply }),
       ctxWith(configWith(cfgWithAutoJoin())),
@@ -1544,7 +1554,7 @@ describe('commands module auto-join', () => {
     const decryptChannelText = vi.fn<CommandsDeps['decryptChannelText']>(async () => {
       throw new Error('API error (500): node hiccup');
     });
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(
       depsWith({ getNotifications, decryptChannelText, reply }),
       ctxWith(configWith(cfgWithAutoJoin())),
@@ -1603,7 +1613,7 @@ describe('commands module auto-join', () => {
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
     const decryptChannelText = vi.fn(async () => ({ text: '/about' }));
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(
       depsWith({
         getNotifications,
@@ -1649,7 +1659,7 @@ describe('commands module auto-join', () => {
       id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
     );
     const decryptChannelText = vi.fn(async () => ({ text: '/about' }));
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(
       depsWith({
         getNotifications,
@@ -1672,7 +1682,7 @@ describe('commands module auto-join', () => {
   });
 
   it('does NOT revoke anything for an ordinary empty/blank message — only a genuinely encrypted one', async () => {
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '99',
@@ -1709,7 +1719,7 @@ describe('commands module message handling', () => {
   });
 
   it('answers an addressed command', async () => {
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/about', { mentions: ['klv1bot'] }));
     await settle();
@@ -1721,7 +1731,7 @@ describe('commands module message handling', () => {
   it('never answers its OWN messages', async () => {
     // Without this a reply that itself begins with "/" loops forever, with the
     // bot spending its own wallet quota on every iteration.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/about', { from: 'klv1bot', mentions: ['klv1bot'] }));
     await settle();
@@ -1733,7 +1743,7 @@ describe('commands module message handling', () => {
     // A bare `/foo` with no handle and no mentions is "addressed" for EVERY bot
     // in the channel — none can tell it was meant for another — so replying
     // "unknown command" makes a three-bot channel answer every typo three times.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/nosuchthing', { mentions: ['klv1bot'] }));
     await settle();
@@ -1742,7 +1752,7 @@ describe('commands module message handling', () => {
   });
 
   it('ignores ordinary chat', async () => {
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('just talking about /about really'));
     await settle();
@@ -1754,7 +1764,7 @@ describe('commands module message handling', () => {
     // Second lock behind the scoped subscription: a shared socket or a
     // reconnect re-subscribing from stale state would otherwise have the bot
     // answering — and spending quota — somewhere the operator never listed.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/about', { channel: 999, mentions: ['klv1bot'] }));
     await settle();
@@ -1766,7 +1776,7 @@ describe('commands module message handling', () => {
     // The SDK lowercases the command token only, never the arguments —
     // lowercasing a ticker or a topic sends the bot looking up a different
     // thing. `/topic Klever` must reach the handler as "Klever".
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const config = configWith(
       botSchema.parse({
         enabled: true,
@@ -1789,7 +1799,7 @@ describe('commands module message handling', () => {
     // Closing the socket does not un-dispatch a message already handed to the
     // callback, and handling is async. Without the guard a module that has been
     // stopped still spends the wallet's quota after shutdown was reported.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/about', { mentions: ['klv1bot'] }));
     await stop();
@@ -1802,7 +1812,7 @@ describe('commands module message handling', () => {
     // type, and an edit payload carries the full replacement text. Without a
     // type check, a user can edit one message in a loop and draw a fresh reply —
     // and a fresh quota slot — every time.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/about', { mentions: ['klv1bot'], msgType: MessageType.ChatEdit }));
     await settle();
@@ -1814,7 +1824,7 @@ describe('commands module message handling', () => {
     // The envelope type says `msg_type: number`, but the node serialises the
     // Rust enum as its name. A numeric-only check passes every hand-built
     // fixture and rejects every live frame.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/about', { mentions: ['klv1bot'], msgType: 'ChatMessage' }));
     await settle();
@@ -1824,7 +1834,7 @@ describe('commands module message handling', () => {
 
   it('answers a re-delivered message only once', async () => {
     // A reconnect replays, and the same frame reaches every connection.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     for (let i = 0; i < 4; i += 1) {
       deliver(msg('/about', { mentions: ['klv1bot'], msgId: 'same-id' }));
@@ -1839,7 +1849,7 @@ describe('commands module message handling', () => {
     // the dispatch table. Otherwise an operator who omits `/topic` to keep their
     // topic list private still gets an exact-match oracle over it, one guess at
     // a time — and `/help` would lie about what the bot answers.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const onlyAbout = botCfg({ commands: [{ name: 'about', description: 'who I am' }] });
     const { deliver, stop } = await startAndCapture(
       depsWith({ reply }),
@@ -1861,7 +1871,7 @@ describe('commands module message handling', () => {
     // verified, funded wallet. Clients auto-link URLs and render @klv1… as a
     // clickable pill, so echoing raw input publishes an attacker's link under
     // the operator's identity — and the abuse reports land on the bot.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(
       msg('/topic @klv1victim verify at https://evil.example #urgent', { mentions: ['klv1bot'] }),
@@ -1880,7 +1890,7 @@ describe('commands module message handling', () => {
     // which renders as "1.") — so a letters-and-digits whitelist still admits
     // both invisible padding and a period-shaped glyph, which is most of what is
     // needed to make an echo read as a domain.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(depsWith({ reply }), ctxWith(configWith(cfg)));
     deliver(msg('/topic \u3164\u1160\u115F\uFFA0evil\u2488com', { mentions: ['klv1bot'] }));
     await settle();
@@ -1922,7 +1932,7 @@ describe('commands module message handling', () => {
     // dryRun is the safety catch that lets an operator test a config against a
     // live network. A command reply is a real post under the bot's real wallet,
     // so it is not exempt.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const { deliver, stop } = await startAndCapture(
       depsWith({ reply }),
       ctxWith(configWith(cfg, true)),
@@ -1936,7 +1946,7 @@ describe('commands module message handling', () => {
   it('stops replying once the wallet-quota share is spent', async () => {
     // Burst limit 20 x share 0.5 = 10 replies per 10-minute window; the rest of
     // the wallet's quota stays reserved for the news pipeline.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const config = configWith(
       botSchema.parse({
         enabled: true,
@@ -1958,7 +1968,7 @@ describe('commands module message handling', () => {
     // The throttle notice is itself a chat message and costs node quota, so it
     // goes through the same budget as a real reply — the amplifier trap in its
     // purest form.
-    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => {});
+    const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: 'mock-msg-id' }));
     const config = configWith(
       botSchema.parse({
         enabled: true,
@@ -1982,5 +1992,222 @@ describe('commands module message handling', () => {
     }
     expect(reply).toHaveBeenCalledTimes(1); // no notices squeezed past the budget
     await stop();
+  });
+
+  describe('button lifecycle (protocol §3.7, §2.6 in-place-menu-edit)', () => {
+    const cCfg = botCfg({ commands: [{ name: 'c', description: 'price', argsHint: '<symbol> [tf]' }] });
+    /** A handler returning both text and a button row, matching CommandReply. */
+    const cHandler = () =>
+      new Map([['c', { cost: 1, run: async () => ({ text: 'card text', buttons: [{ buttons: [{ label: '1h', command: '/c BTC 1h' }] }] }) }]]);
+
+    it('a FRESH invocation (no via_button) posts a new reply carrying the buttons', async () => {
+      const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
+      const editReply = vi.fn(async () => true);
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, editReply, handlersOverride: cHandler }),
+        ctxWith(configWith(cCfg)),
+      );
+      deliver(msg('/c BTC', { mentions: ['klv1bot'] }));
+      await settle();
+      expect(editReply).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledTimes(1);
+      expect(reply).toHaveBeenCalledWith(7, 'card text', ['klv1user'], [
+        { buttons: [{ label: '1h', command: '/c BTC 1h' }] },
+      ]);
+      await stop();
+    });
+
+    it('a PRESS (via_button + reply_to) EDITS the origin message instead of posting a new one', async () => {
+      // Security-audit regression guard: the edit is only authorized once
+      // this bot has itself recorded `originId` as a button-bearing message
+      // it posted IN THIS CHANNEL (`buttonMessageChannels`) — an
+      // arbitrary/unknown `reply_to` is NOT enough (see the next describe
+      // block, "reply_to that was never a button-bearing card"). So the
+      // origin card is posted for real first, and the press then names the
+      // msg_id `reply` actually returned for it.
+      const originId = 'ab'.repeat(32);
+      const reply = vi.fn(async () => ({ msgId: originId }));
+      const editReply = vi.fn(async () => true);
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, editReply, handlersOverride: cHandler }),
+        ctxWith(configWith(cCfg)),
+      );
+      deliver(msg('/c BTC', { mentions: ['klv1bot'] })); // posts the card, recording originId
+      await settle();
+      reply.mockClear();
+
+      deliver(msg('/c BTC 1h', { mentions: ['klv1bot'], viaButton: true, replyTo: originId }));
+      await settle();
+      expect(reply).not.toHaveBeenCalled();
+      expect(editReply).toHaveBeenCalledTimes(1);
+      expect(editReply).toHaveBeenCalledWith(7, originId, 'card text', [
+        { buttons: [{ label: '1h', command: '/c BTC 1h' }] },
+      ]);
+      await stop();
+    });
+
+    it('falls back to a fresh reply when the edit fails (expired window, or a node error)', async () => {
+      const originId = 'cd'.repeat(32);
+      const reply = vi.fn(async (_channelId: number, _text: string, _mentions: string[]) => ({ msgId: originId }));
+      const editReply = vi.fn(async () => false); // simulates a rejected edit
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, editReply, handlersOverride: cHandler }),
+        ctxWith(configWith(cCfg)),
+      );
+      deliver(msg('/c BTC', { mentions: ['klv1bot'] })); // posts the card, recording originId
+      await settle();
+      reply.mockClear();
+
+      deliver(msg('/c BTC 1h', { mentions: ['klv1bot'], viaButton: true, replyTo: originId }));
+      await settle();
+      expect(editReply).toHaveBeenCalledTimes(1);
+      expect(reply).toHaveBeenCalledTimes(1); // the fallback
+      expect(reply.mock.calls[0]![1]).toBe('card text');
+      await stop();
+    });
+
+    it('reply_to that was never a button-bearing card is NOT edited, even with via_button set (security audit, BLOCKING)', async () => {
+      // The exact attack the fix closes: an attacker addresses ANY declared
+      // command with via_button + a reply_to naming a message this bot
+      // posted for an unrelated reason (never recorded as button-bearing).
+      // Must fall through to an ordinary fresh reply, never an edit.
+      const someOtherMsgId = 'ef'.repeat(32);
+      const reply = vi.fn(async () => ({ msgId: 'unrelated-id' }));
+      const editReply = vi.fn(async () => true);
+      const { deliver, stop } = await startAndCapture(
+        depsWith({
+          reply,
+          editReply,
+          handlersOverride: () => new Map([['about', { cost: 1, run: async () => 'plain reply' }]]),
+        }),
+        ctxWith(configWith(botCfg({ commands: [{ name: 'about', description: 'who I am' }] }))),
+      );
+      deliver(msg('/about', { mentions: ['klv1bot'], viaButton: true, replyTo: someOtherMsgId }));
+      await settle();
+      expect(editReply).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledTimes(1);
+      await stop();
+    });
+
+    it('reply_to naming a card posted in a DIFFERENT channel is NOT edited (security audit, BLOCKING)', async () => {
+      // Closes the cross-channel half of the same finding: a card recorded
+      // for channel 7 must not be editable by a press claiming to arrive
+      // (with a matching reply_to) in a different channel's traffic.
+      const cardId = '11'.repeat(32);
+      const reply = vi.fn(async () => ({ msgId: cardId }));
+      const editReply = vi.fn(async () => true);
+      const multiChannelCfg = botCfg({
+        channels: [7, 8],
+        commands: [{ name: 'c', description: 'price', argsHint: '<symbol> [tf]' }],
+      });
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, editReply, handlersOverride: cHandler }),
+        ctxWith(configWith(multiChannelCfg)),
+      );
+      deliver(msg('/c BTC', { channel: 7, mentions: ['klv1bot'] })); // records cardId -> channel 7
+      await settle();
+      reply.mockClear();
+
+      // Same reply_to, but arriving on channel 8 — must not edit channel 7's card.
+      deliver(msg('/c BTC 1h', { channel: 8, mentions: ['klv1bot'], viaButton: true, replyTo: cardId }));
+      await settle();
+      expect(editReply).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledTimes(1);
+      await stop();
+    });
+
+    it('a BUTTONLESS reply is never recorded, so its own msg_id cannot later be used as an edit target (re-audit regression guard)', async () => {
+      // Pins the exact axis the first version of the cross-channel test
+      // could NOT pin (its forged replyTo never matched its mock's
+      // returned msgId): remove `send`'s `if (buttons !== undefined)`
+      // guard and this test fails while the other button-lifecycle tests
+      // stay green, since they always press against a message that WAS
+      // posted with buttons.
+      const plainReplyId = '22'.repeat(32);
+      const reply = vi.fn(async () => ({ msgId: plainReplyId }));
+      const editReply = vi.fn(async () => true);
+      const { deliver, stop } = await startAndCapture(
+        depsWith({
+          reply,
+          editReply,
+          handlersOverride: () => new Map([['about', { cost: 1, run: async () => 'plain reply, no buttons' }]]),
+        }),
+        ctxWith(configWith(botCfg({ commands: [{ name: 'about', description: 'who I am' }] }))),
+      );
+      deliver(msg('/about', { mentions: ['klv1bot'] })); // plain reply, never recorded
+      await settle();
+      reply.mockClear();
+
+      // Same channel, replyTo names the exact id just returned — still not
+      // an authorized edit target, because it never carried buttons.
+      deliver(msg('/about', { mentions: ['klv1bot'], viaButton: true, replyTo: plainReplyId }));
+      await settle();
+      expect(editReply).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledTimes(1);
+      await stop();
+    });
+
+    it('the failed-edit fallback is dropped (not sent unaccounted) once the budget is exhausted (re-audit regression guard)', async () => {
+      // Pins the second-consume() fix: with exactly 2 burst slots, posting
+      // the original card spends slot 1, and a failed edit attempt spends
+      // slot 2 — leaving none for the fallback reply, which must be
+      // dropped rather than sent for free.
+      const cardId = '33'.repeat(32);
+      const reply = vi.fn(async () => ({ msgId: cardId }));
+      const editReply = vi.fn(async () => false); // every edit attempt fails
+      const config = configWith(cCfg);
+      const rl = config.bot.rateLimit as { maxShareOfNodeBudget: number; perWalletShareOfBudget: number };
+      rl.maxShareOfNodeBudget = 0.1; // 20 * 0.1 = 2 total burst slots
+      // Both requests below come from the SAME wallet — without raising this
+      // too, the per-wallet share of that 2-slot budget floors to 1
+      // (max(1, floor(2 * default 0.25))) and blocks the second request
+      // before it ever reaches `sendEdit`, which would test the per-wallet
+      // limiter instead of the fix this test exists to pin.
+      rl.perWalletShareOfBudget = 1;
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, editReply, handlersOverride: cHandler }),
+        ctxWith(config),
+      );
+      deliver(msg('/c BTC', { mentions: ['klv1bot'] })); // slot 1/2 — posts + records the card
+      await settle();
+      expect(reply).toHaveBeenCalledTimes(1);
+      reply.mockClear();
+
+      deliver(msg('/c BTC 1h', { mentions: ['klv1bot'], viaButton: true, replyTo: cardId })); // slot 2/2 — edit attempt (fails)
+      await settle();
+      expect(editReply).toHaveBeenCalledTimes(1);
+      expect(reply).not.toHaveBeenCalled(); // fallback would be slot 3 — dropped, not sent free
+      await stop();
+    });
+
+    it('via_button WITHOUT a reply_to still posts fresh (no origin to edit)', async () => {
+      const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
+      const editReply = vi.fn(async () => true);
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, editReply, handlersOverride: cHandler }),
+        ctxWith(configWith(cCfg)),
+      );
+      deliver(msg('/c BTC 1h', { mentions: ['klv1bot'], viaButton: true }));
+      await settle();
+      expect(editReply).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledTimes(1);
+      await stop();
+    });
+
+    it('a plain string reply (no buttons) still reaches deps.reply with no trailing buttons argument', async () => {
+      // Regression guard: `send`/`sendEdit` must not pass a trailing
+      // `undefined` positionally when a handler returns no buttons — every
+      // pre-existing `toHaveBeenCalledWith(channelId, text, mentions)`
+      // assertion elsewhere in this file depends on that 3-argument shape.
+      const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));
+      const { deliver, stop } = await startAndCapture(
+        depsWith({ reply, handlersOverride: () => new Map([['about', { cost: 1, run: async () => 'plain text' }]]) }),
+        ctxWith(configWith(botCfg({ commands: [{ name: 'about', description: 'who I am' }] }))),
+      );
+      deliver(msg('/about', { mentions: ['klv1bot'] }));
+      await settle();
+      expect(reply).toHaveBeenCalledWith(7, 'plain text', ['klv1user']);
+      await stop();
+    });
   });
 });

@@ -15,6 +15,8 @@ describe('decodeChatPayload', () => {
       encContent: null,
       encNonce: null,
       keyEpoch: null,
+      viaButton: false,
+      replyTo: null,
     });
   });
 
@@ -30,6 +32,8 @@ describe('decodeChatPayload', () => {
       encContent: null,
       encNonce: null,
       keyEpoch: null,
+      viaButton: false,
+      replyTo: null,
     });
   });
 
@@ -138,6 +142,45 @@ describe('decodeChatPayload', () => {
       expect(out.encContent).toBeNull();
       expect(out.encNonce).toBeNull();
       expect(out.keyEpoch).toBeNull();
+    });
+  });
+
+  describe('viaButton / replyTo (button lifecycle, protocol §3.7)', () => {
+    it('reads via_button and a well-formed 32-byte reply_to', () => {
+      const replyTo = new Uint8Array(32).fill(0xab);
+      const out = decodeChatPayload(
+        wire({ content: '/c BTC 1h', mentions: [], via_button: true, reply_to: replyTo }),
+      );
+      expect(out.viaButton).toBe(true);
+      expect(out.replyTo).toBe('ab'.repeat(32));
+    });
+
+    it('defaults viaButton to false and replyTo to null when absent', () => {
+      const out = decodeChatPayload(wire({ content: '/about', mentions: [] }));
+      expect(out.viaButton).toBe(false);
+      expect(out.replyTo).toBeNull();
+    });
+
+    it('treats anything other than the literal boolean true as not-via-button', () => {
+      expect(decodeChatPayload(wire({ content: 'x', mentions: [], via_button: 1 })).viaButton).toBe(false);
+      expect(decodeChatPayload(wire({ content: 'x', mentions: [], via_button: 'true' })).viaButton).toBe(
+        false,
+      );
+    });
+
+    it('drops a reply_to that is not exactly 32 bytes', () => {
+      expect(
+        decodeChatPayload(wire({ content: 'x', mentions: [], reply_to: new Uint8Array(31) })).replyTo,
+      ).toBeNull();
+      expect(
+        decodeChatPayload(wire({ content: 'x', mentions: [], reply_to: new Uint8Array(33) })).replyTo,
+      ).toBeNull();
+    });
+
+    it('drops a non-binary reply_to rather than coercing it', () => {
+      expect(
+        decodeChatPayload(wire({ content: 'x', mentions: [], reply_to: 'not-bytes' })).replyTo,
+      ).toBeNull();
     });
   });
 

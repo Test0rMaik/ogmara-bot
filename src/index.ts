@@ -566,17 +566,42 @@ async function run(args: CliArgs): Promise<number> {
   let reconnectChannelSubscription: (() => void) | undefined;
 
   const commandsModule = createCommandsModule({
-      reply: async (channelId, text, mentions) => {
+      reply: async (channelId, text, mentions, buttons) => {
         // Encrypted first: a channel this bot has ever gotten a key for
         // always replies encrypted — silently plaintext-replying into a
         // channel it knows is encrypted would leak the reply to the node
         // (and to anyone who can read public traffic) in cleartext.
-        const envelope = await channelKeys.encryptedReplyEnvelope(channelId, text, mentions);
+        const envelope = await channelKeys.encryptedReplyEnvelope(channelId, text, mentions, buttons);
         if (envelope !== null) {
-          await publisher.client.sendMessageEnvelope(envelope);
-          return;
+          const { msg_id } = await publisher.client.sendMessageEnvelope(envelope);
+          return { msgId: msg_id };
         }
-        await publisher.client.sendMessage(channelId, text, { mentions });
+        const { msg_id } = await publisher.client.sendMessage(channelId, text, {
+          mentions,
+          ...(buttons !== undefined && { buttons }),
+        });
+        return { msgId: msg_id };
+      },
+      editReply: async (channelId, msgId, text, buttons) => {
+        // Same encrypted-first rule as `reply` above — a channel this bot
+        // has ever gotten a key for always edits encrypted.
+        try {
+          const envelope = await channelKeys.encryptedEditEnvelope(channelId, msgId, text, buttons);
+          if (envelope !== null) {
+            await publisher.client.sendMessageEnvelope(envelope);
+            return true;
+          }
+          await publisher.client.editMessage(channelId, msgId, text, {
+            ...(buttons !== undefined && { buttons }),
+          });
+          return true;
+        } catch {
+          // Expired edit window, msgId not this wallet's own message, or a
+          // node/network error — all ordinary, expected outcomes here (see
+          // `editReply`'s doc comment on `CommandsDeps`), not something to
+          // crash or log loudly for. The caller falls back to a fresh reply.
+          return false;
+        }
       },
       decryptChannelText: (channelId, encContent, encNonce, keyEpoch) =>
         channelKeys.decryptChannelMessage(channelId, encContent, encNonce, keyEpoch),

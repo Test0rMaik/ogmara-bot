@@ -17,7 +17,14 @@
  */
 
 import type { ZodTypeAny } from 'zod';
-import { MSG_TYPE_NAME, MessageType, parseCommand, type Envelope, type Notification } from '@ogmara/sdk';
+import {
+  MSG_TYPE_NAME,
+  MessageType,
+  parseCommand,
+  type ButtonRow,
+  type Envelope,
+  type Notification,
+} from '@ogmara/sdk';
 import { NODE_LIMITS, type Config } from '../../config.js';
 import { schedule, type ScheduledJob } from '../../scheduler.js';
 import type { BotContext, BotModule, ModuleHandle, ModuleJob, PreflightFailure } from '../types.js';
@@ -38,8 +45,36 @@ export interface ChannelFacts {
 
 /** Services the module needs that the core or another module owns. */
 export interface CommandsDeps {
-  /** Send a plain chat message. Routed through the shared posting path. */
-  readonly reply: (channelId: number, text: string, mentions: string[]) => Promise<void>;
+  /**
+   * Send a plain chat message. Routed through the shared posting path.
+   * `buttons` attaches a row (protocol §3.3) — omit for an ordinary reply.
+   * Returns the new message's `msg_id` — the caller (`send` in index.ts)
+   * uses it to record which messages THIS bot posted with buttons, the
+   * actual authorization gate for a later in-place edit of one (security
+   * audit, BLOCKING — see `buttonMessageChannels`'s doc comment).
+   */
+  readonly reply: (
+    channelId: number,
+    text: string,
+    mentions: string[],
+    buttons?: ButtonRow[],
+  ) => Promise<{ msgId: string }>;
+  /**
+   * Edit a message THIS bot's own wallet previously posted — the button
+   * lifecycle mechanism (protocol §3.7): a bot swaps a card's text/button
+   * row in place on a press rather than posting a new message every time.
+   * Returns `false` on any failure (expired edit window, `msgId` not
+   * actually this wallet's own message, a node/network error) rather than
+   * throwing — the caller decides how to recover (see `sendEdit` below),
+   * and "the edit didn't apply" is an ordinary, expected outcome here, not
+   * an exceptional one.
+   */
+  readonly editReply: (
+    channelId: number,
+    msgId: string,
+    text: string,
+    buttons?: ButtonRow[],
+  ) => Promise<boolean>;
   /** Subscribe to channel messages. Returns a close function. */
   readonly subscribeChannels: (
     channels: number[],
@@ -402,6 +437,32 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
   const answered = new Set<string>();
   /** Bound on `answered`; oldest entries are evicted first (insertion order). */
   const MAX_ANSWERED = 2048;
+  /**
+   * msg_id → channel_id of every message THIS bot posted carrying a button
+   * row, newest last (security audit, BLOCKING).
+   *
+   * `via_button`/`reply_to` are attacker-controlled — any wallet can set
+   * them on any message it sends (protocol §3.3; not a security boundary).
+   * The node's own authorship check on the resulting `ChatEdit` only
+   * verifies "does the caller's wallet match the TARGET's author" — it does
+   * NOT verify that the target actually carried a button row, and it does
+   * NOT verify the target's channel matches the one the press arrived in
+   * (`resolve_chat_channel_id`, l2-node router.rs, documents this against
+   * itself). Without this map, dispatching an edit for ANY `viaButton` +
+   * `replyTo` pair — regardless of command, regardless of whether this bot
+   * ever posted a button-bearing card at that id — let any wallet rewrite
+   * ANY recent message this bot posted (a plain `/about` reply, say) by
+   * addressing an unrelated command with a crafted `reply_to`, including
+   * one naming a message in a DIFFERENT channel: the edit would land there,
+   * and in an encrypted channel would additionally re-encrypt it under the
+   * WRONG channel's key/epoch, permanently corrupting it for every member.
+   * A press is now only routed to `sendEdit` when `replyTo` is a KNOWN
+   * entry here AND its recorded channel matches the incoming message's own
+   * channel — see `handleMessage`.
+   */
+  const buttonMessageChannels = new Map<string, number>();
+  /** Bound on `buttonMessageChannels`; oldest entries evicted first (insertion order). */
+  const MAX_BUTTON_MESSAGES = 2048;
   /** When the reply budget last blocked, so the log says it once, not per message. */
   let budgetWarnedAt = 0;
   /**
@@ -1336,12 +1397,60 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     // the command again, which arrives with a new id.
     if (msgId !== undefined) remember(msgId);
 
-    const text = await handler.run(parsed.args);
-    if (text === null) return;
-    await send(ctx, channelId, author, text, Date.now());
+    const result = await handler.run(parsed.args);
+    if (result === null) return;
+    const text = typeof result === 'string' ? result : result.text;
+    const buttons = typeof result === 'string' ? undefined : result.buttons;
+
+    // A press (viaButton + a reply_to pointing at the message the button
+    // row was displayed on) EDITS that message in place instead of posting
+    // a new one — the in-place-menu-edit worked example (protocol §3.7,
+    // §2.6). `sendEdit` itself falls back to a fresh reply if the edit
+    // fails (stale window, or a node/network error).
+    //
+    // SECURITY (audit, BLOCKING): `viaButton`/`replyTo` alone are NOT
+    // enough to authorize an edit — both are attacker-controlled, and the
+    // node's own authorship check does not verify the target actually
+    // carried a button row, nor that its channel matches this one. Only
+    // dispatch to `sendEdit` when `replyTo` is a message THIS bot recorded
+    // as button-bearing (`buttonMessageChannels`, populated by `send`
+    // below) AND that record's channel matches the channel the press
+    // arrived in — see the map's own doc comment for the full attack this
+    // closes.
+    const recordedChannel = decoded.viaButton && decoded.replyTo !== null
+      ? buttonMessageChannels.get(decoded.replyTo)
+      : undefined;
+    if (recordedChannel !== undefined && recordedChannel === channelId) {
+      await sendEdit(ctx, channelId, decoded.replyTo!, author, text, Date.now(), buttons);
+      return;
+    }
+    await send(ctx, channelId, author, text, Date.now(), buttons);
   }
 
-    /** Record an answered message id, evicting the oldest once the bound is hit. */
+  /**
+   * Record that THIS bot posted `msgId` (carrying a button row) in
+   * `channelId` — see `buttonMessageChannels`'s own doc comment for why
+   * this is the actual authorization gate for an in-place edit, not
+   * `viaButton`/`replyTo` alone.
+   */
+  function rememberButtonMessage(msgId: string, channelId: number): void {
+    // Same length guard `handleMessage` already applies to every other
+    // node-supplied id (`author`, `envelope.msg_id`) before retaining it —
+    // `sent.msgId` here comes from this bot's OWN POST response, so it is
+    // not hostile-input in the way an incoming envelope's fields are, but
+    // it is still node-supplied and unvalidated in shape; matching the
+    // existing guard keeps this map consistent with the file's own
+    // documented threat model rather than being the one unbounded-string
+    // key in it.
+    if (typeof msgId !== 'string' || msgId.length === 0 || msgId.length > MAX_ID_CHARS) return;
+    if (buttonMessageChannels.size >= MAX_BUTTON_MESSAGES) {
+      const oldest = buttonMessageChannels.keys().next();
+      if (!oldest.done) buttonMessageChannels.delete(oldest.value);
+    }
+    buttonMessageChannels.set(msgId, channelId);
+  }
+
+  /** Record an answered message id, evicting the oldest once the bound is hit. */
   function remember(msgId: string): void {
     if (answered.size >= MAX_ANSWERED) {
       // Set iteration is insertion order, so the first key is the oldest.
@@ -1420,6 +1529,7 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     to: string,
     text: string,
     now: number,
+    buttons?: ButtonRow[],
   ): Promise<void> {
     if (!running) return;
     // Consumed in dry run too. The budget is what stops handlers running
@@ -1445,6 +1555,82 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       ctx.log(`  [dry run] would reply in channel ${channelId}: ${forLog(text)}`);
       return;
     }
-    await deps.reply(channelId, text, [to]);
+    // Omit the trailing argument entirely rather than passing an explicit
+    // `undefined` — keeps `deps.reply`'s call shape for the common,
+    // buttonless case identical to before this feature existed.
+    const sent =
+      buttons !== undefined
+        ? await deps.reply(channelId, text, [to], buttons)
+        : await deps.reply(channelId, text, [to]);
+    // Record this as an editable card ONLY when it actually carries buttons
+    // — see `buttonMessageChannels`'s doc comment for why this is the real
+    // authorization gate for a future in-place edit of it.
+    if (buttons !== undefined) rememberButtonMessage(sent.msgId, channelId);
+  }
+
+  /**
+   * Edit a message THIS bot previously posted, in place — the button
+   * lifecycle mechanism's other half (protocol §3.7, §2.6): a bot swaps a
+   * card's text/buttons on press rather than posting a fresh reply every
+   * time. Callers only reach this function once `handleMessage` has already
+   * confirmed `msgId` is a message THIS bot recorded as button-bearing in
+   * THIS channel (`buttonMessageChannels`) — this is the real authorization
+   * gate; the node's own authorship check on the resulting `ChatEdit` is
+   * necessary but not sufficient on its own (see that map's doc comment).
+   *
+   * On failure — the edit window elapsed, or a node/network error — falls
+   * back to posting a fresh reply, so a stale target never means the
+   * invoker gets no answer at all. The fallback consumes its OWN budget
+   * slot (security audit, WARNING): the failed edit attempt and the
+   * fallback reply are each a real request that reached the node, so each
+   * spends the quota slot that models exactly that, matching `send`'s own
+   * documented invariant ("a request that reached the node counts against
+   * it whether or not we liked the response") — charging only one slot for
+   * two node requests would let a crafted press (any legitimate button
+   * press whose edit happens to lose the 30-minute race, not just a hostile
+   * one) drive roughly double the request rate the budget believes it caps.
+   */
+  async function sendEdit(
+    ctx: BotContext,
+    channelId: number,
+    msgId: string,
+    to: string,
+    text: string,
+    now: number,
+    buttons?: ButtonRow[],
+  ): Promise<void> {
+    if (!running) return;
+    if (!nodeBudget!.consume(now)) {
+      warnBudgetExhausted(ctx, now);
+      return;
+    }
+    if (ctx.config.posting.dryRun) {
+      ctx.log(`  [dry run] would edit message ${msgId} in channel ${channelId}: ${forLog(text)}`);
+      return;
+    }
+    const edited =
+      buttons !== undefined
+        ? await deps.editReply(channelId, msgId, text, buttons)
+        : await deps.editReply(channelId, msgId, text);
+    if (edited) return;
+
+    // Logged before the budget check but worded not to promise the fallback
+    // actually happens — `warnBudgetExhausted` below can still drop it
+    // (and its own 10-minute de-dup can suppress that second line), so a
+    // reader must not take "posting a fresh reply instead" as confirmation.
+    ctx.warn(
+      `  warning: could not edit message ${msgId} in channel ${channelId} (expired, or a node ` +
+        'error) — will try a fresh reply instead.',
+    );
+    const fallbackNow = Date.now();
+    if (!nodeBudget!.consume(fallbackNow)) {
+      warnBudgetExhausted(ctx, fallbackNow);
+      return;
+    }
+    const sent =
+      buttons !== undefined
+        ? await deps.reply(channelId, text, [to], buttons)
+        : await deps.reply(channelId, text, [to]);
+    if (buttons !== undefined) rememberButtonMessage(sent.msgId, channelId);
   }
 }

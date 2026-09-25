@@ -16,8 +16,11 @@ function configWith(topics: string[] = []): Config {
 const handlers = (topics: string[] = ['Klever']) =>
   buildHandlers(configWith(topics), botSchema.parse({ commands: [] }));
 
-const run = async (name: string, args: string[]): Promise<string> =>
-  (await handlers().get(name)!.run(args)) ?? '';
+const run = async (name: string, args: string[]): Promise<string> => {
+  const result = await handlers().get(name)!.run(args);
+  if (result === null) return '';
+  return typeof result === 'string' ? result : result.text;
+};
 
 describe('command handlers', () => {
   it('preserves argument CASE', async () => {

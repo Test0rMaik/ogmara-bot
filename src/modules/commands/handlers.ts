@@ -8,8 +8,20 @@
  * to be wrong — see the casing note on `/topic`.
  */
 
+import type { ButtonRow } from '@ogmara/sdk';
 import type { Config } from '../../config.js';
 import type { BotConfig } from './schema.js';
+import { lookupToken } from './prices.js';
+
+/**
+ * A reply carrying a button row (protocol §3.3/§3.7's worked example: `/c`'s
+ * timeframe row). Plain `string` remains valid for every handler that has no
+ * buttons — this is additive, not a breaking change to the interface.
+ */
+export interface CommandReply {
+  text: string;
+  buttons?: ButtonRow[];
+}
 
 export interface CommandHandler {
   /**
@@ -19,7 +31,7 @@ export interface CommandHandler {
    * SDK lowercases the command token only, never the arguments, because
    * lowercasing a ticker sends the bot looking up a different asset.
    */
-  run(args: readonly string[]): Promise<string | null>;
+  run(args: readonly string[]): Promise<string | CommandReply | null>;
   /**
    * Weight for rate limiting. A cheap lookup is not an AI call, and charging
    * them the same either throttles cheap commands needlessly or lets expensive
@@ -215,5 +227,111 @@ export function buildHandlers(config: Config, bot: BotConfig): Map<string, Comma
     },
   });
 
+  handlers.set('c', {
+    async run(args): Promise<string | CommandReply> {
+      const symbol = args[0];
+      if (symbol === undefined || symbol.trim().length === 0) {
+        return 'Usage: /c <symbol> [15m|30m|1h|4h|1d] — price and recent change for a KDA token.';
+      }
+      const tf = parseTimeframe(args[1]);
+
+      let quote: Awaited<ReturnType<typeof lookupToken>>;
+      try {
+        quote = await lookupToken(symbol);
+      } catch (err) {
+        // A feed outage or a malformed response — not the caller's fault,
+        // and not worth surfacing the raw error text (an upstream detail
+        // this bot's readers cannot act on) beyond "try again".
+        return clip(
+          `Could not fetch a price right now (${err instanceof Error ? err.message : 'unknown error'}). Try again shortly.`,
+        );
+      }
+      if (quote === null) {
+        // The echo goes through `safeEcho`, never raw — `symbol` is
+        // attacker-chosen text in a reply signed by the operator's wallet,
+        // same rule as `/topic` above.
+        const echo = safeEcho(symbol);
+        return echo.length === 0
+          ? 'That does not look like a token symbol.'
+          : clip(`I do not have a price for "${echo}".`);
+      }
+      return {
+        text: clip(priceCard(quote.symbol, quote.price, quote.sparkline, tf)),
+        // The button row's own `command` strings carry the feed's CANONICAL
+        // ticker (`quote.symbol`), never the caller's raw input — this is
+        // what makes a press safe to trust as "a real, known symbol" without
+        // re-validating it, and is a second, independent reason (beyond
+        // `safeEcho` above) the raw argument never reaches a signed message.
+        buttons: buildTimeframeButtons(quote.symbol),
+      };
+    },
+    // Cost 1: the upstream fetch is shared and 5-minute-cached across every
+    // invocation (`prices.ts`), so a burst of `/c` presses costs this bot at
+    // most one HTTP round trip per window, not one per press.
+    cost: 1,
+  });
+
   return handlers;
+}
+
+/** The button row's own labels — also the only accepted second `/c` argument. */
+const TIMEFRAMES = ['15m', '30m', '1h', '4h', '1d'] as const;
+type Timeframe = (typeof TIMEFRAMES)[number];
+
+function parseTimeframe(raw: string | undefined): Timeframe {
+  const lower = raw?.toLowerCase();
+  return (TIMEFRAMES as readonly string[]).includes(lower ?? '') ? (lower as Timeframe) : '1h';
+}
+
+/**
+ * Hourly-sparkline offset for a timeframe. `null` for 15m/30m: the feed's
+ * `sparkline7d` is ~168 HOURLY points (memory `reference_bitcoin_me.md`), so
+ * there is no real sub-hourly history to compute a genuine window change
+ * from — `priceCard` says so explicitly rather than fabricating a number
+ * from adjacent hourly points.
+ */
+const TIMEFRAME_HOURS: Record<Timeframe, number | null> = {
+  '15m': null,
+  '30m': null,
+  '1h': 1,
+  '4h': 4,
+  '1d': 24,
+};
+
+/**
+ * THIS is the in-place-menu-edit worked example (protocol §3.7, §2.6): the
+ * button's `command` is `/c <symbol> <tf>` — a literal, self-contained
+ * invocation, not an opaque token — so pressing any button re-runs this same
+ * handler with a different `args[1]`, and `index.ts`'s dispatch (not this
+ * file) is what turns that into an EDIT of the original card instead of a
+ * new post, using `decoded.viaButton`/`decoded.replyTo`.
+ */
+function buildTimeframeButtons(symbol: string): ButtonRow[] {
+  return [{ buttons: TIMEFRAMES.map((tf) => ({ label: tf, command: `/c ${symbol} ${tf}` })) }];
+}
+
+/**
+ * Format a price at a sensible number of significant digits — a fixed
+ * decimal count either truncates a sub-cent KDA price to "0.00" or pads a
+ * five-figure one with meaningless trailing zeros. `Number(...)` after
+ * `toPrecision` trims the trailing zeros/decimal point `toPrecision` itself
+ * would otherwise leave on a round number.
+ */
+function formatPrice(price: number): string {
+  return Number(price.toPrecision(price >= 1 ? 6 : 4)).toString();
+}
+
+function priceCard(symbol: string, price: number, sparkline: number[], tf: Timeframe): string {
+  const priceStr = formatPrice(price);
+  const hours = TIMEFRAME_HOURS[tf];
+  if (hours === null) {
+    return `${symbol} — $${priceStr} (${tf}: this feed only has ~1h resolution — showing latest price, no sub-hourly change)`;
+  }
+  const past = sparkline[sparkline.length - 1 - hours];
+  if (past === undefined || past <= 0) {
+    return `${symbol} — $${priceStr} (${tf}: not enough price history yet)`;
+  }
+  const changePct = ((price - past) / past) * 100;
+  const sign = changePct >= 0 ? '+' : '';
+  return `${symbol} — $${priceStr} (${tf}: ${sign}${changePct.toFixed(2)}%)`;
 }

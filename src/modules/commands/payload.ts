@@ -82,6 +82,23 @@ export interface ChatPayload {
   readonly encNonce: Uint8Array | null;
   /** The epoch the channel key must be at, present only when `encrypted` and well-formed. */
   readonly keyEpoch: number | null;
+  /**
+   * True when the sender's client set `via_button` — the button lifecycle
+   * mechanism's press signal (protocol §3.7). NOT a security boundary: any
+   * wallet can set this on an ordinary typed message too, so it is a
+   * rendering/UX hint only, never trusted for authorization.
+   */
+  readonly viaButton: boolean;
+  /**
+   * Hex-encoded `reply_to`, present only when well-formed (exactly 32
+   * bytes). For a button press this is the msg_id of the message the
+   * button row was displayed on — a bot combines it with `viaButton` to
+   * decide whether to EDIT that message in place rather than post a new
+   * one. Not proof of anything by itself: the node's own authorship check
+   * on the resulting edit is what actually gates whether this wallet may
+   * touch that message (see `channelKeys.ts`'s `encryptedEditEnvelope`).
+   */
+  readonly replyTo: string | null;
 }
 
 const EMPTY: ChatPayload = {
@@ -91,6 +108,8 @@ const EMPTY: ChatPayload = {
   encContent: null,
   encNonce: null,
   keyEpoch: null,
+  viaButton: false,
+  replyTo: null,
 };
 
 /**
@@ -163,7 +182,15 @@ export function decodeChatPayload(payload: unknown): ChatPayload {
         ? rawKeyEpoch
         : null;
 
-    return { content, mentions, encrypted, encContent, encNonce, keyEpoch };
+    const viaButton = obj['via_button'] === true;
+
+    const rawReplyTo = obj['reply_to'];
+    const replyTo =
+      rawReplyTo instanceof Uint8Array && rawReplyTo.length === 32
+        ? Buffer.from(rawReplyTo).toString('hex')
+        : null;
+
+    return { content, mentions, encrypted, encContent, encNonce, keyEpoch, viaButton, replyTo };
   } catch {
     return EMPTY;
   }

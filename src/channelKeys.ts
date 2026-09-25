@@ -30,6 +30,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   buildDeviceEncBinding,
+  buildEncryptedChannelEdit,
   buildEncryptedChannelMessage,
   computeChannelScope,
   decryptDmContent,
@@ -41,6 +42,7 @@ import {
   sealKeyVault,
   unwrapConvKey,
   VAULT_SIGN_CLAIM,
+  type ButtonRow,
   type OgmaraClient,
   type VaultKeyring,
   type WalletSigner,
@@ -469,6 +471,7 @@ export class ChannelKeyService {
     channelId: number,
     text: string,
     mentions: string[],
+    buttons?: ButtonRow[],
   ): Promise<Uint8Array | null> {
     const scopeHex = toHex(computeChannelScope(channelId));
     const resolved = this.#cachedLatest(scopeHex);
@@ -503,6 +506,70 @@ export class ChannelKeyService {
       epoch: resolved.epoch,
       text,
       mentions,
+      // See `encryptedEditEnvelope` below for why this is spread rather
+      // than passed directly under `exactOptionalPropertyTypes`.
+      ...(buttons !== undefined && { buttons }),
+    });
+  }
+
+  /**
+   * Build a signed, encrypted `ChatEdit` envelope against a message THIS
+   * wallet previously posted in `channelId` (e.g. an in-place button-row
+   * update — protocol §3.7's "button lifecycle mechanism", l2-node
+   * 0.133.0+). Same cache-only / floor-checked shape as
+   * {@link encryptedReplyEnvelope} — see its doc comment for why a cache
+   * miss means "not an encrypted channel" rather than "key not arrived
+   * yet", and why the epoch floor is re-checked fresh on every call rather
+   * than trusted from the cache.
+   *
+   * The node independently enforces that only the ORIGINAL author may edit
+   * a message and that an encrypted edit's shape must match its target's —
+   * this method does not (and cannot, without an extra fetch) verify
+   * `msgId` actually belongs to this wallet; an edit attempt against a
+   * message this wallet never posted simply comes back rejected, which the
+   * caller treats like any other failed send.
+   */
+  async encryptedEditEnvelope(
+    channelId: number,
+    msgId: string,
+    text: string,
+    buttons?: ButtonRow[],
+  ): Promise<Uint8Array | null> {
+    const scopeHex = toHex(computeChannelScope(channelId));
+    const resolved = this.#cachedLatest(scopeHex);
+    if (resolved === null) return null;
+
+    let floor: number;
+    try {
+      const { channel } = await this.#client.getChannel(channelId);
+      floor = channel.key_epoch_floor ?? 0;
+    } catch (err) {
+      this.#warn(
+        `  warning: could not verify channel ${channelId}'s key-epoch floor before editing ` +
+          `(${err instanceof Error ? err.message : String(err)}) — not sending this edit.`,
+      );
+      return null;
+    }
+    if (resolved.epoch < floor) {
+      this.#cache.delete(`${scopeHex}:${resolved.epoch}`);
+      this.#warn(
+        `  warning: channel ${channelId}'s key rotated past this bot's cached epoch ` +
+          `(${resolved.epoch} < floor ${floor}) — not editing until a member serves the new key.`,
+      );
+      return null;
+    }
+
+    return buildEncryptedChannelEdit(this.#signer, {
+      channelId,
+      msgId,
+      convKey: resolved.key,
+      epoch: resolved.epoch,
+      text,
+      // Spread rather than `buttons` directly: under `exactOptionalPropertyTypes`,
+      // passing `buttons: undefined` is NOT the same as omitting the key, and
+      // omitting it is what `buildEncryptedChannelEdit` relies on to mean "leave
+      // the button row unchanged" (vs. `[]`, which clears it).
+      ...(buttons !== undefined && { buttons }),
     });
   }
 }
