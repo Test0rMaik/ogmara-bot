@@ -643,6 +643,7 @@ async function run(args: CliArgs): Promise<number> {
             // which is precisely what this check exists to prevent.
             encrypted:
               channel.channel_type === CHANNEL_TYPE_PRIVATE || channel.encryption_enabled === true,
+            isPrivate: channel.channel_type === CHANNEL_TYPE_PRIVATE,
             // `isModerator: false` deliberately — the bot should be usable
             // without moderator rights, so preflight must pass on the weaker
             // assumption rather than one that could be revoked later.
@@ -662,11 +663,14 @@ async function run(args: CliArgs): Promise<number> {
       publishDescriptor: async (descriptor) => {
         await publisher.client.setBotCommands(descriptor);
       },
-      joinChannel: async (channelId) => {
-        await publisher.client.joinChannel(channelId);
+      // `options` passed through as-is: `{ invite }` for a Private channel
+      // join (l2-node 0.140.0+), `undefined` otherwise. The SDK pre-checks
+      // that an attached invite names this channel and this wallet.
+      joinChannel: async (channelId, options) => {
+        await publisher.client.joinChannel(channelId, options);
       },
-      federateChannel: async (channelId, hostUrl) => {
-        await publisher.client.federateChannel(channelId, hostUrl);
+      federateChannel: async (channelId, hostUrl, options) => {
+        await publisher.client.federateChannel(channelId, hostUrl, options);
       },
       getNotifications: async (since, limit, type) => {
         const { notifications } = await publisher.client.getNotifications(since, limit, type);

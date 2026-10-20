@@ -5,6 +5,92 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] - 2026-10-20
+
+Private-channel invite gate (spec 05 §8.4). Requires `@ogmara/sdk` 0.64.0+;
+the gate itself is enforced by l2-node 0.140.0+, which rejects a Private
+`ChannelJoin` (and answers `federate` with 403) unless it carries a signed
+invite naming this wallet.
+
+### Added
+
+- **The invite poller now carries the signed invite.** `channel_invite`
+  notifications from l2-node 0.140.0+ include `invite_envelope` (standard
+  base64 of the raw signed `ChannelInvite`) and `invite_expires_at`.
+  `extractChannelInvites` decodes the envelope strictly via the SDK's
+  `base64ToBytes` (a `null` and an absent key both normalize to "no
+  invite"; malformed, empty, oversized — input capped before decoding — or
+  an envelope for a different channel than the notification names are all
+  dropped), and the poller sends the same bytes to
+  `federateChannel(cid, host, { invite })` and
+  `joinChannel(cid, { invite })`.
+- Effective expiry is the signed envelope's own value, tightened to the
+  node's `invite_expires_at` hint when that is earlier (never loosened).
+- `ChannelFacts.isPrivate` (from `channel_type`), distinct from
+  `encrypted` — new Public/ReadPublic channels are encrypted too and need
+  no invite.
+
+### Changed
+
+- **A Private-channel invite that cannot be used is skipped, not sent to be
+  rejected:** no envelope (node older than 0.140.0, or malformed), or
+  expired by the client margin (`now >= expiresAt - 5 min`). Checked
+  before federating (privacy judged by the private id namespace, > 2^32,
+  while the channel is unknown locally) and again after describing it (its
+  own record decides). The skip is a warning line routed through `forLog`;
+  the envelope itself is never logged. The cursor advances past it as with
+  any other skipped invite — the inviter sends a fresh one.
+- Several invites to the same channel in one poll (a re-invite) collapse to
+  one attempt, ranked like spec 05 §8.4 and the SDK's `selectPendingInvite`:
+  a USABLE invite (not expired by the client margin) first, so a newer but
+  already-expired 1h re-invite never displaces an older still-valid 7d one;
+  then the NEWEST signed invite, later expiry only as a tie-break. Newest,
+  not longest-lived: after a kick, an older long-TTL invite is rejected by
+  the node's removal cutoff while a fresh short-TTL re-invite is valid.
+- **Transient invite failures are retried instead of consumed.** l2-node's
+  federate limits (10 attempts per wallet per 10 min, a global bucket, 8
+  concurrent fetches → 503 "federation busy") make 429/503 a normal answer;
+  previously ANY federate/join failure was logged as "skipping" and the
+  cursor advanced past it, losing the invite for good. Now failures are
+  classified: 429 → retry later AND no further federate/join in that poll
+  (limits are per wallet); 502/503/504 and network/timeout errors → retry
+  later; anything else (403 invite rejected / proof required, 400, 404, a
+  local SDK pre-check error) → skipped as before. A retried invite holds the
+  cursor just below its notification (never past it); invites already
+  settled above it are remembered in memory so the re-fetch does not join or
+  warn twice. Bounded: at most 5 attempts per invite (one per poll), and a
+  Private invite's own expiry margin ends retries sooner. A describe that
+  cannot reach the node is now retried the same way (it was "not retried").
+  After a restart the in-memory settled set is empty, so a re-fetched,
+  already-joined invite is joined once more (idempotent).
+- Only a Private join carries the invite. A public channel is joined
+  exactly as before, without one, even if the notification carried an
+  envelope — so a malformed or mis-targeted envelope cannot break a join
+  that needs no proof.
+- `CommandsDeps.joinChannel` / `federateChannel` gained an optional
+  `{ invite?: Uint8Array }` argument. The static `bot.channels` join loops
+  (start and reconfigure) are unchanged and send no invite: a channel this
+  wallet is already a member of is accepted idempotently by the node. A
+  Private channel listed in `bot.channels` that this wallet is NOT yet a
+  member of now fails to join (logged warning, as before for any failed
+  join) — invite the bot to it instead.
+
+### Known limitations
+
+- **`package-lock.json` must be regenerated after `@ogmara/sdk` 0.64.0 is
+  published:** `package.json` and the lock's root entry require `^0.64.0`,
+  but the resolved `node_modules/@ogmara/sdk` entry is still 0.62.0 (a
+  correct entry needs the published tarball's integrity). Run
+  `npm install @ogmara/sdk@^0.64.0`; until then `npm ci` (CI, Docker build)
+  fails with "lock out of sync".
+
+### Security
+
+- Dependency: `source-map-js` 1.2.1 → 1.2.2 (GHSA-68fv-2mgg-jv7q, high —
+  event-loop DoS via indexed source-map section offsets). **Dev/build tooling
+  only** (vitest → vite → postcss); not shipped in the bot. Lockfile-only
+  bump within postcss's existing `^1.2.1` range; `npm audit` now reports 0.
+
 ## [0.39.0] - 2026-09-25
 
 Interactive-message-buttons plan, Phase 6 (worked example). Requires

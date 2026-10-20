@@ -3,11 +3,238 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  INVITE_EXPIRY_MARGIN_MS,
+  WalletSigner,
+  buildInvite,
+  bytesToBase64,
+  decodeChannelInvite,
+} from '@ogmara/sdk';
+import {
+  bestInvitePerChannel,
+  classifyInviteFailure,
   extractChannelInvites,
+  inviteUsable,
+  isPrivateChannel,
   loadAutoJoinState,
   saveAutoJoinState,
+  type ChannelInviteNotice,
   type RawNotification,
 } from './autojoin.js';
+
+const PRIVATE_ID = 397276220293295;
+
+/** A real signed ChannelInvite envelope, as an inviter's client builds it. */
+async function makeInvite(channelId: number, expiresInMs = 24 * 3_600_000): Promise<Uint8Array> {
+  const inviter = await WalletSigner.generate();
+  inviter.network = 'testnet';
+  const bot = await WalletSigner.generate();
+  return buildInvite(inviter, channelId, bot.address, undefined, { expiresAt: Date.now() + expiresInMs });
+}
+
+function inviteNotification(channelId: number, over: Partial<RawNotification> = {}): RawNotification {
+  return { type: 'channel_invite', channel_id: String(channelId), from: 'klv1owner', timestamp: 1000, ...over };
+}
+
+describe('extractChannelInvites — invite envelope (private join gate)', () => {
+  it('leaves invite/inviteExpiresAt undefined when invite_envelope is ABSENT (older node)', () => {
+    const [n] = extractChannelInvites([inviteNotification(PRIVATE_ID)]).invites;
+    expect(n?.invite).toBeUndefined();
+    expect(n?.inviteExpiresAt).toBeUndefined();
+  });
+
+  it('normalizes a wire invite_envelope: null (and invite_expires_at: null) to undefined, not a crash', () => {
+    const [n] = extractChannelInvites([
+      inviteNotification(PRIVATE_ID, { invite_envelope: null, invite_expires_at: null }),
+    ]).invites;
+    expect(n).toBeDefined();
+    expect(n?.invite).toBeUndefined();
+    expect(n?.inviteExpiresAt).toBeUndefined();
+  });
+
+  it('decodes a PRESENT envelope from standard base64 to the exact signed bytes', async () => {
+    const bytes = await makeInvite(PRIVATE_ID);
+    const [n] = extractChannelInvites([
+      inviteNotification(PRIVATE_ID, { invite_envelope: bytesToBase64(bytes) }),
+    ]).invites;
+    expect(n?.invite).toEqual(bytes);
+    // No hint from the node: the signed envelope's own expiry is used.
+    expect(n?.inviteExpiresAt).toBe(decodeChannelInvite(bytes)?.expiresAt);
+    expect(n?.inviteSignedAt).toBe(decodeChannelInvite(bytes)?.timestamp);
+  });
+
+  it('keeps the signed expiry when invite_expires_at is null alongside a present envelope', async () => {
+    const bytes = await makeInvite(PRIVATE_ID);
+    const [n] = extractChannelInvites([
+      inviteNotification(PRIVATE_ID, { invite_envelope: bytesToBase64(bytes), invite_expires_at: null }),
+    ]).invites;
+    expect(n?.inviteExpiresAt).toBe(decodeChannelInvite(bytes)?.expiresAt);
+  });
+
+  it('tightens to the node hint when it is EARLIER than the signed expiry, never loosens', async () => {
+    const bytes = await makeInvite(PRIVATE_ID);
+    const signed = decodeChannelInvite(bytes)!.expiresAt;
+    const earlier = extractChannelInvites([
+      inviteNotification(PRIVATE_ID, { invite_envelope: bytesToBase64(bytes), invite_expires_at: signed - 1000 }),
+    ]).invites[0];
+    expect(earlier?.inviteExpiresAt).toBe(signed - 1000);
+    const later = extractChannelInvites([
+      inviteNotification(PRIVATE_ID, { invite_envelope: bytesToBase64(bytes), invite_expires_at: signed + 1000 }),
+    ]).invites[0];
+    expect(later?.inviteExpiresAt).toBe(signed);
+  });
+
+  it('drops a malformed, empty, oversized or non-string envelope without dropping the invite itself', async () => {
+    const notifications: RawNotification[] = [
+      inviteNotification(PRIVATE_ID, { invite_envelope: '!!!not base64!!!' }),
+      inviteNotification(PRIVATE_ID, { invite_envelope: '' }),
+      inviteNotification(PRIVATE_ID, { invite_envelope: 'A'.repeat(4000) }),
+      inviteNotification(PRIVATE_ID, { invite_envelope: 42 as unknown as string }),
+      // Valid base64, but not a ChannelInvite envelope at all.
+      inviteNotification(PRIVATE_ID, { invite_envelope: bytesToBase64(new Uint8Array([1, 2, 3, 4])) }),
+    ];
+    const { invites } = extractChannelInvites(notifications);
+    expect(invites).toHaveLength(5);
+    for (const n of invites) {
+      expect(n.invite).toBeUndefined();
+      expect(n.inviteExpiresAt).toBeUndefined();
+    }
+  });
+
+  it('drops an envelope that is an invite for a DIFFERENT channel than the notification names', async () => {
+    const bytes = await makeInvite(PRIVATE_ID + 1);
+    const [n] = extractChannelInvites([
+      inviteNotification(PRIVATE_ID, { invite_envelope: bytesToBase64(bytes) }),
+    ]).invites;
+    expect(n?.invite).toBeUndefined();
+  });
+});
+
+describe('inviteUsable', () => {
+  const notice = (inviteExpiresAt: number | undefined, invite?: Uint8Array): ChannelInviteNotice => ({
+    channelId: PRIVATE_ID,
+    channelName: undefined,
+    invitedBy: 'klv1owner',
+    timestamp: 1,
+    anchorNode: undefined,
+    invite,
+    inviteExpiresAt,
+    inviteSignedAt: invite !== undefined ? 1 : undefined,
+  });
+  const bytes = new Uint8Array([1]);
+
+  it('is false with no invite at all', () => {
+    expect(inviteUsable(notice(undefined), 0)).toBe(false);
+  });
+
+  it('applies the 5-minute client margin: usable just before, expired AT expiresAt - margin', () => {
+    const exp = 10_000_000;
+    expect(inviteUsable(notice(exp, bytes), exp - INVITE_EXPIRY_MARGIN_MS - 1)).toBe(true);
+    expect(inviteUsable(notice(exp, bytes), exp - INVITE_EXPIRY_MARGIN_MS)).toBe(false);
+    expect(inviteUsable(notice(exp, bytes), exp)).toBe(false);
+  });
+});
+
+describe('bestInvitePerChannel', () => {
+  const NOW = 0;
+  /** `signedAt`/`exp` given = carries an envelope; omitted = no envelope. */
+  const n = (channelId: number, timestamp: number, signedAt?: number, exp?: number): ChannelInviteNotice => ({
+    channelId,
+    channelName: undefined,
+    invitedBy: 'klv1owner',
+    timestamp,
+    anchorNode: undefined,
+    invite: signedAt !== undefined ? new Uint8Array([1]) : undefined,
+    inviteExpiresAt: signedAt !== undefined ? exp ?? signedAt + 1000 : undefined,
+    inviteSignedAt: signedAt,
+  });
+
+  it('keeps one invite per channel — the NEWEST signed invite — in first-seen order', () => {
+    const out = bestInvitePerChannel([n(5, 300, 100, 1000), n(9, 250), n(5, 200, 200, 900), n(5, 100)], NOW);
+    expect(out.map((x) => [x.channelId, x.inviteSignedAt])).toEqual([
+      [5, 200],
+      [9, undefined],
+    ]);
+  });
+
+  it('kick then re-invite: the newest invite wins even though it expires much sooner', () => {
+    // Old 14-day invite (pre-kick, now dead at the node via the removal
+    // cutoff) and a fresh 1-hour re-invite, in one poll.
+    const day = 86_400_000;
+    const old = n(5, 1000, 1_000_000, 1_000_000 + 14 * day);
+    const fresh = n(5, 2000, 5_000_000, 5_000_000 + 3_600_000);
+    expect(bestInvitePerChannel([old, fresh], NOW)[0]).toBe(fresh);
+    expect(bestInvitePerChannel([fresh, old], NOW)[0]).toBe(fresh);
+  });
+
+  it('a USABLE older invite beats a newer one that is already expired (SDK selectPendingInvite order)', () => {
+    const now = 100_000_000;
+    const olderValid7d = n(5, 1000, now - 3_600_000, now + 7 * 86_400_000);
+    // Newer re-invite, but only 1h TTL and signed long enough ago to be past
+    // expiresAt - 5 min.
+    const newerExpired = n(5, 2000, now - 3_000_000, now + 60_000);
+    expect(bestInvitePerChannel([olderValid7d, newerExpired], now)[0]).toBe(olderValid7d);
+    expect(bestInvitePerChannel([newerExpired, olderValid7d], now)[0]).toBe(olderValid7d);
+  });
+
+  it('an expired envelope still outranks no envelope at all (so the skip log names the expiry)', () => {
+    const expired = n(5, 100, 10, 20);
+    const none = n(5, 300);
+    expect(bestInvitePerChannel([none, expired], 1_000_000)[0]).toBe(expired);
+  });
+
+  it('breaks a signed-timestamp tie by the later expiry', () => {
+    const a = n(5, 1000, 500, 800);
+    const b = n(5, 900, 500, 1200);
+    expect(bestInvitePerChannel([a, b], NOW)[0]).toBe(b);
+    expect(bestInvitePerChannel([b, a], NOW)[0]).toBe(b);
+  });
+
+  it('prefers an invite WITH an envelope over a newer one without', () => {
+    const out = bestInvitePerChannel([n(5, 300), n(5, 100, 50, 1000)], NOW);
+    expect(out[0]?.inviteExpiresAt).toBe(1000);
+  });
+
+  it('among envelope-less invites keeps the newest notification', () => {
+    const out = bestInvitePerChannel([n(5, 100), n(5, 300)], NOW);
+    expect(out[0]?.timestamp).toBe(300);
+  });
+});
+
+describe('classifyInviteFailure', () => {
+  it('429 is rate-limited; 502/503/504 are transient; other statuses are permanent', () => {
+    expect(classifyInviteFailure(new Error('API error (429): slow down'))).toBe('rate-limited');
+    for (const s of [502, 503, 504]) expect(classifyInviteFailure(new Error(`API error (${s}): x`))).toBe('transient');
+    for (const s of [400, 403, 404, 500]) expect(classifyInviteFailure(new Error(`API error (${s}): x`))).toBe('permanent');
+  });
+
+  it('network and timeout errors are transient', () => {
+    expect(classifyInviteFailure(new TypeError('fetch failed'))).toBe('transient');
+    const abort = new Error('aborted');
+    abort.name = 'AbortError';
+    expect(classifyInviteFailure(abort)).toBe('transient');
+    const reset = Object.assign(new Error('socket'), { code: 'ECONNRESET' });
+    expect(classifyInviteFailure(reset)).toBe('transient');
+    expect(classifyInviteFailure(new Error('wrapped', { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toBe('transient');
+  });
+
+  it('local errors (SDK invite pre-check) and non-errors are permanent', () => {
+    expect(classifyInviteFailure(new Error('invite is addressed to a different account'))).toBe('permanent');
+    expect(classifyInviteFailure('boom')).toBe('permanent');
+  });
+});
+
+describe('isPrivateChannel', () => {
+  it('trusts a known record over the id namespace', () => {
+    expect(isPrivateChannel(99, true)).toBe(true);
+    expect(isPrivateChannel(PRIVATE_ID, false)).toBe(false);
+  });
+
+  it('falls back to the private id floor (2^32) for a channel not known locally', () => {
+    expect(isPrivateChannel(PRIVATE_ID, undefined)).toBe(true);
+    expect(isPrivateChannel(2 ** 32, undefined)).toBe(false);
+    expect(isPrivateChannel(99, undefined)).toBe(false);
+  });
+});
 
 describe('extractChannelInvites', () => {
   it('picks out channel_invite entries and ignores everything else', () => {

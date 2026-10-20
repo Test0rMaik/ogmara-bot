@@ -3,7 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { encode } from '@msgpack/msgpack';
-import { MessageType, type Envelope, type Notification } from '@ogmara/sdk';
+import {
+  MessageType,
+  WalletSigner,
+  buildInvite,
+  bytesToBase64,
+  type Envelope,
+  type Notification,
+} from '@ogmara/sdk';
 import type { Config } from '../../config.js';
 import type { BotContext } from '../types.js';
 import { botSchema, type BotConfig } from './schema.js';
@@ -52,7 +59,24 @@ function ctxWith(config: Config): BotContext {
   } as unknown as BotContext;
 }
 
-const publicChannel: ChannelFacts = { name: 'general', encrypted: false, canPost: true };
+const publicChannel: ChannelFacts = { name: 'general', encrypted: false, canPost: true, isPrivate: false };
+const privateChannel: ChannelFacts = { name: 'secret', encrypted: true, canPost: true, isPrivate: true };
+
+/**
+ * A real signed ChannelInvite envelope (what l2-node 0.140.0+ attaches to a
+ * channel_invite notification as `invite_envelope`, std base64).
+ */
+async function signedInvite(
+  channelId: number,
+  expiresInMs = 24 * 3_600_000,
+): Promise<{ bytes: Uint8Array; b64: string }> {
+  const inviter = await WalletSigner.generate();
+  inviter.network = 'testnet';
+  const bytes = await buildInvite(inviter, channelId, 'klv1bot', undefined, {
+    expiresAt: Date.now() + expiresInMs,
+  });
+  return { bytes, b64: bytesToBase64(bytes) };
+}
 
 function depsWith(over: Partial<CommandsDeps> = {}): CommandsDeps {
   return {
@@ -186,7 +210,7 @@ describe('commands module preflight', () => {
     // `bot.channels` entry must start successfully and let `handleMessage`'s
     // decrypt-and-retry logic sort out whether it ever becomes usable.
     const deps = depsWith({
-      describeChannel: vi.fn(async () => ({ name: 'secret', encrypted: true, canPost: true })),
+      describeChannel: vi.fn(async () => ({ name: 'secret', encrypted: true, canPost: true, isPrivate: false })),
     });
     const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
     expect(failure).toBeNull();
@@ -203,6 +227,7 @@ describe('commands module preflight', () => {
         name: 'evil\x1b[31mFAKE\x1b[0m',
         encrypted: false,
         canPost: false,
+        isPrivate: false,
       })),
     });
     const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
@@ -348,7 +373,7 @@ describe('commands module preflight', () => {
 
   it('refuses a channel where the wallet cannot post', async () => {
     const deps = depsWith({
-      describeChannel: vi.fn(async () => ({ name: 'announce', encrypted: false, canPost: false })),
+      describeChannel: vi.fn(async () => ({ name: 'announce', encrypted: false, canPost: false, isPrivate: false })),
     });
     const failure = await createCommandsModule(deps).preflight!(ctxWith(configWith(botCfg())));
     expect(failure!.message).toContain('not allowed to post');
@@ -672,6 +697,7 @@ describe('commands module auto-join', () => {
       name: 'Bots & Co.',
       encrypted: false,
       canPost: true,
+      isPrivate: false,
     }));
     const notification: Notification = {
       type: 'channel_invite',
@@ -943,7 +969,7 @@ describe('commands module auto-join', () => {
     await first.stop();
 
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
-      id === 99 ? { name: 'now secret', encrypted: true, canPost: true } : publicChannel,
+      id === 99 ? { name: 'now secret', encrypted: true, canPost: true, isPrivate: false } : publicChannel,
     );
     const noNewInvites = vi.fn(async (_since?: number) => []);
     const second = await startAndCapture(
@@ -1079,7 +1105,7 @@ describe('commands module auto-join', () => {
     // invites one by one).
     const joinChannel = vi.fn(async (_id: number) => {});
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
-      id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
+      id === 99 ? { name: 'Secret', encrypted: true, canPost: true, isPrivate: false } : publicChannel,
     );
     const notification: Notification = {
       type: 'channel_invite',
@@ -1106,7 +1132,7 @@ describe('commands module auto-join', () => {
     // new Public/ReadPublic/Private channels are all created encrypted by
     // default (spec §3.6).
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
-      id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
+      id === 99 ? { name: 'Secret', encrypted: true, canPost: true, isPrivate: false } : publicChannel,
     );
     const notification: Notification = {
       type: 'channel_invite',
@@ -1381,6 +1407,10 @@ describe('commands module auto-join', () => {
     // properties of null (reading 'split')"), silently killing the poll
     // before it ever federated or joined — live symptom was "checked for
     // channel invites — 1 notification(s), 1 invite(s)" and then nothing.
+    // Since 0.40.0 a private-namespace id also needs a usable invite to
+    // get as far as federating (private join gate) — attached here so this
+    // keeps guarding the null-name crash, not the gate.
+    const { b64 } = await signedInvite(397276220293295);
     const notification: Notification = {
       type: 'channel_invite',
       channel_id: '397276220293295',
@@ -1388,6 +1418,7 @@ describe('commands module auto-join', () => {
       from: 'klv1owner',
       timestamp: 1000,
       anchor_node: 'https://host.example',
+      invite_envelope: b64,
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
     const federateChannel = vi.fn(async (_id: number, _hostUrl: string) => {});
@@ -1401,7 +1432,9 @@ describe('commands module auto-join', () => {
     await mod.preflight!(ctx);
     await expect((await mod.start(ctx)).stop()).resolves.toBeUndefined();
 
-    expect(federateChannel).toHaveBeenCalledWith(397276220293295, 'https://host.example');
+    expect(federateChannel).toHaveBeenCalledWith(397276220293295, 'https://host.example', {
+      invite: expect.any(Uint8Array),
+    });
   });
 
   it('skips an invite whose federate attempt fails, without aborting the rest of the poll', async () => {
@@ -1446,6 +1479,352 @@ describe('commands module auto-join', () => {
     await (await mod.start(ctx)).stop();
 
     expect(federateChannel).not.toHaveBeenCalled();
+  });
+
+  describe('private-channel invite gate (l2-node 0.140.0+)', () => {
+    const PRIVATE_ID = 397276220293295;
+
+    it('passes the SAME invite bytes to federateChannel and joinChannel for a private channel', async () => {
+      const { bytes, b64 } = await signedInvite(PRIVATE_ID);
+      let federated = false;
+      const federateChannel = vi.fn(async (_id: number, _host: string, _o?: { invite?: Uint8Array }) => {
+        federated = true;
+      });
+      const describeChannel = vi.fn(async (id: number) =>
+        id === PRIVATE_ID ? (federated ? privateChannel : null) : publicChannel,
+      );
+      const joinChannel = vi.fn(async (_id: number, _o?: { invite?: Uint8Array }) => {});
+      const getNotifications = vi.fn(async (_since?: number) => [
+        {
+          type: 'channel_invite',
+          channel_id: String(PRIVATE_ID),
+          from: 'klv1owner',
+          timestamp: 1000,
+          anchor_node: 'https://host.example',
+          invite_envelope: b64,
+        } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, joinChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(federateChannel).toHaveBeenCalledWith(PRIVATE_ID, 'https://host.example', { invite: bytes });
+      expect(joinChannel).toHaveBeenCalledWith(PRIVATE_ID, { invite: bytes });
+      // The static loop's join of channel 7 is untouched: no options at all.
+      expect(joinChannel).toHaveBeenCalledWith(7);
+    });
+
+    it('skips a private invite whose envelope is null — no federate, no join, cursor still advances', async () => {
+      const warn = vi.fn();
+      const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), warn } as unknown as BotContext;
+      const federateChannel = vi.fn(async (_id: number, _host: string) => {});
+      const joinChannel = vi.fn(async (_id: number) => {});
+      const describeChannel = vi.fn(async (id: number) => (id === PRIVATE_ID ? null : publicChannel));
+      const getNotifications = vi.fn(async (_since?: number) => [
+        {
+          type: 'channel_invite',
+          channel_id: String(PRIVATE_ID),
+          from: 'klv1owner',
+          timestamp: 1000,
+          anchor_node: 'https://host.example',
+          invite_envelope: null,
+        } as Notification,
+      ]);
+      const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, joinChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(federateChannel).not.toHaveBeenCalled();
+      expect(joinChannel).not.toHaveBeenCalledWith(PRIVATE_ID, expect.anything());
+      expect(joinChannel).not.toHaveBeenCalledWith(PRIVATE_ID);
+      const logged = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes(String(PRIVATE_ID)));
+      expect(logged).toMatch(/no usable invite/);
+      expect(JSON.parse(readFileSync(statePath, 'utf8')).lastHandledTs).toBe(1000);
+    });
+
+    it('skips a KNOWN private channel (low id, record says Private) without an envelope', async () => {
+      const joinChannel = vi.fn(async (_id: number) => {});
+      const describeChannel = vi.fn(async (id: number) => (id === 99 ? privateChannel : publicChannel));
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 1000 } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      const mod = createCommandsModule(depsWith({ joinChannel, describeChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(joinChannel).not.toHaveBeenCalledWith(99);
+      expect(joinChannel).not.toHaveBeenCalledWith(99, expect.anything());
+      const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+      expect(saved.answerChannelIds).not.toContain(99);
+    });
+
+    it('skips an invite expired by the 5-minute client margin, logging the expiry', async () => {
+      // Valid for 2 more minutes — inside the margin, so already unusable.
+      const { b64 } = await signedInvite(99, 2 * 60_000);
+      const warn = vi.fn();
+      const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), warn } as unknown as BotContext;
+      const joinChannel = vi.fn(async (_id: number) => {});
+      const describeChannel = vi.fn(async (id: number) => (id === 99 ? privateChannel : publicChannel));
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 1000, invite_envelope: b64 } as Notification,
+      ]);
+      const mod = createCommandsModule(depsWith({ joinChannel, describeChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(joinChannel).not.toHaveBeenCalledWith(99, expect.anything());
+      const logged = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('channel 99'));
+      expect(logged).toMatch(/expired \(valid until \d{4}-\d{2}-\d{2}T/);
+    });
+
+    it('skips an expired invite for an unknown private-namespace id BEFORE federating', async () => {
+      const { b64 } = await signedInvite(PRIVATE_ID, 60_000);
+      const federateChannel = vi.fn(async (_id: number, _host: string) => {});
+      const describeChannel = vi.fn(async (id: number) => (id === PRIVATE_ID ? null : publicChannel));
+      const getNotifications = vi.fn(async (_since?: number) => [
+        {
+          type: 'channel_invite',
+          channel_id: String(PRIVATE_ID),
+          from: 'klv1owner',
+          timestamp: 1000,
+          anchor_node: 'https://host.example',
+          invite_envelope: b64,
+        } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(federateChannel).not.toHaveBeenCalled();
+    });
+
+    it('joins a PUBLIC channel WITHOUT attaching an invite, even when one came with the notification', async () => {
+      const { b64 } = await signedInvite(99);
+      const joinChannel = vi.fn(async (_id: number, _o?: { invite?: Uint8Array }) => {});
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 1000, invite_envelope: b64 } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      const mod = createCommandsModule(depsWith({ joinChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(joinChannel).toHaveBeenCalledWith(99);
+      expect(joinChannel).not.toHaveBeenCalledWith(99, expect.anything());
+    });
+
+    it('a re-invite in the same page: joins once with the valid invite, no warning about the stale one', async () => {
+      // Stale is signed FIRST (older signed timestamp; a same-ms tie falls
+      // to fresh's later expiry), fresh is the re-invite.
+      const stale = await signedInvite(99, 60_000);
+      const fresh = await signedInvite(99);
+      const warn = vi.fn();
+      const ctx = { ...ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, answerInvitedChannels: false } }))), warn } as unknown as BotContext;
+      const joinChannel = vi.fn(async (_id: number, _o?: { invite?: Uint8Array }) => {});
+      const describeChannel = vi.fn(async (id: number) => (id === 99 ? privateChannel : publicChannel));
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 2000, invite_envelope: fresh.b64 } as Notification,
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 1000, invite_envelope: stale.b64 } as Notification,
+      ]);
+      const mod = createCommandsModule(depsWith({ joinChannel, describeChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      expect(joinChannel).toHaveBeenCalledWith(99, { invite: fresh.bytes });
+      expect(joinChannel.mock.calls.filter((c) => c[0] === 99)).toHaveLength(1);
+      expect(warn.mock.calls.map((c) => String(c[0])).some((m) => m.includes('expired'))).toBe(false);
+    });
+
+    it('sanitizes the skip log line and never logs the envelope itself', async () => {
+      const { b64 } = await signedInvite(99, 60_000);
+      const warn = vi.fn();
+      const log = vi.fn();
+      const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), warn, log } as unknown as BotContext;
+      const describeChannel = vi.fn(async (id: number) => (id === 99 ? privateChannel : publicChannel));
+      const getNotifications = vi.fn(async (_since?: number) => [
+        {
+          type: 'channel_invite',
+          channel_id: '99',
+          channel_name: 'na\x1b[2Jme',
+          from: 'klv1owner\x1b[31mFAKE\x1b[0m\nsecond line',
+          timestamp: 1000,
+          invite_envelope: b64,
+        } as Notification,
+      ]);
+      const mod = createCommandsModule(depsWith({ describeChannel, getNotifications }));
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+
+      const logged = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('channel 99'));
+      expect(logged).toBeDefined();
+      // eslint-disable-next-line no-control-regex
+      expect(logged).not.toMatch(/[\x00-\x1f]/);
+      expect(logged).not.toContain('second line');
+      const everything = [...warn.mock.calls, ...log.mock.calls].map((c) => String(c[0])).join('\n');
+      expect(everything).not.toContain(b64);
+      expect(everything).not.toContain(b64.slice(0, 24));
+    });
+  });
+
+  describe('transient federate/join failures are retried, not consumed (l2-node rate limits)', () => {
+    const apiError = (status: number) => new Error(`API error (${status}): limited`);
+    const savedCursor = () => JSON.parse(readFileSync(statePath, 'utf8')).lastHandledTs as number;
+    /** Run one poll on the SAME module instance (in-memory retry state survives). */
+    async function poll(mod: ReturnType<typeof createCommandsModule>, ctx: BotContext): Promise<void> {
+      await mod.preflight!(ctx);
+      await (await mod.start(ctx)).stop();
+    }
+
+    it('429 mid-page: earlier invite handled, the failed one and everything after it NOT consumed, retried next poll', async () => {
+      const federated = new Set<number>();
+      let limited = true;
+      const federateChannel = vi.fn(async (id: number, _host: string) => {
+        if (id === 20 && limited) throw apiError(429);
+        federated.add(id);
+      });
+      const describeChannel = vi.fn(async (id: number) =>
+        id === 7 || federated.has(id) ? publicChannel : null,
+      );
+      const joinChannel = vi.fn(async (_id: number) => {});
+      // Newest first, as the node returns them.
+      const page = [
+        { type: 'channel_invite', channel_id: '30', from: 'klv1c', timestamp: 3000, anchor_node: 'https://h.example' },
+        { type: 'channel_invite', channel_id: '20', from: 'klv1b', timestamp: 2000, anchor_node: 'https://h.example' },
+        { type: 'channel_invite', channel_id: '10', from: 'klv1a', timestamp: 1000, anchor_node: 'https://h.example' },
+      ] as Notification[];
+      const getNotifications = vi.fn(async (_since?: number) => page);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin({ autoJoin: { statePath, answerInvitedChannels: false } })));
+      const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, joinChannel, getNotifications }));
+
+      await poll(mod, ctx);
+      expect(joinChannel).toHaveBeenCalledWith(30);
+      // After the 429 no further federation is attempted this poll.
+      expect(federateChannel.mock.calls.map((c) => c[0])).toEqual([30, 20]);
+      // The cursor is held below the earliest invite not settled (10 was deferred).
+      expect(savedCursor()).toBe(999);
+
+      limited = false;
+      await poll(mod, ctx);
+      expect(getNotifications).toHaveBeenLastCalledWith(999, 200, 'channel_invite');
+      expect(joinChannel).toHaveBeenCalledWith(20);
+      expect(joinChannel).toHaveBeenCalledWith(10);
+      // 30 was already settled — not joined a second time on the re-fetch.
+      expect(joinChannel.mock.calls.filter((c) => c[0] === 30)).toHaveLength(1);
+      expect(savedCursor()).toBe(3000);
+    });
+
+    it('503 ("federation busy") on join is retried, and the cursor does not pass it', async () => {
+      let busy = true;
+      const joinChannel = vi.fn(async (id: number) => {
+        if (id === 99 && busy) throw apiError(503);
+      });
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 4000 } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      const mod = createCommandsModule(depsWith({ joinChannel, getNotifications }));
+      await poll(mod, ctx);
+      expect(savedCursor()).toBe(3999);
+      busy = false;
+      await poll(mod, ctx);
+      expect(joinChannel.mock.calls.filter((c) => c[0] === 99)).toHaveLength(2);
+      expect(savedCursor()).toBe(4000);
+    });
+
+    it('a network error (fetch failed) is transient too', async () => {
+      const joinChannel = vi.fn(async (id: number) => {
+        if (id === 99) throw new TypeError('fetch failed');
+      });
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 4000 } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      await poll(createCommandsModule(depsWith({ joinChannel, getNotifications })), ctx);
+      expect(savedCursor()).toBe(3999);
+    });
+
+    it('403 (invite rejected) is permanent: skipped, cursor advances, never retried', async () => {
+      const joinChannel = vi.fn(async (id: number) => {
+        if (id === 99) throw apiError(403);
+      });
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 4000 } as Notification,
+      ]);
+      const ctx = ctxWith(configWith(cfgWithAutoJoin()));
+      await poll(createCommandsModule(depsWith({ joinChannel, getNotifications })), ctx);
+      expect(savedCursor()).toBe(4000);
+    });
+
+    it('gives up after MAX_INVITE_RETRY_ATTEMPTS polls, then lets the cursor pass', async () => {
+      const joinChannel = vi.fn(async (id: number) => {
+        if (id === 99) throw apiError(503);
+      });
+      const warn = vi.fn();
+      const getNotifications = vi.fn(async (_since?: number) => [
+        { type: 'channel_invite', channel_id: '99', from: 'klv1owner', timestamp: 4000 } as Notification,
+      ]);
+      const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), warn } as unknown as BotContext;
+      const mod = createCommandsModule(depsWith({ joinChannel, getNotifications }));
+      for (let i = 0; i < 4; i++) {
+        await poll(mod, ctx);
+        expect(savedCursor()).toBe(3999);
+      }
+      await poll(mod, ctx);
+      expect(savedCursor()).toBe(4000);
+      expect(warn.mock.calls.map((c) => String(c[0])).some((m) => m.includes('giving up after 5 attempts'))).toBe(true);
+      await poll(mod, ctx);
+      expect(joinChannel.mock.calls.filter((c) => c[0] === 99)).toHaveLength(5);
+    });
+
+    it('the invite expiring ends retries; retry log lines are sanitized and never carry the envelope', async () => {
+      const PRIVATE_ID = 397276220293295;
+      // Usable for ~5 more minutes (10 min TTL minus the 5 min margin).
+      const { b64 } = await signedInvite(PRIVATE_ID, 10 * 60_000);
+      const federateChannel = vi.fn(async (_id: number, _host: string) => {
+        throw apiError(503);
+      });
+      const describeChannel = vi.fn(async (id: number) => (id === PRIVATE_ID ? null : publicChannel));
+      const warn = vi.fn();
+      const log = vi.fn();
+      const getNotifications = vi.fn(async (_since?: number) => [
+        {
+          type: 'channel_invite',
+          channel_id: String(PRIVATE_ID),
+          from: 'klv1owner\x1b[31mFAKE\x1b[0m\nline2',
+          timestamp: 4000,
+          anchor_node: 'https://host.example',
+          invite_envelope: b64,
+        } as Notification,
+      ]);
+      const ctx = { ...ctxWith(configWith(cfgWithAutoJoin())), warn, log } as unknown as BotContext;
+      const mod = createCommandsModule(depsWith({ federateChannel, describeChannel, getNotifications }));
+
+      await poll(mod, ctx);
+      expect(federateChannel).toHaveBeenCalledTimes(1);
+      expect(savedCursor()).toBe(3999);
+      const retryLine = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('will retry'));
+      expect(retryLine).toBeDefined();
+      // eslint-disable-next-line no-control-regex
+      expect(retryLine).not.toMatch(/[\x00-\x1f]/);
+      expect(retryLine).not.toContain('line2');
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(Date.now() + 6 * 60_000);
+        await poll(mod, ctx);
+      } finally {
+        vi.useRealTimers();
+      }
+      // Expired by the client margin: skipped for good, no further federate.
+      expect(federateChannel).toHaveBeenCalledTimes(1);
+      expect(savedCursor()).toBe(4000);
+      const everything = [...warn.mock.calls, ...log.mock.calls].map((c) => String(c[0])).join('\n');
+      expect(everything).toMatch(/has expired/);
+      expect(everything).not.toContain(b64.slice(0, 24));
+    });
   });
 
   /** Build a real encrypted-message wire payload, as `buildEncryptedChannelMessage` would. */
@@ -1656,7 +2035,7 @@ describe('commands module auto-join', () => {
     };
     const getNotifications = vi.fn(async (_since?: number) => [notification]);
     const describeChannel = vi.fn(async (id: number): Promise<ChannelFacts> =>
-      id === 99 ? { name: 'Secret', encrypted: true, canPost: true } : publicChannel,
+      id === 99 ? { name: 'Secret', encrypted: true, canPost: true, isPrivate: false } : publicChannel,
     );
     const decryptChannelText = vi.fn(async () => ({ text: '/about' }));
     const reply = vi.fn(async () => ({ msgId: 'mock-msg-id' }));

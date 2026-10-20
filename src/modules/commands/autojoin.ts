@@ -19,6 +19,13 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  INVITE_EXPIRY_MARGIN_MS,
+  MAX_INVITE_ENVELOPE_BYTES,
+  base64ToBytes,
+  decodeChannelInvite,
+} from '@ogmara/sdk';
+import { httpStatusFromError } from '../../ogmara.js';
 
 /** One channel-invite notification, narrowed to what this module needs. */
 export interface ChannelInviteNotice {
@@ -34,6 +41,28 @@ export interface ChannelInviteNotice {
    * set it (older node, or the inviter's own node URL wasn't public https).
    */
   readonly anchorNode: string | undefined;
+  /**
+   * Raw signed `ChannelInvite` envelope bytes (l2-node 0.140.0+ private
+   * join gate, spec 05 §8.4) — what a Private channel join must carry, sent
+   * unchanged to both `federateChannel` and `joinChannel`. `undefined` when
+   * the node attached none (older node, or a `null` on the wire), or when the
+   * attached one is malformed, oversized, or does not decode as an invite for
+   * THIS channel. Opaque to this module: never logged, never verified here
+   * (the node is the verifier; the SDK pre-checks the target wallet).
+   */
+  readonly invite: Uint8Array | undefined;
+  /**
+   * Effective expiry of {@link invite} in unix ms — the signed envelope's own
+   * value (authoritative), tightened to the node's `invite_expires_at` hint
+   * when that is earlier. `undefined` exactly when `invite` is.
+   */
+  readonly inviteExpiresAt: number | undefined;
+  /**
+   * The invite envelope's own signed timestamp (unix ms, decoded, unverified)
+   * — used only to pick the NEWEST of several invites to one channel.
+   * `undefined` exactly when `invite` is.
+   */
+  readonly inviteSignedAt: number | undefined;
 }
 
 /**
@@ -52,12 +81,135 @@ export interface RawNotification {
   readonly channel_id?: string;
   readonly channel_name?: string | null;
   readonly anchor_node?: string | null;
+  /** Standard base64 of the raw signed invite envelope (l2-node 0.140.0+); `null`/absent when none. */
+  readonly invite_envelope?: string | null;
+  /** Node-computed effective expiry (unix ms) — a hint; the signed envelope is authoritative. */
+  readonly invite_expires_at?: number | null;
   readonly from: string;
   readonly timestamp: number;
 }
 
 /** Longest `anchor_node` string this module will act on — a sanity bound, not a URL validator (the node re-validates for real before ever fetching it). */
 const MAX_ANCHOR_NODE_CHARS = 2048;
+
+/**
+ * Longest `invite_envelope` string decoded at all: the base64 length of a
+ * {@link MAX_INVITE_ENVELOPE_BYTES} envelope. A cap on the untrusted INPUT,
+ * checked before any decode work, so an oversized field costs nothing.
+ */
+const MAX_INVITE_B64_CHARS = Math.ceil(MAX_INVITE_ENVELOPE_BYTES / 3) * 4;
+
+/**
+ * Private channel ids live above this floor (l2-node `PRIVATE_CHANNEL_ID_FLOOR`,
+ * 2^32). Used ONLY when the channel's own record is not known locally yet —
+ * the node applies the same rule to an unknown id.
+ */
+const PRIVATE_CHANNEL_ID_FLOOR = 2 ** 32;
+
+/**
+ * Whether a channel must be joined with an invite: its record says Private,
+ * or — while this wallet's node has no record of it yet — its id is in the
+ * private namespace. A known record always wins over the id heuristic.
+ */
+export function isPrivateChannel(channelId: number, knownPrivate: boolean | undefined): boolean {
+  return knownPrivate ?? channelId > PRIVATE_CHANNEL_ID_FLOOR;
+}
+
+/**
+ * Pull the invite envelope out of one `channel_invite` notification.
+ *
+ * `null` and absent are the same thing here (normalized to `undefined`, never
+ * passed on as `null`). Decoding is strict standard base64 via the SDK; any
+ * failure — bad base64, empty, oversized, not a `ChannelInvite`, or an invite
+ * for a different channel than the notification names — yields no invite,
+ * which for a Private channel means the invite is skipped rather than sent to
+ * be rejected.
+ */
+function parseInviteEnvelope(
+  b64: unknown,
+  expiresHint: unknown,
+  channelId: number,
+): { invite: Uint8Array; inviteExpiresAt: number; inviteSignedAt: number } | undefined {
+  if (typeof b64 !== 'string' || b64.length === 0 || b64.length > MAX_INVITE_B64_CHARS) return undefined;
+  const bytes = base64ToBytes(b64);
+  if (bytes === null || bytes.length === 0 || bytes.length > MAX_INVITE_ENVELOPE_BYTES) return undefined;
+  const decoded = decodeChannelInvite(bytes);
+  if (decoded === null || decoded.channelId !== channelId) return undefined;
+  const hint =
+    typeof expiresHint === 'number' && Number.isSafeInteger(expiresHint) ? expiresHint : undefined;
+  return {
+    invite: bytes,
+    inviteSignedAt: decoded.timestamp,
+    inviteExpiresAt: hint !== undefined ? Math.min(decoded.expiresAt, hint) : decoded.expiresAt,
+  };
+}
+
+/**
+ * Whether an invite is still usable at `now`, by the client margin of spec 05
+ * §8.4: expired once `now >= expiresAt - INVITE_EXPIRY_MARGIN_MS` — tighter
+ * than the node, so a join is never signed with an invite that would be
+ * rejected on arrival. No invite at all is "not usable".
+ */
+export function inviteUsable(
+  notice: ChannelInviteNotice,
+  now: number,
+): notice is ChannelInviteNotice & { readonly invite: Uint8Array; readonly inviteExpiresAt: number } {
+  return (
+    notice.invite !== undefined &&
+    notice.inviteExpiresAt !== undefined &&
+    now < notice.inviteExpiresAt - INVITE_EXPIRY_MARGIN_MS
+  );
+}
+
+/**
+ * Collapse several invites to the SAME channel (re-invites, or one invite
+ * listed twice) into one, so a page never joins a channel with one invite and
+ * then warns about an older, expired one for the same channel.
+ *
+ * Ranking matches spec 05 §8.4 and the SDK's `selectPendingInvite`, which
+ * drops expired invites FIRST and only then picks the newest:
+ *   1. a USABLE invite (envelope present, not expired by the client margin at
+ *      `now`) beats an expired one, which beats one with no envelope — so a
+ *      newer but already-expired 1h re-invite never displaces an older,
+ *      still-valid 7d one;
+ *   2. within a tier, the NEWEST signed envelope timestamp wins, later expiry
+ *      only as a tie-break. Newest — not longest-lived — matters: after a
+ *      kick, an older long-TTL invite is dead at the node (removal cutoff)
+ *      while a fresh short-TTL re-invite is valid;
+ *   3. among envelope-less invites, the newest notification.
+ * Order of first appearance is kept.
+ */
+function inviteTier(n: ChannelInviteNotice, now: number): number {
+  if (n.invite === undefined || n.inviteSignedAt === undefined) return 0;
+  return inviteUsable(n, now) ? 2 : 1;
+}
+
+function outranks(a: ChannelInviteNotice, b: ChannelInviteNotice, now: number): boolean {
+  const aTier = inviteTier(a, now);
+  const bTier = inviteTier(b, now);
+  if (aTier !== bTier) return aTier > bTier;
+  if (aTier === 0) return a.timestamp > b.timestamp;
+  const aSigned = a.inviteSignedAt ?? 0;
+  const bSigned = b.inviteSignedAt ?? 0;
+  if (aSigned !== bSigned) return aSigned > bSigned;
+  return (a.inviteExpiresAt ?? 0) > (b.inviteExpiresAt ?? 0);
+}
+
+export function bestInvitePerChannel(
+  invites: readonly ChannelInviteNotice[],
+  now: number,
+): ChannelInviteNotice[] {
+  const best = new Map<number, ChannelInviteNotice>();
+  for (const n of invites) {
+    const cur = best.get(n.channelId);
+    if (cur === undefined) {
+      best.set(n.channelId, n);
+      continue;
+    }
+    if (outranks(n, cur, now)) best.set(n.channelId, n);
+  }
+  return [...best.values()];
+}
 
 /**
  * Pull `channel_invite` entries out of a page of notifications, and report
@@ -97,12 +249,16 @@ export function extractChannelInvites(
     // null (reading 'split')") — silently aborting the whole invite before
     // it ever reaches federate/join. Normalize here, once.
     const channelName = typeof n.channel_name === 'string' ? n.channel_name : undefined;
+    const parsed = parseInviteEnvelope(n.invite_envelope, n.invite_expires_at, channelId);
     invites.push({
       channelId,
       channelName,
       invitedBy: n.from,
       timestamp: n.timestamp,
       anchorNode,
+      invite: parsed?.invite,
+      inviteExpiresAt: parsed?.inviteExpiresAt,
+      inviteSignedAt: parsed?.inviteSignedAt,
     });
   }
   return { invites, newestTs };
@@ -203,4 +359,62 @@ export function saveAutoJoinState(path: string, state: AutoJoinState): void {
   const tmp = join(dir, `.${Date.now()}-${process.pid}.tmp`);
   writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, path);
+}
+
+/**
+ * How an invite's federate/join/describe failure should be treated.
+ *
+ * - `rate-limited` (HTTP 429): retry on a later poll AND stop making further
+ *   federate/join calls in this poll — the node's limits are per wallet, so
+ *   continuing would only hammer it (l2-node: 10 federations per wallet per
+ *   10 min, a global bucket, 8 concurrent fetches).
+ * - `transient` (HTTP 502/503/504 — 503 is the node's "federation busy" —
+ *   or a network/timeout error with no HTTP status): retry on a later poll.
+ * - `permanent` (any other HTTP status — 400, 403 "invite proof required",
+ *   404 — or a local error such as the SDK's invite pre-check): skip, and let
+ *   the cursor move past it. Retrying would get the same answer.
+ */
+export type InviteFailureKind = 'rate-limited' | 'transient' | 'permanent';
+
+/** Node.js/undici network error codes that mean "the request never got an answer". */
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+export function classifyInviteFailure(err: unknown): InviteFailureKind {
+  const status = httpStatusFromError(err);
+  if (status === 429) return 'rate-limited';
+  if (status === 502 || status === 503 || status === 504) return 'transient';
+  if (status !== null) return 'permanent';
+  if (!(err instanceof Error)) return 'permanent';
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return 'transient';
+  // undici's fetch rejects with `TypeError: fetch failed`, the real cause in `.cause`.
+  if (err instanceof TypeError && /fetch failed/i.test(err.message)) return 'transient';
+  const code = (err as { code?: unknown }).code ?? (err.cause as { code?: unknown } | undefined)?.code;
+  if (typeof code === 'string' && NETWORK_ERROR_CODES.has(code)) return 'transient';
+  return 'permanent';
+}
+
+/**
+ * How many polls an invite that keeps failing transiently is retried before
+ * it is given up on (logged, cursor allowed past it). With the default
+ * 15-minute poll that is a bit over an hour of retries; a Private invite's
+ * own expiry margin ends retries sooner when it is reached first.
+ */
+export const MAX_INVITE_RETRY_ATTEMPTS = 5;
+
+/** Identity of one invite notification across polls (re-fetched after a held-back cursor). */
+export function inviteKey(n: Pick<ChannelInviteNotice, 'channelId' | 'timestamp'>): string {
+  return `${n.channelId}:${n.timestamp}`;
 }

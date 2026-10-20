@@ -32,13 +32,35 @@ import { botSchema, type BotConfig } from './schema.js';
 import { CommandRateLimiter, NodeBudget, capFor } from './rateLimit.js';
 import { buildHandlers, type CommandHandler } from './handlers.js';
 import { decodeChatPayload } from './payload.js';
-import { extractChannelInvites, loadAutoJoinState, saveAutoJoinState } from './autojoin.js';
+import {
+  MAX_INVITE_RETRY_ATTEMPTS,
+  bestInvitePerChannel,
+  classifyInviteFailure,
+  extractChannelInvites,
+  inviteKey,
+  inviteUsable,
+  isPrivateChannel,
+  loadAutoJoinState,
+  saveAutoJoinState,
+  type ChannelInviteNotice,
+  type InviteFailureKind,
+} from './autojoin.js';
+
+/** Outcome of handling one invite in a poll — see `handleInvite`. */
+type InviteOutcome = 'done' | 'retry' | 'deferred';
 
 /** What preflight needs to know about a channel before listening in it. */
 export interface ChannelFacts {
   readonly name: string;
   /** True for a force-encrypted private channel. */
   readonly encrypted: boolean;
+  /**
+   * True for a Private channel (`channel_type` Private) — the type whose
+   * join must carry a signed invite (l2-node 0.140.0+, spec 05 §8.4). Not the
+   * same as `encrypted`: new Public/ReadPublic channels are encrypted too,
+   * and need no invite.
+   */
+  readonly isPrivate: boolean;
   /** Whether this wallet is allowed to post here at all. */
   readonly canPost: boolean;
 }
@@ -97,8 +119,14 @@ export interface CommandsDeps {
     handle?: string;
     commands: Array<{ name: string; description: string; args_hint?: string }>;
   }) => Promise<void>;
-  /** Join a channel by id — a real signed write, subject to `posting.dryRun`. */
-  readonly joinChannel: (channelId: number) => Promise<void>;
+  /**
+   * Join a channel by id — a real signed write, subject to `posting.dryRun`.
+   * `options.invite` is the raw signed `ChannelInvite` envelope a Private
+   * channel join must carry (l2-node 0.140.0+); omitted for every other
+   * channel type, and for a channel this wallet is already a member of (the
+   * node accepts that join idempotently).
+   */
+  readonly joinChannel: (channelId: number, options?: { invite?: Uint8Array }) => Promise<void>;
   /**
    * Federate (replicate) a private channel from its host node, so this
    * wallet's own node — which may have never heard of it, since private
@@ -108,7 +136,11 @@ export interface CommandsDeps {
    * about another node, which "nothing reaches the network in dry run"
    * should cover even though it isn't itself a signed publish.
    */
-  readonly federateChannel: (channelId: number, hostUrl: string) => Promise<void>;
+  readonly federateChannel: (
+    channelId: number,
+    hostUrl: string,
+    options?: { invite?: Uint8Array },
+  ) => Promise<void>;
   /**
    * Fetch this wallet's notifications, newest first, optionally since a
    * timestamp and/or filtered to one type. The type filter matters here: an
@@ -158,6 +190,21 @@ function forLog(text: string): string {
   const firstLine = text.split('\n')[0] ?? '';
   // eslint-disable-next-line no-control-regex
   return firstLine.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202E]/gu, '');
+}
+
+/**
+ * Why an invite cannot be used, for the operator's log. Never includes the
+ * envelope itself — only whether one was present and its expiry, rendered
+ * from a number (no attacker-chosen text reaches the terminal).
+ */
+function unusableInviteReason(invite: ChannelInviteNotice): string {
+  if (invite.invite === undefined || invite.inviteExpiresAt === undefined) {
+    return 'the notification carries no usable invite (node older than 0.140.0, or a malformed one)';
+  }
+  const at = new Date(invite.inviteExpiresAt);
+  // An absurd far-future value would make toISOString() throw.
+  const when = Number.isNaN(at.getTime()) ? String(invite.inviteExpiresAt) : at.toISOString();
+  return `the invite has expired (valid until ${when}, less the 5-minute safety margin)`;
 }
 
 /**
@@ -425,6 +472,15 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
    * on why a channel's own metadata can't be trusted to signal this.
    */
   let encryptedSince = new Map<number, number>();
+  /**
+   * Invite notifications already settled (key `channelId:timestamp` → its
+   * timestamp) that a held-back cursor may fetch again; pruned below the
+   * cursor after every poll. In memory only: after a restart a re-fetched,
+   * already-joined invite is simply joined again (idempotent).
+   */
+  const resolvedInvites = new Map<string, number>();
+  /** Transient-failure attempts per invite notification (same key), pruned with it. */
+  const inviteAttempts = new Map<string, number>();
   /**
    * Message ids already answered, newest last.
    *
@@ -935,13 +991,19 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
    * and join each one. Joins ONLY — see the module doc comment for why this
    * never adds the channel to `bot.channels` on its own.
    *
-   * A failed join or a node hiccup on ONE invite is logged and skipped, not
-   * retried: the cursor advances past every notification seen this poll
-   * regardless of per-invite outcome, trading a rare missed invite (an
-   * unlikely transient failure right when an invite happens to land) for a
-   * simple, single-timestamp cursor rather than a per-invite retry queue.
-   * An operator who notices can always add the channel to `bot.channels`
-   * by hand — nothing about a missed auto-join is unrecoverable.
+   * Failures are classified (`classifyInviteFailure`). A PERMANENT one (403
+   * invite rejected, 400, 404, a local pre-check error) is logged and
+   * skipped; the cursor moves past it. A TRANSIENT one (429, 502/503/504,
+   * network/timeout) is retried on a later poll: the cursor is held just
+   * below that invite's notification instead of advancing to the page's
+   * newest, and invites settled above it are remembered in memory so the
+   * re-fetch does not repeat them. After the first 429 no further
+   * federate/join is attempted in the same poll (the node's limits are per
+   * wallet). Retries are bounded by MAX_INVITE_RETRY_ATTEMPTS per invite and,
+   * for a Private invite, by its own expiry margin. Since the l2-node
+   * federate limits (10 per wallet per 10 min, a global bucket, 8 concurrent
+   * fetches) make 429/503 a normal answer, consuming the invite on one of
+   * those would silently lose it.
    */
   async function pollForInvites(ctx: BotContext, cfg: BotConfig): Promise<void> {
     const statePath = cfg.autoJoin.statePath;
@@ -965,7 +1027,16 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       ctx.warn(`  warning: could not check for channel invites (${forLog(String(err))})`);
       return;
     }
-    const { invites, newestTs } = extractChannelInvites(notifications);
+    const extracted = extractChannelInvites(notifications);
+    const { newestTs } = extracted;
+    // Notifications re-fetched only because the cursor was held back for a
+    // retry are already settled — drop them so a held cursor never re-joins
+    // (or re-warns about) anything twice. Then one attempt per channel per
+    // poll, with that channel's best invite.
+    const invites = bestInvitePerChannel(
+      extracted.invites.filter((n) => !resolvedInvites.has(inviteKey(n))),
+      Date.now(),
+    );
     // Always logged, including the zero-result case — otherwise there is no
     // way to tell "the poller ran and found nothing" apart from "the poller
     // never ran," "it crashed silently," or "the invite never reached the
@@ -1032,7 +1103,14 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       }
     }
 
-    for (const invite of invites) {
+    /**
+     * Handle one invite. `'done'` = resolved (joined, or skipped for good) —
+     * the cursor may pass it. `'retry'` = a transient failure, counted as an
+     * attempt; `'deferred'` = not attempted because this poll already hit a
+     * 429. Both of the latter hold the cursor back so the next poll sees the
+     * invite again.
+     */
+    const handleInvite = async (invite: ChannelInviteNotice): Promise<InviteOutcome> => {
       // A channel the operator already wrote into bot.channels answers
       // unconditionally regardless of this pipeline — nothing here can add
       // to that, so there is nothing to do beyond membership, which the
@@ -1040,17 +1118,66 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       // Skipped BEFORE describeChannel/joinChannel entirely: processing it
       // would waste a cap slot (or a confusing "cap reached" warning) on a
       // channel that never needed one.
-      if (cfg.channels.includes(invite.channelId)) continue;
+      if (cfg.channels.includes(invite.channelId)) return 'done';
       // Already granted (e.g. this wallet was invited more than once, or
       // the same notification appears twice in one page) — nothing new to
       // do, and re-joining/re-logging would just be noise.
-      if (autoAnsweredChannels.has(invite.channelId)) continue;
+      if (autoAnsweredChannels.has(invite.channelId)) return 'done';
       // Both wire strings from a payload another wallet controls, so both
       // get the same treatment reply text and error text get elsewhere in
       // this file: `forLog` strips control characters and ANSI escapes that
       // could otherwise rewrite or hide what the operator's terminal shows.
       const invitedBy = forLog(invite.invitedBy);
       const noticeName = invite.channelName !== undefined ? forLog(invite.channelName) : undefined;
+      // A failed network step: permanent ones are skipped (the cursor moves
+      // past them); transient/rate-limited ones are retried on a later poll,
+      // up to MAX_INVITE_RETRY_ATTEMPTS, by holding the cursor back.
+      const failed = (what: string, kind: InviteFailureKind): InviteOutcome => {
+        const where =
+          `invited to channel ${invite.channelId}` +
+          (noticeName !== undefined ? ` ("${noticeName}")` : '') +
+          ` by ${invitedBy}, but ${what}`;
+        if (kind === 'permanent') {
+          ctx.warn(`  warning: ${where} — skipping`);
+          return 'done';
+        }
+        if (kind === 'rate-limited') poll.rateLimited = true;
+        const key = inviteKey(invite);
+        const attempts = (inviteAttempts.get(key) ?? 0) + 1;
+        if (attempts >= MAX_INVITE_RETRY_ATTEMPTS) {
+          inviteAttempts.delete(key);
+          ctx.warn(
+            `  warning: ${where} — giving up after ${attempts} attempts. ` +
+              'Ask for a fresh invite, or add it to bot.channels by hand.',
+          );
+          return 'done';
+        }
+        inviteAttempts.set(key, attempts);
+        ctx.warn(
+          `  warning: ${where} — will retry on a later poll ` +
+            `(attempt ${attempts}/${MAX_INVITE_RETRY_ATTEMPTS})`,
+        );
+        return 'retry';
+      };
+      // Private-channel invite gate (l2-node 0.140.0+, spec 05 §8.4): a
+      // Private join must carry the signed invite, so one with no usable
+      // invite (none attached, malformed, or expired by the client margin)
+      // is skipped HERE rather than sent to be rejected. Checked twice:
+      // before federating (privacy judged by the id namespace — the channel
+      // is unknown locally) and again after describing it (its own record
+      // decides). Not retried: the cursor advances past it like any other
+      // skipped invite; the inviter can send a fresh one.
+      const skipUnusablePrivate = (knownPrivate: boolean | undefined): boolean => {
+        if (!isPrivateChannel(invite.channelId, knownPrivate)) return false;
+        if (inviteUsable(invite, Date.now())) return false;
+        ctx.warn(
+          `  warning: invited to private channel ${invite.channelId}` +
+            (noticeName !== undefined ? ` ("${noticeName}")` : '') +
+            ` by ${invitedBy}, but ${unusableInviteReason(invite)} — skipping. ` +
+            'Ask a member to invite this wallet again.',
+        );
+        return true;
+      };
 
       let facts: ChannelFacts | null | 'unreachable';
       try {
@@ -1061,22 +1188,13 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
         // rejecting), but this loop must not let one bad invite abort the
         // rest of the page — or skip saving the cursor for invites already
         // handled above it.
-        ctx.warn(
-          `  warning: could not check channel ${invite.channelId} ` +
-            `(${forLog(String(err))}) — skipping`,
-        );
-        continue;
+        return failed(`could not check it (${forLog(String(err))})`, classifyInviteFailure(err));
       }
       if (facts === 'unreachable') {
-        ctx.warn(
-          `  warning: invited to channel ${invite.channelId}` +
-            (noticeName !== undefined ? ` ("${noticeName}")` : '') +
-            ` by ${invitedBy}, but could not reach the node to check it — not retried, ` +
-            'see bot.channels to add it by hand',
-        );
-        continue;
+        return failed('could not reach the node to check it', 'transient');
       }
       if (facts === null && invite.anchorNode !== undefined) {
+        if (skipUnusablePrivate(undefined)) return 'done';
         // This wallet's own node has never heard of the channel — the common
         // case for a brand-new private channel, since private channels are
         // host-node-scoped and only federate (replicate) on demand.
@@ -1088,36 +1206,37 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
           ctx.log(
             `  [dry run] would federate channel ${invite.channelId} from ${forLog(invite.anchorNode)}`,
           );
-          continue;
+          return 'done';
         }
+        // A 429 earlier in this poll: the limit is per wallet, so every
+        // further federate/join now would just be refused too. Not an attempt.
+        if (poll.rateLimited) return 'deferred';
         try {
-          await deps.federateChannel(invite.channelId, invite.anchorNode);
+          // The invite goes along whenever it is usable: federating is the
+          // private-channel path, and l2-node 0.140.0+ answers 403 to a
+          // caller who is neither a member nor carrying a valid invite. The
+          // same bytes go to the join below.
+          if (inviteUsable(invite, Date.now())) {
+            await deps.federateChannel(invite.channelId, invite.anchorNode, { invite: invite.invite });
+          } else {
+            await deps.federateChannel(invite.channelId, invite.anchorNode);
+          }
         } catch (err) {
-          ctx.warn(
-            `  warning: invited to channel ${invite.channelId}` +
-              (noticeName !== undefined ? ` ("${noticeName}")` : '') +
-              ` by ${invitedBy}, but could not federate it from its host ` +
-              `(${forLog(String(err))}) — skipping`,
+          return failed(
+            `could not federate it from its host (${forLog(String(err))})`,
+            classifyInviteFailure(err),
           );
-          continue;
         }
         try {
           facts = await deps.describeChannel(invite.channelId);
         } catch (err) {
-          ctx.warn(
-            `  warning: could not check channel ${invite.channelId} after federating ` +
-              `(${forLog(String(err))}) — skipping`,
+          return failed(
+            `could not check it after federating (${forLog(String(err))})`,
+            classifyInviteFailure(err),
           );
-          continue;
         }
         if (facts === 'unreachable') {
-          ctx.warn(
-            `  warning: invited to channel ${invite.channelId}` +
-              (noticeName !== undefined ? ` ("${noticeName}")` : '') +
-              ` by ${invitedBy}, but could not reach the node to re-check it after ` +
-              'federating — not retried, see bot.channels to add it by hand',
-          );
-          continue;
+          return failed('could not reach the node to re-check it after federating', 'transient');
         }
       }
       if (facts === null) {
@@ -1126,8 +1245,14 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
             (noticeName !== undefined ? ` ("${noticeName}")` : '') +
             ` by ${invitedBy}, but this wallet cannot see it — skipping`,
         );
-        continue;
+        return 'done';
       }
+      if (skipUnusablePrivate(facts.isPrivate)) return 'done';
+      // Only a Private join carries the invite. A public/ReadPublic channel
+      // needs none, and attaching one anyway would let a malformed or
+      // mis-targeted invite (which the SDK pre-check rejects) break a join
+      // that would otherwise just work.
+      const proof = facts.isPrivate ? invite.invite : undefined;
       const name = forLog(facts.name);
       // Joined regardless of `facts.encrypted` — an explicit invite is a
       // channel owner asking for this wallet specifically, with no
@@ -1141,15 +1266,17 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
       // whether it ever actually becomes usable.
       if (ctx.config.posting.dryRun) {
         ctx.log(`  [dry run] would join channel ${invite.channelId} ("${name}"), invited by ${invitedBy}`);
-        continue;
+        return 'done';
       }
+      if (poll.rateLimited) return 'deferred';
       try {
-        await deps.joinChannel(invite.channelId);
+        if (proof !== undefined) {
+          await deps.joinChannel(invite.channelId, { invite: proof });
+        } else {
+          await deps.joinChannel(invite.channelId);
+        }
       } catch (err) {
-        ctx.warn(
-          `  warning: could not join channel ${invite.channelId} (${forLog(String(err))})`,
-        );
-        continue;
+        return failed(`could not join it (${forLog(String(err))})`, classifyInviteFailure(err));
       }
 
       if (!cfg.autoJoin.answerInvitedChannels) {
@@ -1157,7 +1284,7 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
           `Commands: joined channel ${invite.channelId} ("${name}"), invited by ${invitedBy}. ` +
             'Add it to bot.channels to answer commands there too.',
         );
-        continue;
+        return 'done';
       }
       // Not `!autoAnsweredChannels.has(...) && ...` — an already-granted
       // channel was already skipped above, so reaching here means this IS a
@@ -1170,7 +1297,7 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
             'invites. To answer here, either have the owner invite again after raising ' +
             'bot.autoJoin.maxAutoAnsweredChannels, or add it to bot.channels by hand.',
         );
-        continue;
+        return 'done';
       }
       autoAnsweredChannels.add(invite.channelId);
       ctx.log(
@@ -1181,6 +1308,25 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
               'this bot the current channel key (spec §8.1.1); until then it will wait.'
             : ''),
       );
+      return 'done';
+    };
+
+    const poll = { rateLimited: false };
+    /** Earliest notification timestamp that must be fetched again next poll. */
+    let holdBelow: number | null = null;
+    for (const invite of invites) {
+      const outcome = await handleInvite(invite);
+      if (outcome === 'done') {
+        // Every notification for this channel on the page is settled by the
+        // one attempt made with its best invite.
+        for (const n of extracted.invites) {
+          if (n.channelId !== invite.channelId) continue;
+          resolvedInvites.set(inviteKey(n), n.timestamp);
+          inviteAttempts.delete(inviteKey(n));
+        }
+      } else if (holdBelow === null || invite.timestamp < holdBelow) {
+        holdBelow = invite.timestamp;
+      }
     }
     // Saved when EITHER the cursor advanced OR cleanup freed a slot — a
     // cleanup-only run (no new notifications this poll) must still persist
@@ -1188,8 +1334,24 @@ export function createCommandsModule(deps: CommandsDeps): BotModule {
     // the stale, now-invalid grant right back from disk. The cursor itself
     // only ever advances to `newestTs`; when there is nothing new to advance
     // to, the existing `since` is kept rather than reset.
+    //
+    // An invite that failed transiently (or was deferred after a 429) holds
+    // the cursor just below its own notification, so the next poll fetches
+    // it again — never past it. Already-settled notifications above it are
+    // filtered out via `resolvedInvites` on the re-fetch. Bounded: every
+    // poll that holds the cursor counted an attempt on some invite, and each
+    // invite gives up after MAX_INVITE_RETRY_ATTEMPTS.
+    let cursor = newestTs ?? since;
+    if (holdBelow !== null) cursor = Math.max(since, Math.min(cursor, holdBelow - 1));
     if (newestTs !== null || grantsChanged) {
-      persistGrants(ctx, cfg, newestTs ?? since);
+      persistGrants(ctx, cfg, cursor);
+    }
+    // Entries below the cursor can never be fetched again — drop them, so
+    // both maps stay bounded by what one held-back page can contain.
+    for (const [key, ts] of resolvedInvites) if (ts < cursor) resolvedInvites.delete(key);
+    for (const key of inviteAttempts.keys()) {
+      const ts = Number(key.slice(key.indexOf(':') + 1));
+      if (!(ts >= cursor)) inviteAttempts.delete(key);
     }
   }
 
