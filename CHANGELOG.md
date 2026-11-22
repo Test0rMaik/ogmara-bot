@@ -5,6 +5,23 @@ All notable changes to ogmara-bot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.1] - 2026-11-22
+
+### Security
+
+Dependency fixes via `npm audit fix` (no `--force`); `npm audit` now reports
+0 vulnerabilities. Build and all 1114 tests pass.
+
+- **Runtime (shipped in the bot):**
+  - `zod` 4.4.3 → 4.6.7 — memory exhaustion while validating oversized
+    constrained input (high). Zod validates settings and panel input.
+  - `fast-xml-parser` 5.11.0 → 5.12.1 — quadratic CPU scanning unterminated
+    input (low). It parses remote RSS/Atom feeds, so a hostile feed could
+    stall the poller.
+- **Dev/test tooling only:** `vitest` / `@vitest/mocker` → 4.1.12 (mock
+  registration code injection, moderate) and `vite` 8.2.x (launch-editor
+  argument escaping, high).
+
 ## [0.40.0] - 2026-10-20
 
 Private-channel invite gate (spec 05 §8.4). Requires `@ogmara/sdk` 0.64.0+;
